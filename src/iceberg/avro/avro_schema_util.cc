@@ -819,7 +819,7 @@ Result<::avro::NodePtr> CreateRecordNodeWithFieldIds(const ::avro::NodePtr& orig
                                                      const NameMapping& name_mapping) {
   auto new_record_node = std::make_shared<::avro::NodeRecord>();
   new_record_node->setName(original_node->name());
-  
+
   for (size_t i = 0; i < original_node->leaves(); ++i) {
     const std::string& field_name = original_node->nameAt(i);
     ::avro::NodePtr field_node = original_node->leafAt(i);

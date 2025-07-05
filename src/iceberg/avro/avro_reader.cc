@@ -219,7 +219,6 @@ class AvroBatchReader::Impl {
     return arrow_array;
   }
 
-
  private:
   // Max number of rows in the record batch to read.
   int64_t batch_size_{};
