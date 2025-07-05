@@ -101,8 +101,9 @@ class AvroBatchReader::Impl {
     if (has_id_visitor.HasNoIds()) {
       // Apply field IDs based on name mapping if available
       if (options.name_mapping) {
-        ICEBERG_ASSIGN_OR_RAISE(auto new_root_node,
-                                CreateAvroNodeWithFieldIds(file_schema.root(), *options.name_mapping));
+        ICEBERG_ASSIGN_OR_RAISE(
+            auto new_root_node,
+            CreateAvroNodeWithFieldIds(file_schema.root(), *options.name_mapping));
 
         // Create a new schema with the updated root node
         auto new_schema = ::avro::ValidSchema(new_root_node);
@@ -111,8 +112,10 @@ class AvroBatchReader::Impl {
         HasIdVisitor verify_visitor;
         ICEBERG_RETURN_UNEXPECTED(verify_visitor.Visit(new_schema));
         if (!verify_visitor.AllHaveIds()) {
-          // TODO(liuxiaoyu): Print detailed error message with missing field IDs information in future
-          return InvalidSchema("Not all fields have field IDs after applying name mapping.");
+          // TODO(liuxiaoyu): Print detailed error message with missing field IDs
+          // information in future
+          return InvalidSchema(
+              "Not all fields have field IDs after applying name mapping.");
         }
 
         // Update the file schema to use the new schema with field IDs

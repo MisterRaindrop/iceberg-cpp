@@ -787,7 +787,7 @@ Result<SchemaProjection> Project(const Schema& expected_schema,
 
 // Helper function to create a new Avro node with field IDs from name mapping
 Result<::avro::NodePtr> CreateAvroNodeWithFieldIds(const ::avro::NodePtr& original_node,
-                                                    const NameMapping& name_mapping) {
+                                                   const NameMapping& name_mapping) {
   switch (original_node->type()) {
     case ::avro::AVRO_RECORD:
       return CreateRecordNodeWithFieldIds(original_node, name_mapping);
@@ -816,7 +816,7 @@ Result<::avro::NodePtr> CreateAvroNodeWithFieldIds(const ::avro::NodePtr& origin
 }
 
 Result<::avro::NodePtr> CreateRecordNodeWithFieldIds(const ::avro::NodePtr& original_node,
-                                                      const NameMapping& name_mapping) {
+                                                     const NameMapping& name_mapping) {
   auto new_record_node = std::make_shared<::avro::NodeRecord>();
   new_record_node->setName(original_node->name());
   
@@ -830,21 +830,20 @@ Result<::avro::NodePtr> CreateRecordNodeWithFieldIds(const ::avro::NodePtr& orig
         // Add field ID attribute to the new node
         ::avro::CustomAttributes attributes;
         attributes.addAttribute(std::string(kFieldIdProp),
-                                std::to_string(field_ref->get().field_id.value()),
-                                false);
+                                std::to_string(field_ref->get().field_id.value()), false);
         new_record_node->addCustomAttributesForField(attributes);
       }
 
       // Recursively apply field IDs to nested fields if they exist
-      if (field_ref->get().nested_mapping &&
-          field_node->type() == ::avro::AVRO_RECORD) {
+      if (field_ref->get().nested_mapping && field_node->type() == ::avro::AVRO_RECORD) {
         const auto& nested_mapping = field_ref->get().nested_mapping;
         auto fields_span = nested_mapping->fields();
         std::vector<MappedField> fields_vector(fields_span.begin(), fields_span.end());
         auto nested_name_mapping = NameMapping::Make(std::move(fields_vector));
 
-        ICEBERG_ASSIGN_OR_RAISE(auto new_nested_node,
-                                CreateAvroNodeWithFieldIds(field_node, *nested_name_mapping));
+        ICEBERG_ASSIGN_OR_RAISE(
+            auto new_nested_node,
+            CreateAvroNodeWithFieldIds(field_node, *nested_name_mapping));
         new_record_node->addName(field_name);
         new_record_node->addLeaf(new_nested_node);
       } else {
@@ -867,7 +866,7 @@ Result<::avro::NodePtr> CreateRecordNodeWithFieldIds(const ::avro::NodePtr& orig
 }
 
 Result<::avro::NodePtr> CreateArrayNodeWithFieldIds(const ::avro::NodePtr& original_node,
-                                                     const NameMapping& name_mapping) {
+                                                    const NameMapping& name_mapping) {
   if (original_node->leaves() != 1) {
     return InvalidSchema("Array type must have exactly one leaf");
   }
@@ -880,8 +879,9 @@ Result<::avro::NodePtr> CreateArrayNodeWithFieldIds(const ::avro::NodePtr& origi
   if (original_node->logicalType().type() == ::avro::LogicalType::CUSTOM &&
       original_node->logicalType().customLogicalType() != nullptr &&
       original_node->logicalType().customLogicalType()->name() == kMapLogicalType) {
-    ICEBERG_ASSIGN_OR_RAISE(auto new_element_node,
-                            CreateAvroNodeWithFieldIds(original_node->leafAt(0), name_mapping));
+    ICEBERG_ASSIGN_OR_RAISE(
+        auto new_element_node,
+        CreateAvroNodeWithFieldIds(original_node->leafAt(0), name_mapping));
     new_array_node->addLeaf(new_element_node);
     return new_array_node;
   }
@@ -897,14 +897,15 @@ Result<::avro::NodePtr> CreateArrayNodeWithFieldIds(const ::avro::NodePtr& origi
     }
   }
 
-  ICEBERG_ASSIGN_OR_RAISE(auto new_element_node,
-                          CreateAvroNodeWithFieldIds(original_node->leafAt(0), name_mapping));
+  ICEBERG_ASSIGN_OR_RAISE(
+      auto new_element_node,
+      CreateAvroNodeWithFieldIds(original_node->leafAt(0), name_mapping));
   new_array_node->addLeaf(new_element_node);
   return new_array_node;
 }
 
 Result<::avro::NodePtr> CreateMapNodeWithFieldIds(const ::avro::NodePtr& original_node,
-                                                   const NameMapping& name_mapping) {
+                                                  const NameMapping& name_mapping) {
   if (original_node->leaves() != 2) {
     return InvalidSchema("Map type must have exactly two leaves");
   }
@@ -927,17 +928,17 @@ Result<::avro::NodePtr> CreateMapNodeWithFieldIds(const ::avro::NodePtr& origina
     if (value_field->get().field_id.has_value()) {
       ::avro::CustomAttributes attributes;
       attributes.addAttribute(std::string(kValueIdProp),
-                              std::to_string(value_field->get().field_id.value()),
-                              false);
+                              std::to_string(value_field->get().field_id.value()), false);
       new_map_node->addCustomAttributesForField(attributes);
     }
   }
 
   // Add key and value nodes
-  ICEBERG_ASSIGN_OR_RAISE(auto new_key_node,
-                          CreateAvroNodeWithFieldIds(original_node->leafAt(0), name_mapping));
-  ICEBERG_ASSIGN_OR_RAISE(auto new_value_node,
-                          CreateAvroNodeWithFieldIds(original_node->leafAt(1), name_mapping));
+  ICEBERG_ASSIGN_OR_RAISE(auto new_key_node, CreateAvroNodeWithFieldIds(
+                                                 original_node->leafAt(0), name_mapping));
+  ICEBERG_ASSIGN_OR_RAISE(
+      auto new_value_node,
+      CreateAvroNodeWithFieldIds(original_node->leafAt(1), name_mapping));
   new_map_node->addLeaf(new_key_node);
   new_map_node->addLeaf(new_value_node);
 
@@ -945,7 +946,7 @@ Result<::avro::NodePtr> CreateMapNodeWithFieldIds(const ::avro::NodePtr& origina
 }
 
 Result<::avro::NodePtr> CreateUnionNodeWithFieldIds(const ::avro::NodePtr& original_node,
-                                                     const NameMapping& name_mapping) {
+                                                    const NameMapping& name_mapping) {
   if (original_node->leaves() != 2) {
     return InvalidSchema("Union type must have exactly two branches");
   }
