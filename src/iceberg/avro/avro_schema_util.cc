@@ -890,6 +890,12 @@ Result<::avro::NodePtr> CreateArrayNodeWithFieldIds(const ::avro::NodePtr& origi
         auto new_element_node,
         MakeAvroNodeWithFieldIds(original_node->leafAt(0), *element_field));
     new_array_node->addLeaf(new_element_node);
+    
+    // Add element field ID as custom attribute
+    ::avro::CustomAttributes element_attributes;
+    element_attributes.addAttribute(std::string(kFieldIdProp),
+                                    std::to_string(*element_field->field_id), false);
+    new_array_node->addCustomAttributesForField(element_attributes);
   } else {
     // If no element field found, this is an error
     return InvalidSchema("Element field not found in nested mapping for array");
@@ -951,6 +957,30 @@ Result<::avro::NodePtr> CreateMapNodeWithFieldIds(const ::avro::NodePtr& origina
       MakeAvroNodeWithFieldIds(original_node->leafAt(1), value_field));
   new_map_node->addLeaf(new_key_node);
   new_map_node->addLeaf(new_value_node);
+
+  // Preserve existing custom attributes from the original node and add field ID attributes
+  // Copy existing attributes from the original node (if any)
+  if (original_node->customAttributes() > 0) {
+    const auto& original_attrs = original_node->customAttributesAt(0);
+    const auto& existing_attrs = original_attrs.attributes();
+    for (const auto& attr_pair : existing_attrs) {
+      // Copy each existing attribute to preserve original metadata
+      ::avro::CustomAttributes attributes;
+      attributes.addAttribute(attr_pair.first, attr_pair.second, false);
+      new_map_node->addCustomAttributesForField(attributes);
+    }
+  }
+  
+  // Add field ID attributes for key and value as separate custom attributes
+  ::avro::CustomAttributes key_attributes;
+  key_attributes.addAttribute(std::string(kFieldIdProp),
+                              std::to_string(*key_mapped_field.field_id), false);
+  new_map_node->addCustomAttributesForField(key_attributes);
+  
+  ::avro::CustomAttributes value_attributes;
+  value_attributes.addAttribute(std::string(kFieldIdProp),
+                                std::to_string(*value_mapped_field.field_id), false);
+  new_map_node->addCustomAttributesForField(value_attributes);
 
   return new_map_node;
 }
