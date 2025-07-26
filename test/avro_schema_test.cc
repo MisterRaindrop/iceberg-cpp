@@ -1132,7 +1132,8 @@ class NameMappingAvroSchemaTest : public ::testing::Test {
     return NameMapping::Make(std::move(fields));
   }
 
-  // Helper function to create a name mapping for complex map types (array<struct<key,value>>)
+  // Helper function to create a name mapping for complex map types
+  // (array<struct<key,value>>)
   std::unique_ptr<NameMapping> CreateComplexMapNameMapping() {
     std::vector<MappedField> fields;
     fields.emplace_back(MappedField{.names = {"id"}, .field_id = 1});
@@ -1145,12 +1146,13 @@ class NameMappingAvroSchemaTest : public ::testing::Test {
 
     // Nested mapping for array
     std::vector<MappedField> array_fields;
-    array_fields.emplace_back(MappedField{.names = {"element"}, .field_id = 50, .nested_mapping = std::move(element_mapping)});
+    array_fields.emplace_back(MappedField{.names = {"element"},
+                                          .field_id = 50,
+                                          .nested_mapping = std::move(element_mapping)});
     auto array_mapping = MappedFields::Make(std::move(array_fields));
 
-    fields.emplace_back(MappedField{.names = {"entries"},
-                                    .field_id = 2,
-                                    .nested_mapping = std::move(array_mapping)});
+    fields.emplace_back(MappedField{
+        .names = {"entries"}, .field_id = 2, .nested_mapping = std::move(array_mapping)});
 
     return NameMapping::Make(std::move(fields));
   }

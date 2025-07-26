@@ -111,7 +111,7 @@ class AvroReader::Impl {
             MakeAvroNodeWithFieldIds(file_schema.root(), *options.name_mapping));
 
         // Update the file schema to use the new schema with field IDs
-        file_schema = ::avro::ValidSchema(new_root_node);;
+        file_schema = ::avro::ValidSchema(new_root_node);
       } else {
         return InvalidSchema(
             "Avro file schema has no field IDs and no name mapping provided");
