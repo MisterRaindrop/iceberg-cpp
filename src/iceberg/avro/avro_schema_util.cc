@@ -890,7 +890,7 @@ Result<::avro::NodePtr> CreateArrayNodeWithFieldIds(const ::avro::NodePtr& origi
         auto new_element_node,
         MakeAvroNodeWithFieldIds(original_node->leafAt(0), *element_field));
     new_array_node->addLeaf(new_element_node);
-    
+
     // Add element field ID as custom attribute
     ::avro::CustomAttributes element_attributes;
     element_attributes.addAttribute(std::string(kFieldIdProp),
@@ -920,14 +920,14 @@ Result<::avro::NodePtr> CreateMapNodeWithFieldIds(const ::avro::NodePtr& origina
   // Find key and value field mappings by name
   std::optional<int32_t> key_id = field.nested_mapping->Id("key");
   std::optional<int32_t> value_id = field.nested_mapping->Id("value");
-  
+
   if (!key_id || !value_id) {
     return InvalidSchema("Map type requires both 'key' and 'value' field mappings");
   }
 
   std::optional<MappedFieldConstRef> key_field_ref = field.nested_mapping->Field(*key_id);
   std::optional<MappedFieldConstRef> value_field_ref = field.nested_mapping->Field(*value_id);
-  
+
   if (!key_field_ref || !value_field_ref) {
     return InvalidSchema("Map type requires both key and value field mappings");
   }
@@ -970,13 +970,13 @@ Result<::avro::NodePtr> CreateMapNodeWithFieldIds(const ::avro::NodePtr& origina
       new_map_node->addCustomAttributesForField(attributes);
     }
   }
-  
+
   // Add field ID attributes for key and value as separate custom attributes
   ::avro::CustomAttributes key_attributes;
   key_attributes.addAttribute(std::string(kFieldIdProp),
                               std::to_string(*key_mapped_field.field_id), false);
   new_map_node->addCustomAttributesForField(key_attributes);
-  
+
   ::avro::CustomAttributes value_attributes;
   value_attributes.addAttribute(std::string(kFieldIdProp),
                                 std::to_string(*value_mapped_field.field_id), false);
