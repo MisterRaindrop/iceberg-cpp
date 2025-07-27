@@ -29,8 +29,11 @@ configure_file("${CMAKE_SOURCE_DIR}/test/test_config.h.in"
                "${CMAKE_BINARY_DIR}/iceberg/test/test_config.h")
 
 add_executable(schema_test)
+target_include_directories(schema_test PRIVATE "${CMAKE_BINARY_DIR}")
 target_sources(schema_test
-               PRIVATE schema_test.cc
+               PRIVATE name_mapping_test.cc
+                       test_common.cc
+                       schema_test.cc
                        schema_field_test.cc
                        type_test.cc
                        transform_test.cc
