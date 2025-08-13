@@ -861,7 +861,8 @@ Result<::avro::NodePtr> CreateArrayNodeWithFieldIds(const ::avro::NodePtr& origi
       for (const auto& attr_pair : existing_attrs) {
         // Skip element-id as we might set it differently
         if (attr_pair.first != kElementIdProp) {
-          merged_attributes.addAttribute(attr_pair.first, attr_pair.second, /*addQuote=*/false);
+          merged_attributes.addAttribute(attr_pair.first, attr_pair.second,
+                                         /*addQuote=*/false);
         }
       }
       // Add merged attributes if we found any
@@ -894,8 +895,8 @@ Result<::avro::NodePtr> CreateArrayNodeWithFieldIds(const ::avro::NodePtr& origi
 
   // First add our element field ID (highest priority)
   merged_attributes.addAttribute(std::string(kElementIdProp),
-                                std::to_string(*element_field.field_id),
-                                /*addQuote=*/false);
+                                 std::to_string(*element_field.field_id),
+                                 /*addQuote=*/false);
 
   // Then merge any custom attributes from original node (except element-id)
   if (original_node->customAttributes() > 0) {
@@ -904,7 +905,8 @@ Result<::avro::NodePtr> CreateArrayNodeWithFieldIds(const ::avro::NodePtr& origi
     for (const auto& attr_pair : existing_attrs) {
       // Skip element-id as we've already set it above
       if (attr_pair.first != kElementIdProp) {
-        merged_attributes.addAttribute(attr_pair.first, attr_pair.second, /*addQuote=*/false);
+        merged_attributes.addAttribute(attr_pair.first, attr_pair.second,
+                                       /*addQuote=*/false);
       }
     }
   }
