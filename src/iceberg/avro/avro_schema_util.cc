@@ -235,15 +235,16 @@ Status ToAvroNodeVisitor::Visit(const StructType& type, ::avro::NodePtr* node) {
     ICEBERG_RETURN_UNEXPECTED(Visit(sub_field, &field_node));
 
     bool is_valid_field_name = ValidAvroName(sub_field.name());
-    std::string field_name =
-        is_valid_field_name ? std::string(sub_field.name()) : SanitizeFieldName(sub_field.name());
+    std::string field_name = is_valid_field_name ? std::string(sub_field.name())
+                                                 : SanitizeFieldName(sub_field.name());
 
     (*node)->addName(field_name);
     (*node)->addLeaf(field_node);
 
     ::avro::CustomAttributes attributes = GetAttributesWithFieldId(sub_field.field_id());
     if (!is_valid_field_name) {
-      attributes.addAttribute(std::string(kIcebergFieldNameProp), std::string(sub_field.name()),
+      attributes.addAttribute(std::string(kIcebergFieldNameProp),
+                              std::string(sub_field.name()),
                               /*addQuotes=*/true);
     }
     (*node)->addCustomAttributesForField(attributes);
