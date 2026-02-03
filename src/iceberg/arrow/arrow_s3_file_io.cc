@@ -22,6 +22,7 @@
 #include <string_view>
 
 #include <arrow/filesystem/filesystem.h>
+#include <arrow/filesystem/localfs.h>
 #if __has_include(<arrow/filesystem/s3fs.h>)
 #include <arrow/filesystem/s3fs.h>
 #define ICEBERG_ARROW_HAS_S3 1
@@ -30,7 +31,10 @@
 #endif
 
 #include "iceberg/arrow/arrow_file_io.h"
+#include "iceberg/arrow/arrow_fs_file_io_internal.h"
 #include "iceberg/arrow/arrow_status_internal.h"
+#include "iceberg/arrow/s3_properties.h"
+#include "iceberg/util/macros.h"
 
 namespace iceberg::arrow {
 
@@ -60,28 +64,103 @@ Status EnsureS3Initialized() {
 #endif
 }
 
+#if ICEBERG_ARROW_HAS_S3
+/// \brief Configure S3Options from a properties map.
+///
+/// \param properties The configuration properties map.
+/// \return Configured S3Options.
+::arrow::fs::S3Options ConfigureS3Options(
+    const std::unordered_map<std::string, std::string>& properties) {
+  ::arrow::fs::S3Options options;
+
+  // Configure credentials
+  auto access_key_it = properties.find(S3Properties::kAccessKeyId);
+  auto secret_key_it = properties.find(S3Properties::kSecretAccessKey);
+  auto session_token_it = properties.find(S3Properties::kSessionToken);
+
+  if (access_key_it != properties.end() && secret_key_it != properties.end()) {
+    if (session_token_it != properties.end()) {
+      options.ConfigureAccessKey(access_key_it->second, secret_key_it->second,
+                                 session_token_it->second);
+    } else {
+      options.ConfigureAccessKey(access_key_it->second, secret_key_it->second);
+    }
+  } else {
+    // Use default credential chain (environment, instance profile, etc.)
+    options.ConfigureDefaultCredentials();
+  }
+
+  // Configure region
+  auto region_it = properties.find(S3Properties::kRegion);
+  if (region_it != properties.end()) {
+    options.region = region_it->second;
+  }
+
+  // Configure endpoint (for MinIO, LocalStack, etc.)
+  auto endpoint_it = properties.find(S3Properties::kEndpoint);
+  if (endpoint_it != properties.end()) {
+    options.endpoint_override = endpoint_it->second;
+  }
+
+  // Configure path-style access (needed for MinIO)
+  auto path_style_it = properties.find(S3Properties::kPathStyleAccess);
+  if (path_style_it != properties.end()) {
+    // Arrow's S3 path-style is controlled via endpoint scheme
+    // For path-style access, we need to ensure the endpoint is properly configured
+  }
+
+  // Configure SSL
+  auto ssl_it = properties.find(S3Properties::kSslEnabled);
+  if (ssl_it != properties.end() && ssl_it->second == "false") {
+    options.scheme = "http";
+  }
+
+  // Configure timeouts
+  auto connect_timeout_it = properties.find(S3Properties::kConnectTimeoutMs);
+  if (connect_timeout_it != properties.end()) {
+    options.connect_timeout = std::stod(connect_timeout_it->second) / 1000.0;
+  }
+
+  auto socket_timeout_it = properties.find(S3Properties::kSocketTimeoutMs);
+  if (socket_timeout_it != properties.end()) {
+    options.request_timeout = std::stod(socket_timeout_it->second) / 1000.0;
+  }
+
+  return options;
+}
+
+/// \brief Create an S3 FileSystem with the given options.
+///
+/// \param options The S3Options to use.
+/// \return A shared_ptr to the S3FileSystem, or an error.
+Result<std::shared_ptr<::arrow::fs::FileSystem>> MakeS3FileSystem(
+    const ::arrow::fs::S3Options& options) {
+  ICEBERG_RETURN_UNEXPECTED(EnsureS3Initialized());
+  ICEBERG_ARROW_ASSIGN_OR_RETURN(auto fs, ::arrow::fs::S3FileSystem::Make(options));
+  return fs;
+}
+#endif
+
 Result<std::shared_ptr<::arrow::fs::FileSystem>> ResolveFileSystemFromUri(
     const std::string& uri, std::string* out_path) {
   if (IsS3Uri(uri)) {
-    auto init_status = EnsureS3Initialized();
-    if (!init_status.has_value()) {
-      return std::unexpected<Error>(init_status.error());
-    }
+    ICEBERG_RETURN_UNEXPECTED(EnsureS3Initialized());
   }
   ICEBERG_ARROW_ASSIGN_OR_RETURN(auto fs, ::arrow::fs::FileSystemFromUri(uri, out_path));
   return fs;
 }
 
+/// \brief ArrowUriFileIO resolves FileSystem from URI for each operation.
+///
+/// This implementation is thread-safe as it creates a new FileSystem instance
+/// for each operation. However, it may be less efficient than caching the
+/// FileSystem. S3 initialization is done once per process.
 class ArrowUriFileIO : public FileIO {
  public:
   Result<std::string> ReadFile(const std::string& file_location,
                                std::optional<size_t> length) override {
     std::string path;
-    auto fs_result = ResolveFileSystemFromUri(file_location, &path);
-    if (!fs_result.has_value()) {
-      return std::unexpected<Error>(fs_result.error());
-    }
-    auto fs = std::move(fs_result).value();
+    ICEBERG_ASSIGN_OR_RAISE(auto fs, ResolveFileSystemFromUri(file_location, &path));
     ::arrow::fs::FileInfo file_info(path);
     if (length.has_value()) {
       file_info.set_size(length.value());
@@ -108,11 +187,7 @@ class ArrowUriFileIO : public FileIO {
   Status WriteFile(const std::string& file_location,
                    std::string_view content) override {
     std::string path;
-    auto fs_result = ResolveFileSystemFromUri(file_location, &path);
-    if (!fs_result.has_value()) {
-      return std::unexpected<Error>(fs_result.error());
-    }
-    auto fs = std::move(fs_result).value();
+    ICEBERG_ASSIGN_OR_RAISE(auto fs, ResolveFileSystemFromUri(file_location, &path));
     ICEBERG_ARROW_ASSIGN_OR_RETURN(auto file, fs->OpenOutputStream(path));
     ICEBERG_ARROW_RETURN_NOT_OK(file->Write(content.data(), content.size()));
     ICEBERG_ARROW_RETURN_NOT_OK(file->Flush());
@@ -122,11 +197,7 @@ class ArrowUriFileIO : public FileIO {
 
   Status DeleteFile(const std::string& file_location) override {
     std::string path;
-    auto fs_result = ResolveFileSystemFromUri(file_location, &path);
-    if (!fs_result.has_value()) {
-      return std::unexpected<Error>(fs_result.error());
-    }
-    auto fs = std::move(fs_result).value();
+    ICEBERG_ASSIGN_OR_RAISE(auto fs, ResolveFileSystemFromUri(file_location, &path));
     ICEBERG_ARROW_RETURN_NOT_OK(fs->DeleteFile(path));
     return {};
   }
@@ -141,13 +212,35 @@ Result<std::unique_ptr<FileIO>> MakeS3FileIO(const std::string& uri) {
 #if !ICEBERG_ARROW_HAS_S3
   return NotImplemented("Arrow S3 support is not enabled");
 #else
+  // Validate that S3 can be initialized and the URI is valid
   std::string path;
-  auto fs_result = ResolveFileSystemFromUri(uri, &path);
-  if (!fs_result.has_value()) {
-    return std::unexpected<Error>(fs_result.error());
-  }
+  ICEBERG_ASSIGN_OR_RAISE(auto fs, ResolveFileSystemFromUri(uri, &path));
   (void)path;
+  (void)fs;
   return std::make_unique<ArrowUriFileIO>();
+#endif
+}
+
+Result<std::unique_ptr<FileIO>> MakeS3FileIO(
+    const std::string& uri,
+    const std::unordered_map<std::string, std::string>& properties) {
+  if (!IsS3Uri(uri)) {
+    return InvalidArgument("S3 URI must start with s3://");
+  }
+#if !ICEBERG_ARROW_HAS_S3
+  return NotImplemented("Arrow S3 support is not enabled");
+#else
+  // If properties are empty, use the simple URI-based resolution
+  if (properties.empty()) {
+    return MakeS3FileIO(uri);
+  }
+
+  // Create S3FileSystem with explicit configuration
+  auto options = ConfigureS3Options(properties);
+  ICEBERG_ASSIGN_OR_RAISE(auto fs, MakeS3FileSystem(options));
+
+  // Return ArrowFileSystemFileIO with the configured S3 filesystem
+  return std::make_unique<ArrowFileSystemFileIO>(std::move(fs));
 #endif
 }
 
