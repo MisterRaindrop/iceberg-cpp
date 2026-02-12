@@ -120,7 +120,8 @@ class RestCatalogIntegrationTest : public ::testing::Test {
           kMaxRetries);
       std::this_thread::sleep_for(std::chrono::milliseconds(kRetryDelayMs));
     }
-    throw std::runtime_error("REST catalog failed to start within {} seconds");
+    throw std::runtime_error(
+        std::format("REST catalog failed to start within {} seconds", kMaxRetries));
   }
 
   static void TearDownTestSuite() { docker_compose_.reset(); }

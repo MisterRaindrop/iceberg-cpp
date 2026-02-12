@@ -64,7 +64,7 @@ jobs:
         env:
           CC: gcc-14
           CXX: g++-14
-        run: ci/scripts/build_iceberg.sh $(pwd) ON
+        run: ci/scripts/build_iceberg.sh $(pwd) ON OFF ON
       - name: Build Example
         shell: bash
         env:
@@ -92,7 +92,7 @@ jobs:
         run: bash ci/scripts/start_minio.sh
       - name: Build Iceberg
         shell: bash
-        run: ci/scripts/build_iceberg.sh $(pwd)
+        run: ci/scripts/build_iceberg.sh $(pwd) OFF OFF ON
       - name: Build Example
         shell: bash
         run: ci/scripts/build_example.sh $(pwd)/example
@@ -127,7 +127,7 @@ jobs:
           SCCACHE_GHA_ENABLED: "true"
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
-          bash -c "ci/scripts/build_iceberg.sh $(pwd) OFF ON"
+          bash -c "ci/scripts/build_iceberg.sh $(pwd) OFF ON ON"
           sccache --show-stats
       - name: Build Example
         shell: cmd

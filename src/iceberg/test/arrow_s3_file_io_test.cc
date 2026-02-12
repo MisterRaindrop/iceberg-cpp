@@ -21,7 +21,7 @@
 #include <string>
 #include <unordered_map>
 
-#if __has_include(<arrow/filesystem/s3fs.h>)
+#ifdef ICEBERG_HAVE_S3
 #include <arrow/filesystem/s3fs.h>
 #endif
 #include <gtest/gtest.h>
@@ -32,7 +32,7 @@
 
 namespace iceberg::arrow {
 
-#if __has_include(<arrow/filesystem/s3fs.h>)
+#ifdef ICEBERG_HAVE_S3
 namespace {
 class ArrowS3Environment final : public ::testing::Environment {
  public:
@@ -47,7 +47,7 @@ TEST(ArrowS3FileIOTest, RejectsNonS3Uri) {
   EXPECT_THAT(result, HasErrorMessage("s3://"));
 }
 
-#if __has_include(<arrow/filesystem/s3fs.h>)
+#ifdef ICEBERG_HAVE_S3
 TEST(ArrowS3FileIOTest, RequiresS3SupportAtBuildTime) {
   auto result = MakeS3FileIO("s3://bucket/path");
   if (!result.has_value()) {
@@ -216,11 +216,3 @@ TEST(ArrowS3FileIOTest, MakeS3FileIOWithTimeouts) {
 }
 
 }  // namespace iceberg::arrow
-
-#if __has_include(<arrow/filesystem/s3fs.h>)
-int main(int argc, char** argv) {
-  ::testing::InitGoogleTest(&argc, argv);
-  ::testing::AddGlobalTestEnvironment(new iceberg::arrow::ArrowS3Environment());
-  return RUN_ALL_TESTS();
-}
-#endif

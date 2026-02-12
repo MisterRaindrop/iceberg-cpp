@@ -55,22 +55,9 @@ class ICEBERG_REST_EXPORT RestCatalog : public Catalog,
 
   /// \brief Create a RestCatalog instance with auto-detected FileIO.
   ///
-  /// This overload automatically creates an appropriate FileIO based on the "io-impl"
-  /// property or the warehouse location URI scheme.
-  ///
-  /// FileIO selection logic:
-  /// 1. If "io-impl" property is set, use the specified implementation from FileIORegistry.
-  /// 2. Otherwise, auto-detect based on warehouse URI:
-  ///    - "s3://" -> ArrowS3FileIO
-  ///    - Local path -> ArrowLocalFileIO
-  ///
-  /// Users can register custom FileIO implementations via FileIORegistry::Register():
-  /// \code
-  /// FileIORegistry::Register("com.mycompany.MyFileIO",
-  ///     [](const std::string& warehouse, const auto& props) {
-  ///         return std::make_shared<MyFileIO>(warehouse, props);
-  ///     });
-  /// \endcode
+  /// This overload automatically creates an appropriate FileIO based on the
+  /// warehouse location and properties. See CreateFileIOFromProperties() in
+  /// iceberg/util/file_io_util.h for the selection logic.
   ///
   /// \param config the configuration for the RestCatalog, including warehouse location
   ///        and optional "io-impl" property

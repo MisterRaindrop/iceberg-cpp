@@ -23,6 +23,7 @@ source_dir=${1}
 build_dir=${1}/build
 build_rest_integration_test=${2:-OFF}
 build_enable_sccache=${3:-OFF}
+build_s3=${4:-OFF}
 
 mkdir ${build_dir}
 pushd ${build_dir}
@@ -37,6 +38,7 @@ CMAKE_ARGS=(
     "-DICEBERG_BUILD_STATIC=ON"
     "-DICEBERG_BUILD_SHARED=ON"
     "-DICEBERG_BUILD_REST_INTEGRATION_TESTS=${build_rest_integration_test}"
+    "-DICEBERG_S3=${build_s3}"
 )
 
 if is_windows; then

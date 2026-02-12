@@ -101,6 +101,7 @@ set(ICEBERG_SOURCES
     update/update_statistics.cc
     util/bucket_util.cc
     util/content_file_util.cc
+    util/file_io_util.cc
     util/conversions.cc
     util/decimal.cc
     util/gzip_internal.cc
@@ -238,6 +239,15 @@ if(ICEBERG_BUILD_BUNDLE)
                   ${ICEBERG_BUNDLE_SHARED_INSTALL_INTERFACE_LIBS}
                   OUTPUTS
                   ICEBERG_BUNDLE_LIBRARIES)
+
+  if(ICEBERG_S3)
+    if(TARGET iceberg_bundle_static)
+      target_compile_definitions(iceberg_bundle_static PUBLIC ICEBERG_HAVE_S3=1)
+    endif()
+    if(TARGET iceberg_bundle_shared)
+      target_compile_definitions(iceberg_bundle_shared PUBLIC ICEBERG_HAVE_S3=1)
+    endif()
+  endif()
 
   add_subdirectory(arrow)
   add_subdirectory(avro)
