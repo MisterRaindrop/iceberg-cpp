@@ -15,16 +15,12 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# Skeleton for the iceberg_hive library target.
-#
-# Source layout, dependency wiring and `add_iceberg_lib(iceberg_hive ...)`
-# are introduced in follow-up commits (C05 registers the actual library
-# target). For now this directory:
-#
-#   * installs the public export header (iceberg_hive_export.h);
-#   * generates the Hive Metastore C++ bindings from the vendored
-#     Thrift IDL at build time, so they stay in sync with whatever IDL
-#     revision the repository checks in.
+# The iceberg_hive library: a Hive Metastore (HMS) catalog client built on
+# generated Apache Thrift bindings. Layout mirrors iceberg_rest.
+
+# ----------------------------------------------------------------------
+# Hive Metastore Thrift bindings, generated at build time so the
+# checked-in IDL is the only source of truth.
 
 set(_hive_idl_dir ${PROJECT_SOURCE_DIR}/third_party/hive_metastore)
 set(_hive_idl ${_hive_idl_dir}/hive_metastore.thrift)
@@ -61,10 +57,54 @@ set_source_files_properties(${ICEBERG_HIVE_THRIFT_GEN_SOURCES}
                             ${ICEBERG_HIVE_THRIFT_GEN_HEADERS}
                             PROPERTIES GENERATED TRUE SKIP_LINTING TRUE)
 
-# A custom target so that follow-up commits (C05's `iceberg_hive` lib)
-# can depend on the codegen step by name, and so `ninja
-# iceberg_hive_thrift_bindings` exercises just the generator.
+# Standalone target so `ninja iceberg_hive_thrift_bindings` exercises the
+# code generator without building the full iceberg_hive library.
 add_custom_target(iceberg_hive_thrift_bindings DEPENDS ${ICEBERG_HIVE_THRIFT_GEN_SOURCES}
                                                        ${ICEBERG_HIVE_THRIFT_GEN_HEADERS})
+
+# ----------------------------------------------------------------------
+# iceberg_hive library
+
+if(NOT TARGET thrift::thrift)
+  message(FATAL_ERROR "iceberg_hive requires a `thrift::thrift` target. With "
+                      "ICEBERG_BUILD_BUNDLE=ON this is created by Apache Arrow's bundled "
+                      "build; a system-Thrift fallback for the BUILD_BUNDLE=OFF case is "
+                      "not yet wired up. Build with -DICEBERG_BUILD_BUNDLE=ON for now.")
+endif()
+
+set(ICEBERG_HIVE_SOURCES hive_catalog.cc hive_catalog_properties.cc
+                         ${ICEBERG_HIVE_THRIFT_GEN_SOURCES})
+
+set(ICEBERG_HIVE_STATIC_BUILD_INTERFACE_LIBS)
+set(ICEBERG_HIVE_SHARED_BUILD_INTERFACE_LIBS)
+set(ICEBERG_HIVE_STATIC_INSTALL_INTERFACE_LIBS)
+set(ICEBERG_HIVE_SHARED_INSTALL_INTERFACE_LIBS)
+
+list(APPEND ICEBERG_HIVE_STATIC_BUILD_INTERFACE_LIBS
+     "$<IF:$<TARGET_EXISTS:iceberg_static>,iceberg_static,iceberg_shared>" thrift::thrift)
+list(APPEND ICEBERG_HIVE_SHARED_BUILD_INTERFACE_LIBS
+     "$<IF:$<TARGET_EXISTS:iceberg_shared>,iceberg_shared,iceberg_static>" thrift::thrift)
+list(APPEND
+     ICEBERG_HIVE_STATIC_INSTALL_INTERFACE_LIBS
+     "$<IF:$<TARGET_EXISTS:iceberg::iceberg_static>,iceberg::iceberg_static,iceberg::iceberg_shared>"
+     thrift::thrift)
+list(APPEND
+     ICEBERG_HIVE_SHARED_INSTALL_INTERFACE_LIBS
+     "$<IF:$<TARGET_EXISTS:iceberg::iceberg_shared>,iceberg::iceberg_shared,iceberg::iceberg_static>"
+     thrift::thrift)
+
+add_iceberg_lib(iceberg_hive
+                SOURCES
+                ${ICEBERG_HIVE_SOURCES}
+                PRIVATE_INCLUDES
+                ${_thrift_gen_dir}
+                SHARED_LINK_LIBS
+                ${ICEBERG_HIVE_SHARED_BUILD_INTERFACE_LIBS}
+                STATIC_LINK_LIBS
+                ${ICEBERG_HIVE_STATIC_BUILD_INTERFACE_LIBS}
+                STATIC_INSTALL_INTERFACE_LIBS
+                ${ICEBERG_HIVE_STATIC_INSTALL_INTERFACE_LIBS}
+                SHARED_INSTALL_INTERFACE_LIBS
+                ${ICEBERG_HIVE_SHARED_INSTALL_INTERFACE_LIBS})
 
 iceberg_install_all_headers(iceberg/catalog/hive)

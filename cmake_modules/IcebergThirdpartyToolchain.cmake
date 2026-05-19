@@ -616,3 +616,17 @@ endif()
 if(ICEBERG_BUILD_REST)
   resolve_cpr_dependency()
 endif()
+
+# Arrow's build_thrift() creates `thrift::thrift` as an IMPORTED target
+# scoped to the FetchContent directory it lives in, so iceberg_hive
+# (which is processed in our top-level scope) cannot see it. Promote it
+# to a global alias here, after every resolve_*_dependency() has had a
+# chance to create the underlying `thrift` target. The `thrift` runtime
+# target is non-imported and globally visible by virtue of having been
+# created with add_library inside a vendored add_subdirectory.
+if(ICEBERG_BUILD_HIVE
+   AND TARGET thrift
+   AND NOT TARGET thrift::thrift)
+  add_library(thrift::thrift INTERFACE IMPORTED GLOBAL)
+  target_link_libraries(thrift::thrift INTERFACE thrift)
+endif()
