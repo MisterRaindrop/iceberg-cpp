@@ -12,8 +12,8 @@ Vendored sources
 ================
 
 * hive_metastore.thrift
-    Apache Hive 3.1 standalone-metastore.
-    Source: https://github.com/apache/hive/blob/branch-3.1/standalone-metastore/src/main/thrift/hive_metastore.thrift
+    Apache Hive 4.0 standalone-metastore-common.
+    Source: https://github.com/apache/hive/blob/branch-4.0/standalone-metastore/metastore-common/src/main/thrift/hive_metastore.thrift
     Copyright (c) The Apache Software Foundation.
 
 * share/fb303/if/fb303.thrift
