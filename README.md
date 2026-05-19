@@ -38,6 +38,10 @@ C++ implementation of [Apache Iceberg™](https://iceberg.apache.org/).
 **Optional:**
 
 - Python 3 and [pre-commit](https://pre-commit.com/) (for linting)
+- [Apache Thrift](https://thrift.apache.org/) (compiler + C++ runtime, only when
+  `ICEBERG_BUILD_HIVE=ON`). Install via `brew install thrift` on macOS or
+  `apt install thrift-compiler libthrift-dev` on Debian/Ubuntu. Set
+  `Thrift_ROOT` to point at a non-standard install prefix.
 
 ## Quick Start
 

@@ -66,6 +66,11 @@ else()
   )
 endif()
 
+# Apache Thrift is consumed from the system install (`brew install
+# thrift` on macOS, `apt install thrift-compiler libthrift-dev` on
+# Debian/Ubuntu). No tarball is fetched here — see
+# `resolve_thrift_dependency()` below.
+
 # ----------------------------------------------------------------------
 # FetchContent
 
@@ -525,10 +530,82 @@ function(resolve_zstd_dependency)
   endif()
 endfunction()
 
+# ----------------------------------------------------------------------
+# Apache Thrift (C++ runtime + IDL compiler, used by iceberg_hive)
+
+function(resolve_thrift_dependency)
+  # iceberg_hive needs the Thrift IDL compiler (to regenerate HMS
+  # bindings at build time, see catalog/hive/CMakeLists.txt) plus the
+  # Thrift C++ runtime to link against. Both are expected to be
+  # installed system-wide (e.g. `brew install thrift` on macOS,
+  # `apt install thrift-compiler libthrift-dev` on Debian/Ubuntu).
+  #
+  # We deliberately do NOT vendor Apache Thrift via FetchContent: when
+  # ICEBERG_BUILD_BUNDLE=ON, Apache Arrow's bundled-build pipeline
+  # creates `thrift::thrift` as an IMPORTED target inside its own
+  # build_thrift() helper, which collides with any pre-existing
+  # FetchContent target of the same name. Routing both Arrow and
+  # iceberg_hive through the system Thrift install avoids that clash
+  # and keeps a single Thrift runtime in the final link.
+  #
+  # This function:
+  #   1. On macOS, points Arrow's `FindThriftAlt.cmake` at the brew
+  #      install via `Thrift_ROOT`.
+  #   2. Locates the thrift IDL compiler and exposes it as
+  #      `thrift::compiler` for C04's `add_custom_command` step.
+  #
+  # The `thrift::thrift` runtime target is created later by Arrow's
+  # resolve_dependency(Thrift) (when ICEBERG_BUILD_BUNDLE=ON) or by
+  # `iceberg_hive`'s own find_package fallback when the bundle is off.
+
+  if(APPLE
+     AND NOT DEFINED Thrift_ROOT
+     AND NOT DEFINED ENV{Thrift_ROOT})
+    find_program(_brew_executable brew)
+    if(_brew_executable)
+      execute_process(COMMAND ${_brew_executable} --prefix thrift
+                      OUTPUT_VARIABLE _brew_thrift_prefix
+                      OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET
+                      RESULT_VARIABLE _brew_thrift_status)
+      if(_brew_thrift_status EQUAL 0 AND _brew_thrift_prefix)
+        set(Thrift_ROOT
+            "${_brew_thrift_prefix}"
+            CACHE PATH "Apache Thrift install prefix" FORCE)
+        message(STATUS "iceberg_hive: using Thrift from ${Thrift_ROOT}")
+      endif()
+    endif()
+  endif()
+
+  find_program(THRIFT_COMPILER_EXECUTABLE
+               NAMES thrift
+               HINTS "${Thrift_ROOT}/bin")
+  if(NOT THRIFT_COMPILER_EXECUTABLE)
+    message(FATAL_ERROR "iceberg_hive: ICEBERG_BUILD_HIVE requires the Apache Thrift "
+                        "IDL compiler. Install it (e.g. `brew install thrift` on "
+                        "macOS or `apt install thrift-compiler` on Debian/Ubuntu) "
+                        "and re-run cmake, or set Thrift_ROOT to its install prefix.")
+  endif()
+  message(STATUS "iceberg_hive: thrift compiler = ${THRIFT_COMPILER_EXECUTABLE}")
+
+  if(NOT TARGET thrift::compiler)
+    add_executable(thrift::compiler IMPORTED GLOBAL)
+    set_target_properties(thrift::compiler PROPERTIES IMPORTED_LOCATION
+                                                      "${THRIFT_COMPILER_EXECUTABLE}")
+  endif()
+endfunction()
+
 resolve_zlib_dependency()
 resolve_nanoarrow_dependency()
 resolve_croaring_dependency()
 resolve_nlohmann_json_dependency()
+
+# Resolve Thrift before Arrow so that the iceberg_hive build settings
+# (BUILD_COMPILER=ON, BUILD_TESTING=OFF, ...) win over Arrow's bundled
+# Thrift declaration. FetchContent_Declare is idempotent on the second
+# call with the same name, so Arrow will reuse our vendored Thrift.
+if(ICEBERG_BUILD_HIVE)
+  resolve_thrift_dependency()
+endif()
 
 if(ICEBERG_BUILD_BUNDLE)
   resolve_arrow_dependency()
