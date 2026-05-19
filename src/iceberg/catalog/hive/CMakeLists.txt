@@ -15,12 +15,12 @@
 # specific language governing permissions and limitations
 # under the License.
 
-add_subdirectory(memory)
+# Skeleton for the iceberg_hive library target.
+#
+# Sources, dependency wiring and `add_iceberg_lib(iceberg_hive ...)` are
+# introduced in follow-up commits (C03 adds Thrift via FetchContent, C04
+# generates HMS bindings, C05 registers the actual library target). For now
+# this file installs only the public export header so that the directory is
+# wired into the build system end-to-end.
 
-if(ICEBERG_BUILD_REST)
-  add_subdirectory(rest)
-endif()
-
-if(ICEBERG_BUILD_HIVE)
-  add_subdirectory(hive)
-endif()
+iceberg_install_all_headers(iceberg/catalog/hive)
