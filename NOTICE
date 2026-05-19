@@ -3,3 +3,8 @@ Copyright 2024-2026 The Apache Software Foundation
 
 This product includes software developed at
 The Apache Software Foundation (http://www.apache.org/).
+
+Third-party Thrift IDLs vendored under third_party/hive_metastore/ are
+copies of upstream Apache projects (Apache Hive, Apache Thrift) and are
+distributed under the Apache License, Version 2.0. See
+third_party/hive_metastore/NOTICE for attribution details.

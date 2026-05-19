@@ -1,0 +1,26 @@
+Apache Iceberg C++ — Vendored Hive Metastore Thrift IDL
+Copyright 2026 The Apache Software Foundation
+
+This directory contains vendored Thrift interface definitions used to
+generate the C++ Hive Metastore (HMS) client consumed by the
+`iceberg_hive` library. The interface files are sourced verbatim from
+upstream Apache projects (only trailing whitespace and final newlines
+were normalized by the repository's pre-commit hooks) and remain under
+the Apache License, Version 2.0 (see LICENSE in the repository root).
+
+Vendored sources
+================
+
+* hive_metastore.thrift
+    Apache Hive 3.1 standalone-metastore.
+    Source: https://github.com/apache/hive/blob/branch-3.1/standalone-metastore/src/main/thrift/hive_metastore.thrift
+    Copyright (c) The Apache Software Foundation.
+
+* share/fb303/if/fb303.thrift
+    Apache Thrift `contrib/fb303` (the Facebook fb303 management
+    service IDL, transitively included by hive_metastore.thrift).
+    Source: https://github.com/apache/thrift/blob/master/contrib/fb303/if/fb303.thrift
+    Originally developed at Facebook, Inc. and contributed to the
+    Apache Software Foundation under the Apache License, Version 2.0.
+
+Both files retain their original Apache 2.0 license headers in-place.
