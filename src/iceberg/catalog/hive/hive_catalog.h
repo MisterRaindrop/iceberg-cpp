@@ -28,6 +28,10 @@
 #include "iceberg/catalog/hive/iceberg_hive_export.h"
 #include "iceberg/result.h"
 
+namespace iceberg::hive {
+class HmsClient;
+}  // namespace iceberg::hive
+
 /// \file iceberg/catalog/hive/hive_catalog.h
 /// \brief HiveCatalog implementation for talking to a Hive Metastore (HMS).
 
@@ -112,10 +116,11 @@ class ICEBERG_HIVE_EXPORT HiveCatalog : public Catalog,
       const std::string& metadata_file_location) override;
 
  private:
-  explicit HiveCatalog(HiveCatalogProperties config);
+  HiveCatalog(HiveCatalogProperties config, std::unique_ptr<HmsClient> client);
 
   HiveCatalogProperties config_;
   std::string name_;
+  std::unique_ptr<HmsClient> client_;
 };
 
 }  // namespace iceberg::hive
