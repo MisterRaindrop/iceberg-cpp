@@ -201,13 +201,28 @@ Status HiveCatalog::UpdateNamespaceProperties(
 
 Result<std::vector<TableIdentifier>> HiveCatalog::ListTables(const Namespace& ns) const {
   ICEBERG_RETURN_UNEXPECTED(ValidateNamespace(ns));
+  // Match Java HiveCatalog: HMS GetAllTables returns every table in the
+  // database regardless of kind. Filter to only the rows that carry the
+  // Iceberg marker, so the identifiers returned here are safely usable by
+  // LoadTable / DropTable / RenameTable (all of which now reject non-Iceberg
+  // rows). The probes run on the same pooled client to avoid serialising
+  // the listing across multiple HMS connections.
   return client_pool_->Run(
       [&](HmsClient* client) -> Result<std::vector<TableIdentifier>> {
         ICEBERG_ASSIGN_OR_RAISE(auto names, client->GetAllTables(ns.levels[0]));
         std::vector<TableIdentifier> identifiers;
         identifiers.reserve(names.size());
         for (auto& table_name : names) {
-          identifiers.push_back(TableIdentifier{.ns = ns, .name = std::move(table_name)});
+          TableIdentifier ident{.ns = ns, .name = std::move(table_name)};
+          auto table = client->GetTable(ident.ns.levels[0], ident.name);
+          if (!table.has_value()) {
+            if (table.error().kind == ErrorKind::kNoSuchTable) continue;
+            return std::unexpected(table.error());
+          }
+          if (!ValidateIcebergTable(ident, table->parameters).has_value()) {
+            continue;
+          }
+          identifiers.push_back(std::move(ident));
         }
         return identifiers;
       });
@@ -319,15 +334,26 @@ Result<std::shared_ptr<Transaction>> HiveCatalog::StageCreateTable(
 Result<bool> HiveCatalog::TableExists(const TableIdentifier& identifier) const {
   ICEBERG_RETURN_UNEXPECTED(ValidateNamespace(identifier.ns));
   ICEBERG_RETURN_UNEXPECTED(identifier.Validate());
+  // Treat non-Iceberg HMS tables as if they do not exist from the catalog's
+  // perspective; otherwise a TableExists=true would mislead callers into
+  // attempting LoadTable / DropTable / RenameTable, all of which now reject
+  // non-Iceberg rows with kNoSuchTable.
   return client_pool_->Run([&](HmsClient* client) -> Result<bool> {
     auto table = client->GetTable(identifier.ns.levels[0], identifier.name);
-    if (table.has_value()) {
-      return true;
+    if (!table.has_value()) {
+      if (table.error().kind == ErrorKind::kNoSuchTable) {
+        return false;
+      }
+      return std::unexpected(table.error());
     }
-    if (table.error().kind == ErrorKind::kNoSuchTable) {
-      return false;
+    auto iceberg = ValidateIcebergTable(identifier, table->parameters);
+    if (!iceberg.has_value()) {
+      if (iceberg.error().kind == ErrorKind::kNoSuchTable) {
+        return false;
+      }
+      return std::unexpected(iceberg.error());
     }
-    return std::unexpected(table.error());
+    return true;
   });
 }
 
