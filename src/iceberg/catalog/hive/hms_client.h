@@ -67,6 +67,7 @@ struct ICEBERG_HIVE_EXPORT HmsLockOptions {
   int32_t check_min_wait_ms = 50;
   int32_t check_max_wait_ms = 5000;
   int32_t acquire_timeout_ms = 180000;
+  int32_t heartbeat_interval_ms = 240000;
 };
 
 /// \brief A live connection to a Hive Metastore over Thrift.
@@ -202,6 +203,11 @@ class ICEBERG_HIVE_EXPORT HmsClient {
   /// sentinel handle returned by HmsLockHandle{}.
   Status Unlock(HmsLockHandle handle);
 
+  /// \brief Send a single `heartbeat(0, lockid)` to HMS to keep the
+  /// referenced lock from being reclaimed by HMS's server-side
+  /// `txn.timeout`. Used by `HmsLockHeartbeat` from a background thread.
+  Status Heartbeat(int64_t lock_id);
+
   /// @}
 
  private:
@@ -209,6 +215,50 @@ class ICEBERG_HIVE_EXPORT HmsClient {
   std::unique_ptr<Impl> impl_;
 
   explicit HmsClient(std::unique_ptr<Impl> impl);
+};
+
+/// \brief RAII background thread that keeps an HMS lock alive while it
+/// is held.
+///
+/// Java's `MetastoreLock` schedules a heartbeat task at
+/// `heartbeat-interval / 2` so the HMS lock manager does not reclaim the
+/// lock under server-side `txn.timeout`. We mirror that with one
+/// dedicated `std::thread` per held lock. The heartbeater opens its own
+/// dedicated `HmsClient` so it can issue RPCs without racing the commit
+/// path that owns the original (pooled) client.
+///
+/// `Stop()` (and the destructor) signal the worker to exit and join
+/// the thread. The destructor is best-effort: any `heartbeat` failures
+/// are swallowed so a transient HMS hiccup does not abort the calling
+/// commit; the CAS still protects correctness even if the heartbeat
+/// missed.
+class ICEBERG_HIVE_EXPORT HmsLockHeartbeat {
+ public:
+  /// \brief Start a heartbeat thread for `lock_id`. The thread connects
+  /// to HMS via `HmsClient::Connect(config)` and fires
+  /// `heartbeat(0, lock_id)` every `interval_ms / 2` until `Stop()` is
+  /// called or the heartbeater is destroyed. If the dedicated HMS
+  /// connection cannot be opened, `Start()` returns an error and no
+  /// thread is created (the caller may proceed without heartbeats but
+  /// the lock is then bounded by HMS's lease).
+  static Result<std::unique_ptr<HmsLockHeartbeat>> Start(
+      const HiveCatalogProperties& config, int64_t lock_id, int32_t interval_ms);
+
+  ~HmsLockHeartbeat();
+
+  HmsLockHeartbeat(const HmsLockHeartbeat&) = delete;
+  HmsLockHeartbeat& operator=(const HmsLockHeartbeat&) = delete;
+  HmsLockHeartbeat(HmsLockHeartbeat&&) = delete;
+  HmsLockHeartbeat& operator=(HmsLockHeartbeat&&) = delete;
+
+  /// \brief Signal the worker to stop and join the thread. Idempotent.
+  void Stop();
+
+ private:
+  class Impl;
+  std::unique_ptr<Impl> impl_;
+
+  explicit HmsLockHeartbeat(std::unique_ptr<Impl> impl);
 };
 
 }  // namespace iceberg::hive

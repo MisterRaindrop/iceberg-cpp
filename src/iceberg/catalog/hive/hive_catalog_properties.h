@@ -101,6 +101,14 @@ class ICEBERG_HIVE_EXPORT HiveCatalogProperties
   /// Java `HIVE_ACQUIRE_LOCK_TIMEOUT_MS`.
   inline static Entry<int> kLockAcquireTimeoutMs{"hive.lock-acquire-timeout-ms", 180000};
 
+  /// \brief How often the background heartbeat thread calls
+  /// `heartbeat(0, lockId)` on a held lock. The heartbeat actually fires
+  /// at half this value to leave HMS some slack before its server-side
+  /// `txn.timeout`. Defaults to 240000ms (4 minutes), matching Java
+  /// `HIVE_LOCK_HEARTBEAT_INTERVAL_MS`.
+  inline static Entry<int> kLockHeartbeatIntervalMs{"hive.lock-heartbeat-interval-ms",
+                                                    240000};
+
   /// \brief Size of the `HmsClient` pool the catalog keeps around. Each
   /// catalog method checks a client out of the pool for the duration of
   /// its RPC sequence and returns it when done, matching Java

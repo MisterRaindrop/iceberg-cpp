@@ -276,9 +276,12 @@ Result<std::shared_ptr<Table>> HiveCatalog::UpdateTable(
       .check_min_wait_ms = config_.Get(HiveCatalogProperties::kLockCheckMinWaitMs),
       .check_max_wait_ms = config_.Get(HiveCatalogProperties::kLockCheckMaxWaitMs),
       .acquire_timeout_ms = config_.Get(HiveCatalogProperties::kLockAcquireTimeoutMs),
+      .heartbeat_interval_ms =
+          config_.Get(HiveCatalogProperties::kLockHeartbeatIntervalMs),
   };
   return client_pool_->Run([&](HmsClient* client) -> Result<std::shared_ptr<Table>> {
-    HiveTableOperations ops(client, file_io_, identifier, lock_enabled, lock_options);
+    HiveTableOperations ops(client, file_io_, identifier, lock_enabled, lock_options,
+                            lock_enabled ? &config_ : nullptr);
     ICEBERG_ASSIGN_OR_RAISE(auto base, ops.Refresh());
 
     // Validate requirements against the current metadata before mutating.

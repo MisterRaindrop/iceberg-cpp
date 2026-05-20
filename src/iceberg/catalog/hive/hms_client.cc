@@ -23,8 +23,10 @@
 #include <cctype>
 #include <charconv>
 #include <chrono>
+#include <condition_variable>
 #include <format>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -148,6 +150,7 @@ using Apache::Hadoop::Hive::Database;
 using Apache::Hadoop::Hive::FieldSchema;
 using Apache::Hadoop::Hive::GetTableRequest;
 using Apache::Hadoop::Hive::GetTableResult;
+using Apache::Hadoop::Hive::HeartbeatRequest;
 using Apache::Hadoop::Hive::InvalidObjectException;
 using Apache::Hadoop::Hive::InvalidOperationException;
 using Apache::Hadoop::Hive::LockComponent;
@@ -704,6 +707,94 @@ Status HmsClient::Unlock(HmsLockHandle handle) {
 
   } catch (const apache::thrift::TException& e) {
     return GenericThriftError("unlock", e.what());
+  }
+}
+
+Status HmsClient::Heartbeat(int64_t lock_id) {
+  HeartbeatRequest request;
+  request.__set_lockid(lock_id);
+  request.__set_txnid(0);
+  try {
+    impl_->client->heartbeat(request);
+    return {};
+  } catch (const NoSuchLockException& e) {
+    return NotFound("HMS reports lock {} no longer exists: {}", lock_id, e.message);
+  } catch (const TxnAbortedException& e) {
+    return CommitFailed("HMS heartbeat: txn aborted: {}", e.message);
+  } catch (const MetaException& e) {
+    return MetaError("heartbeat", e.message);
+  } catch (const apache::thrift::transport::TTransportException& e) {
+    return TransportError("heartbeat", e.what());
+  } catch (const apache::thrift::TException& e) {
+    return GenericThriftError("heartbeat", e.what());
+  }
+}
+
+// ---------------------------------------------------------------------------
+// HmsLockHeartbeat: dedicated background thread + dedicated HMS client.
+// Java's MetastoreLock uses a scheduled executor; we use one std::thread per
+// held lock because commits are infrequent and the simpler model avoids a
+// shared scheduler. The thread owns its own HmsClient connection so it cannot
+// race with the commit path that owns the pooled client.
+
+class HmsLockHeartbeat::Impl {
+ public:
+  std::unique_ptr<HmsClient> client;
+  int64_t lock_id = -1;
+  int32_t interval_ms = 0;
+  std::mutex mu;
+  std::condition_variable cv;
+  bool stopping = false;
+  std::thread worker;
+
+  void Run() {
+    // Fire at half the configured interval so HMS sees a heartbeat well
+    // before its txn.timeout, mirroring MetastoreLock's `interval / 2`.
+    const auto sleep_for = std::chrono::milliseconds(std::max(1, interval_ms / 2));
+    std::unique_lock<std::mutex> lock(mu);
+    while (!stopping) {
+      if (cv.wait_for(lock, sleep_for, [&] { return stopping; })) {
+        return;
+      }
+      // Release the mutex during the RPC so Stop() can preempt a slow
+      // heartbeat without waiting for the RPC to finish.
+      lock.unlock();
+      (void)client->Heartbeat(lock_id);
+      lock.lock();
+    }
+  }
+};
+
+HmsLockHeartbeat::HmsLockHeartbeat(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
+
+HmsLockHeartbeat::~HmsLockHeartbeat() { Stop(); }
+
+Result<std::unique_ptr<HmsLockHeartbeat>> HmsLockHeartbeat::Start(
+    const HiveCatalogProperties& config, int64_t lock_id, int32_t interval_ms) {
+  ICEBERG_ASSIGN_OR_RAISE(auto client, HmsClient::Connect(config));
+  auto impl = std::make_unique<Impl>();
+  impl->client = std::move(client);
+  impl->lock_id = lock_id;
+  impl->interval_ms = interval_ms;
+  auto* impl_ptr = impl.get();
+  impl_ptr->worker = std::thread([impl_ptr] { impl_ptr->Run(); });
+  return std::unique_ptr<HmsLockHeartbeat>(new HmsLockHeartbeat(std::move(impl)));
+}
+
+void HmsLockHeartbeat::Stop() {
+  if (!impl_) {
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lock(impl_->mu);
+    if (impl_->stopping) {
+      return;
+    }
+    impl_->stopping = true;
+  }
+  impl_->cv.notify_all();
+  if (impl_->worker.joinable()) {
+    impl_->worker.join();
   }
 }
 

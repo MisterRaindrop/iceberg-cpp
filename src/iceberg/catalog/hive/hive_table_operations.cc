@@ -38,12 +38,14 @@ namespace iceberg::hive {
 HiveTableOperations::HiveTableOperations(HmsClient* client,
                                          std::shared_ptr<FileIO> file_io,
                                          TableIdentifier identifier, bool lock_enabled,
-                                         HmsLockOptions lock_options)
+                                         HmsLockOptions lock_options,
+                                         const HiveCatalogProperties* heartbeat_config)
     : client_(client),
       file_io_(std::move(file_io)),
       identifier_(std::move(identifier)),
       lock_enabled_(lock_enabled),
-      lock_options_(lock_options) {}
+      lock_options_(lock_options),
+      heartbeat_config_(heartbeat_config) {}
 
 Result<HiveTableMetadataSnapshot> HiveTableOperations::Refresh() {
   ICEBERG_RETURN_UNEXPECTED(ValidateNamespace(identifier_.ns));
@@ -108,6 +110,7 @@ Result<std::string> HiveTableOperations::Commit(const HiveTableMetadataSnapshot&
   const auto cleanup = [&] { (void)file_io_->DeleteFile(new_metadata_location); };
 
   HmsClient::HmsLockHandle lock_handle;
+  std::unique_ptr<HmsLockHeartbeat> heartbeat;
   if (lock_enabled_) {
     auto lock_or_error =
         client_->LockExclusive(identifier_.ns.levels[0], identifier_.name, lock_options_);
@@ -116,8 +119,23 @@ Result<std::string> HiveTableOperations::Commit(const HiveTableMetadataSnapshot&
       return std::unexpected(lock_or_error.error());
     }
     lock_handle = *lock_or_error;
+    // Keep the lock alive against HMS's server-side txn.timeout. Failure
+    // to start the heartbeat is non-fatal -- the CAS alone protects
+    // correctness on short commits -- so we ignore the error and proceed.
+    if (heartbeat_config_ != nullptr && lock_options_.heartbeat_interval_ms > 0) {
+      auto hb = HmsLockHeartbeat::Start(*heartbeat_config_, lock_handle.lock_id,
+                                        lock_options_.heartbeat_interval_ms);
+      if (hb.has_value()) {
+        heartbeat = std::move(*hb);
+      }
+    }
   }
   const auto release_lock = [&] {
+    // Stop the heartbeat thread BEFORE releasing the lock so the worker
+    // never races against a freshly-reclaimed lock_id.
+    if (heartbeat) {
+      heartbeat->Stop();
+    }
     if (lock_handle.acquired()) {
       (void)client_->Unlock(lock_handle);
     }
