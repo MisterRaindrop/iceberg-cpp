@@ -43,8 +43,16 @@
 
 #include "iceberg/catalog/hive/hive_catalog.h"
 #include "iceberg/catalog/hive/hive_catalog_properties.h"
+#include "iceberg/partition_spec.h"
+#include "iceberg/schema.h"
+#include "iceberg/schema_field.h"
+#include "iceberg/sort_order.h"
+#include "iceberg/table.h"
+#include "iceberg/table_requirement.h"
+#include "iceberg/table_update.h"
 #include "iceberg/test/test_resource.h"
 #include "iceberg/test/util/docker_compose_util.h"
+#include "iceberg/type.h"
 
 namespace iceberg::hive {
 
@@ -172,6 +180,88 @@ TEST_F(HiveCatalogIntegrationTest, TableExistsReturnsFalseForMissing) {
   ASSERT_TRUE(tables.has_value()) << tables.error().message;
   EXPECT_TRUE(tables->empty());
 
+  ASSERT_TRUE(catalog->DropNamespace(ns).has_value());
+}
+
+namespace {
+
+std::shared_ptr<Schema> MakeOrdersSchema() {
+  return std::make_shared<Schema>(
+      std::vector<SchemaField>{SchemaField::MakeRequired(1, "id", int64()),
+                               SchemaField::MakeRequired(2, "amount", float64()),
+                               SchemaField::MakeOptional(3, "label", string())});
+}
+
+std::shared_ptr<PartitionSpec> MakeUnpartitionedSpec(const Schema& schema) {
+  auto spec = PartitionSpec::Make(/*spec_id=*/0, std::vector<PartitionField>{});
+  EXPECT_TRUE(spec.has_value());
+  return std::shared_ptr<PartitionSpec>(std::move(spec.value()));
+}
+
+}  // namespace
+
+TEST_F(HiveCatalogIntegrationTest, CreateTableRoundTrip) {
+  auto catalog_result = HiveCatalog::Make(MakeProperties("arrow-fs-local"));
+  ASSERT_TRUE(catalog_result.has_value()) << catalog_result.error().message;
+  auto& catalog = *catalog_result;
+
+  Namespace ns{.levels = {"iceberg_cpp_it_ns"}};
+  (void)catalog->DropNamespace(ns);
+  ASSERT_TRUE(catalog->CreateNamespace(ns, {}).has_value());
+
+  TableIdentifier ident{.ns = ns, .name = "orders"};
+  (void)catalog->DropTable(ident, /*purge=*/false);
+
+  auto schema = MakeOrdersSchema();
+  auto spec = MakeUnpartitionedSpec(*schema);
+  auto sort_order = SortOrder::Unsorted();
+
+  auto created = catalog->CreateTable(ident, schema, spec, sort_order,
+                                      /*location=*/"", /*properties=*/{});
+  ASSERT_TRUE(created.has_value()) << created.error().message;
+
+  auto loaded = catalog->LoadTable(ident);
+  ASSERT_TRUE(loaded.has_value()) << loaded.error().message;
+  EXPECT_EQ((*loaded)->name(), ident);
+
+  ASSERT_TRUE(catalog->DropTable(ident, /*purge=*/false).has_value());
+  ASSERT_TRUE(catalog->DropNamespace(ns).has_value());
+}
+
+TEST_F(HiveCatalogIntegrationTest, UpdateTablePropertiesViaTableUpdate) {
+  auto catalog_result = HiveCatalog::Make(MakeProperties("arrow-fs-local"));
+  ASSERT_TRUE(catalog_result.has_value()) << catalog_result.error().message;
+  auto& catalog = *catalog_result;
+
+  Namespace ns{.levels = {"iceberg_cpp_it_ns"}};
+  (void)catalog->DropNamespace(ns);
+  ASSERT_TRUE(catalog->CreateNamespace(ns, {}).has_value());
+
+  TableIdentifier ident{.ns = ns, .name = "orders"};
+  (void)catalog->DropTable(ident, /*purge=*/false);
+
+  auto schema = MakeOrdersSchema();
+  ASSERT_TRUE(catalog
+                  ->CreateTable(ident, schema, MakeUnpartitionedSpec(*schema),
+                                SortOrder::Unsorted(), /*location=*/"", /*properties=*/{})
+                  .has_value());
+
+  // Bump a single property via the TableUpdate path. The exact update
+  // type does not matter for the integration test -- the point is to
+  // verify the full CAS commit round-trip lands a non-empty change set
+  // through HiveTableOperations::Commit.
+  std::vector<std::unique_ptr<TableUpdate>> updates;
+  updates.push_back(std::make_unique<table::SetProperties>(
+      std::unordered_map<std::string, std::string>{{"hive.it.tag", "v1"}}));
+  std::vector<std::unique_ptr<TableRequirement>> requirements;
+
+  auto updated = catalog->UpdateTable(ident, requirements, updates);
+  ASSERT_TRUE(updated.has_value()) << updated.error().message;
+
+  auto loaded = catalog->LoadTable(ident);
+  ASSERT_TRUE(loaded.has_value()) << loaded.error().message;
+
+  ASSERT_TRUE(catalog->DropTable(ident, /*purge=*/false).has_value());
   ASSERT_TRUE(catalog->DropNamespace(ns).has_value());
 }
 
