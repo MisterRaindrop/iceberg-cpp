@@ -43,11 +43,15 @@
 
 #include "iceberg/catalog/hive/hive_catalog.h"
 #include "iceberg/catalog/hive/hive_catalog_properties.h"
+#include "iceberg/catalog/hive/hive_table_operations.h"
+#include "iceberg/catalog/hive/hms_client.h"
+#include "iceberg/file_io_registry.h"
 #include "iceberg/partition_spec.h"
 #include "iceberg/schema.h"
 #include "iceberg/schema_field.h"
 #include "iceberg/sort_order.h"
 #include "iceberg/table.h"
+#include "iceberg/table_metadata.h"
 #include "iceberg/table_requirement.h"
 #include "iceberg/table_update.h"
 #include "iceberg/test/test_resource.h"
@@ -225,6 +229,183 @@ TEST_F(HiveCatalogIntegrationTest, CreateTableRoundTrip) {
   EXPECT_EQ((*loaded)->name(), ident);
 
   ASSERT_TRUE(catalog->DropTable(ident, /*purge=*/false).has_value());
+  ASSERT_TRUE(catalog->DropNamespace(ns).has_value());
+}
+
+TEST_F(HiveCatalogIntegrationTest, CommitCasMismatchSurfacesAsCommitFailed) {
+  // Drive HiveTableOperations directly so we can hold onto an out-of-date
+  // snapshot while a concurrent writer advances HMS's metadata_location.
+  // The stale Commit must fail with kCommitFailed (the retry signal the
+  // Transaction loop bound to MakeCommitRetryRunner watches for).
+  const auto props = MakeProperties("arrow-fs-local");
+  auto catalog_result = HiveCatalog::Make(props);
+  ASSERT_TRUE(catalog_result.has_value()) << catalog_result.error().message;
+  auto& catalog = *catalog_result;
+
+  Namespace ns{.levels = {"iceberg_cpp_it_cas_ns"}};
+  (void)catalog->DropNamespace(ns);
+  ASSERT_TRUE(catalog->CreateNamespace(ns, {}).has_value());
+
+  TableIdentifier ident{.ns = ns, .name = "cas_target"};
+  (void)catalog->DropTable(ident, /*purge=*/false);
+  auto schema = MakeOrdersSchema();
+  ASSERT_TRUE(catalog
+                  ->CreateTable(ident, schema, MakeUnpartitionedSpec(*schema),
+                                SortOrder::Unsorted(), /*location=*/"", /*properties=*/{})
+                  .has_value());
+
+  auto stale_client = HmsClient::Connect(props);
+  ASSERT_TRUE(stale_client.has_value()) << stale_client.error().message;
+  auto file_io_result =
+      FileIORegistry::Load(std::string(FileIORegistry::kArrowLocalFileIO),
+                           /*properties=*/{});
+  ASSERT_TRUE(file_io_result.has_value()) << file_io_result.error().message;
+  std::shared_ptr<FileIO> file_io = std::move(*file_io_result);
+  HiveTableOperations ops(stale_client->get(), file_io, ident);
+
+  auto stale = ops.Refresh();
+  ASSERT_TRUE(stale.has_value()) << stale.error().message;
+
+  // Concurrent writer advances metadata_location via the public path.
+  std::vector<std::unique_ptr<TableUpdate>> winner_updates;
+  winner_updates.push_back(std::make_unique<table::SetProperties>(
+      std::unordered_map<std::string, std::string>{{"hive.cas.who", "winner"}}));
+  ASSERT_TRUE(
+      catalog->UpdateTable(ident, /*requirements=*/{}, winner_updates).has_value());
+
+  // Build new metadata from the *stale* snapshot and try to commit.
+  auto builder = TableMetadataBuilder::BuildFrom(stale->metadata.get());
+  table::SetProperties stale_update({{"hive.cas.who", "loser"}});
+  stale_update.ApplyTo(*builder);
+  auto new_metadata = builder->Build();
+  ASSERT_TRUE(new_metadata.has_value()) << new_metadata.error().message;
+
+  auto commit_result = ops.Commit(*stale, **new_metadata);
+  ASSERT_FALSE(commit_result.has_value());
+  EXPECT_EQ(commit_result.error().kind, ErrorKind::kCommitFailed);
+
+  // Retry from a fresh snapshot must succeed (Transaction's normal flow).
+  auto fresh = ops.Refresh();
+  ASSERT_TRUE(fresh.has_value()) << fresh.error().message;
+  auto retry_builder = TableMetadataBuilder::BuildFrom(fresh->metadata.get());
+  table::SetProperties retry_update({{"hive.cas.who", "loser-retried"}});
+  retry_update.ApplyTo(*retry_builder);
+  auto retry_metadata = retry_builder->Build();
+  ASSERT_TRUE(retry_metadata.has_value()) << retry_metadata.error().message;
+  auto retried = ops.Commit(*fresh, **retry_metadata);
+  ASSERT_TRUE(retried.has_value()) << retried.error().message;
+
+  ASSERT_TRUE(catalog->DropTable(ident, /*purge=*/false).has_value());
+  ASSERT_TRUE(catalog->DropNamespace(ns).has_value());
+}
+
+TEST_F(HiveCatalogIntegrationTest, CommitWithHmsLockEnabled) {
+  // Same UpdateTable path, but with hive.lock-enabled=true so Commit acquires
+  // an HMS EXCLUSIVE table-level lock around GetTable -> AlterTable and
+  // releases it on the success path. We rely on the lock-release behaviour
+  // working: a second UpdateTable would block forever if the first one
+  // leaked the lock.
+  auto catalog_result = HiveCatalog::Make(HiveCatalogProperties::FromMap(
+      {{std::string(HiveCatalogProperties::kUri.key()),
+        std::format("thrift://{}:{}", kHmsHost, kHmsPort)},
+       {std::string(HiveCatalogProperties::kName.key()), "hive_lock"},
+       {std::string(HiveCatalogProperties::kIOImpl.key()), "arrow-fs-local"},
+       {std::string(HiveCatalogProperties::kWarehouse.key()), "file:///tmp/iceberg"},
+       {std::string(HiveCatalogProperties::kLockEnabled.key()), "true"}}));
+  ASSERT_TRUE(catalog_result.has_value()) << catalog_result.error().message;
+  auto& catalog = *catalog_result;
+
+  Namespace ns{.levels = {"iceberg_cpp_it_lock_ns"}};
+  (void)catalog->DropNamespace(ns);
+  ASSERT_TRUE(catalog->CreateNamespace(ns, {}).has_value());
+
+  TableIdentifier ident{.ns = ns, .name = "lock_target"};
+  (void)catalog->DropTable(ident, /*purge=*/false);
+  auto schema = MakeOrdersSchema();
+  ASSERT_TRUE(catalog
+                  ->CreateTable(ident, schema, MakeUnpartitionedSpec(*schema),
+                                SortOrder::Unsorted(), /*location=*/"", /*properties=*/{})
+                  .has_value());
+
+  for (int i = 0; i < 2; ++i) {
+    std::vector<std::unique_ptr<TableUpdate>> updates;
+    updates.push_back(std::make_unique<table::SetProperties>(
+        std::unordered_map<std::string, std::string>{
+            {"hive.lock.attempt", std::to_string(i)}}));
+    auto updated = catalog->UpdateTable(ident, /*requirements=*/{}, updates);
+    ASSERT_TRUE(updated.has_value())
+        << "iteration " << i << " failed (lock leak?): " << updated.error().message;
+  }
+
+  ASSERT_TRUE(catalog->DropTable(ident, /*purge=*/false).has_value());
+  ASSERT_TRUE(catalog->DropNamespace(ns).has_value());
+}
+
+TEST_F(HiveCatalogIntegrationTest, RegisterTableReattachesExistingMetadata) {
+  auto catalog_result = HiveCatalog::Make(MakeProperties("arrow-fs-local"));
+  ASSERT_TRUE(catalog_result.has_value()) << catalog_result.error().message;
+  auto& catalog = *catalog_result;
+
+  Namespace ns{.levels = {"iceberg_cpp_it_reg_ns"}};
+  (void)catalog->DropNamespace(ns);
+  ASSERT_TRUE(catalog->CreateNamespace(ns, {}).has_value());
+
+  TableIdentifier ident{.ns = ns, .name = "to_register"};
+  (void)catalog->DropTable(ident, /*purge=*/false);
+  auto schema = MakeOrdersSchema();
+  auto created = catalog->CreateTable(ident, schema, MakeUnpartitionedSpec(*schema),
+                                      SortOrder::Unsorted(),
+                                      /*location=*/"", /*properties=*/{});
+  ASSERT_TRUE(created.has_value()) << created.error().message;
+  const std::string saved_metadata_location((*created)->metadata_file_location());
+
+  // Drop the HMS row but keep the metadata.json on disk (purge=false).
+  ASSERT_TRUE(catalog->DropTable(ident, /*purge=*/false).has_value());
+
+  // Re-register against the surviving metadata file.
+  auto registered = catalog->RegisterTable(ident, saved_metadata_location);
+  ASSERT_TRUE(registered.has_value()) << registered.error().message;
+  EXPECT_EQ((*registered)->metadata_file_location(), saved_metadata_location);
+
+  auto reloaded = catalog->LoadTable(ident);
+  ASSERT_TRUE(reloaded.has_value()) << reloaded.error().message;
+  EXPECT_EQ((*reloaded)->metadata_file_location(), saved_metadata_location);
+
+  ASSERT_TRUE(catalog->DropTable(ident, /*purge=*/false).has_value());
+  ASSERT_TRUE(catalog->DropNamespace(ns).has_value());
+}
+
+TEST_F(HiveCatalogIntegrationTest, RenameTableMovesIdentifier) {
+  auto catalog_result = HiveCatalog::Make(MakeProperties("arrow-fs-local"));
+  ASSERT_TRUE(catalog_result.has_value()) << catalog_result.error().message;
+  auto& catalog = *catalog_result;
+
+  Namespace ns{.levels = {"iceberg_cpp_it_rename_ns"}};
+  (void)catalog->DropNamespace(ns);
+  ASSERT_TRUE(catalog->CreateNamespace(ns, {}).has_value());
+
+  TableIdentifier from{.ns = ns, .name = "before_rename"};
+  TableIdentifier to{.ns = ns, .name = "after_rename"};
+  (void)catalog->DropTable(from, /*purge=*/false);
+  (void)catalog->DropTable(to, /*purge=*/false);
+
+  auto schema = MakeOrdersSchema();
+  ASSERT_TRUE(catalog
+                  ->CreateTable(from, schema, MakeUnpartitionedSpec(*schema),
+                                SortOrder::Unsorted(), /*location=*/"", /*properties=*/{})
+                  .has_value());
+
+  ASSERT_TRUE(catalog->RenameTable(from, to).has_value());
+
+  auto loaded_new = catalog->LoadTable(to);
+  ASSERT_TRUE(loaded_new.has_value()) << loaded_new.error().message;
+  EXPECT_EQ((*loaded_new)->name(), to);
+
+  auto old_exists = catalog->TableExists(from);
+  ASSERT_TRUE(old_exists.has_value()) << old_exists.error().message;
+  EXPECT_FALSE(*old_exists);
+
+  ASSERT_TRUE(catalog->DropTable(to, /*purge=*/false).has_value());
   ASSERT_TRUE(catalog->DropNamespace(ns).has_value());
 }
 
