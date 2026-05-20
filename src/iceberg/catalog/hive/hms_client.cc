@@ -77,28 +77,63 @@ Result<HmsEndpoint> ParseSingleEndpoint(std::string_view spec) {
   }
 
   HmsEndpoint endpoint;
-  const auto colon = spec.rfind(':');
-  if (colon == std::string_view::npos) {
-    endpoint.host = std::string(spec);
-    endpoint.port = kDefaultHmsPort;
-    return endpoint;
+  std::string_view host_part;
+  std::string_view port_part;
+
+  // RFC 3986-style bracketed host (`[ipv6]:port`) avoids ambiguity with
+  // the colons inside an IPv6 address. Any other input that still
+  // contains a colon other than as the host/port separator (e.g., a
+  // bare unbracketed IPv6 address) is rejected because we cannot tell
+  // host from port reliably.
+  if (!spec.empty() && spec.front() == '[') {
+    const auto close = spec.find(']');
+    if (close == std::string_view::npos || close == 1) {
+      return InvalidArgument("HMS endpoint has malformed bracketed host: '{}'.", spec);
+    }
+    host_part = spec.substr(1, close - 1);
+    auto rest = spec.substr(close + 1);
+    if (rest.empty()) {
+      port_part = {};
+    } else if (rest.front() == ':') {
+      port_part = rest.substr(1);
+    } else {
+      return InvalidArgument("HMS endpoint has trailing characters after ']': '{}'.",
+                             spec);
+    }
+  } else {
+    const auto colon = spec.find(':');
+    if (colon == std::string_view::npos) {
+      host_part = spec;
+    } else {
+      // Reject ambiguous bare IPv6 (multiple colons without brackets).
+      if (spec.find(':', colon + 1) != std::string_view::npos) {
+        return InvalidArgument(
+            "HMS endpoint has multiple ':' separators (bracket IPv6 hosts as "
+            "[host]:port): '{}'.",
+            spec);
+      }
+      host_part = spec.substr(0, colon);
+      port_part = spec.substr(colon + 1);
+    }
   }
 
-  endpoint.host = std::string(spec.substr(0, colon));
-  if (endpoint.host.empty()) {
+  if (host_part.empty()) {
     return InvalidArgument("HMS endpoint has empty host: '{}'.", spec);
   }
+  endpoint.host = std::string(host_part);
 
-  const auto port_str = spec.substr(colon + 1);
-  if (port_str.empty()) {
+  if (port_part.empty()) {
     endpoint.port = kDefaultHmsPort;
     return endpoint;
   }
 
   int port = 0;
-  const auto [_, ec] =
-      std::from_chars(port_str.data(), port_str.data() + port_str.size(), port);
-  if (ec != std::errc() || port <= 0 || port > 65535) {
+  const auto* port_end = port_part.data() + port_part.size();
+  const auto [ptr, ec] = std::from_chars(port_part.data(), port_end, port);
+  // `from_chars` stops at the first non-digit and reports success as long
+  // as one digit was consumed; check ptr to reject trailing garbage like
+  // "8080foo" or "]" / ":1]" residue from a malformed IPv6 attempt.
+  if (ec != std::errc() || ptr != port_end || port <= 0 || port > 65535) {
     return InvalidArgument("Invalid HMS port in endpoint '{}'.", spec);
   }
   endpoint.port = port;

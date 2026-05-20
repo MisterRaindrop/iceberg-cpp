@@ -100,6 +100,46 @@ TEST(ParseHmsUrisTest, EmptySegmentInListFails) {
   EXPECT_FALSE(ParseHmsUris("h1:9083,").has_value());
 }
 
+TEST(ParseHmsUrisTest, TrailingGarbageInPortRejected) {
+  // std::from_chars stops at the first non-digit and reports success even if
+  // there is trailing garbage; the parser must catch this via the end-pointer
+  // check, otherwise "8080foo" is silently accepted as port 8080. (Note:
+  // surrounding whitespace is stripped earlier by Trim() and is still
+  // accepted by design.)
+  EXPECT_FALSE(ParseHmsUris("hms:8080foo").has_value());
+  EXPECT_FALSE(ParseHmsUris("hms:1.5").has_value());
+  EXPECT_FALSE(ParseHmsUris("hms:0x80").has_value());
+}
+
+TEST(ParseHmsUrisTest, BareIpv6AmbiguousRejected) {
+  // Bare unbracketed IPv6 addresses contain multiple colons and cannot be
+  // disambiguated from `host:port`; require the RFC-3986 `[ipv6]:port` form.
+  EXPECT_FALSE(ParseHmsUris("::1").has_value());
+  EXPECT_FALSE(ParseHmsUris("fe80::1").has_value());
+  EXPECT_FALSE(ParseHmsUris("::1:9083").has_value());
+}
+
+TEST(ParseHmsUrisTest, BracketedIpv6Accepted) {
+  auto result = ParseHmsUris("[::1]:9083");
+  ASSERT_TRUE(result.has_value()) << result.error().message;
+  ASSERT_EQ(result->size(), 1);
+  EXPECT_EQ((*result)[0].host, "::1");
+  EXPECT_EQ((*result)[0].port, 9083);
+
+  auto no_port = ParseHmsUris("[fe80::1]");
+  ASSERT_TRUE(no_port.has_value()) << no_port.error().message;
+  ASSERT_EQ(no_port->size(), 1);
+  EXPECT_EQ((*no_port)[0].host, "fe80::1");
+  EXPECT_EQ((*no_port)[0].port, 9083);
+}
+
+TEST(ParseHmsUrisTest, MalformedBracketRejected) {
+  EXPECT_FALSE(ParseHmsUris("[::1").has_value());         // missing ]
+  EXPECT_FALSE(ParseHmsUris("[]:9083").has_value());      // empty host
+  EXPECT_FALSE(ParseHmsUris("[::1]junk").has_value());    // garbage after ]
+  EXPECT_FALSE(ParseHmsUris("[::1]:99999").has_value());  // bad port
+}
+
 TEST(HmsClientConnectTest, MissingUriIsInvalidArgument) {
   auto config = HiveCatalogProperties::default_properties();
   auto client = HmsClient::Connect(config);
