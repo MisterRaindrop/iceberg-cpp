@@ -136,7 +136,7 @@ TEST_F(HiveCatalogIntegrationTest, NamespaceCrudRoundTrip) {
   ASSERT_TRUE(catalog_result.has_value()) << catalog_result.error().message;
   auto& catalog = *catalog_result;
 
-  Namespace ns{.levels = {"iceberg_cpp_it_ns"}};
+  Namespace ns{.levels = {"iceberg_cpp_it_ns_crud"}};
 
   // Cleanup from any prior aborted run.
   (void)catalog->DropNamespace(ns);
@@ -194,7 +194,7 @@ TEST_F(HiveCatalogIntegrationTest, TableExistsReturnsFalseForMissing) {
   ASSERT_TRUE(catalog_result.has_value()) << catalog_result.error().message;
   auto& catalog = *catalog_result;
 
-  Namespace ns{.levels = {"iceberg_cpp_it_ns"}};
+  Namespace ns{.levels = {"iceberg_cpp_it_ns_exists"}};
   (void)catalog->DropNamespace(ns);
   ASSERT_TRUE(catalog->CreateNamespace(ns, {}).has_value());
 
@@ -231,7 +231,7 @@ TEST_F(HiveCatalogIntegrationTest, CreateTableRoundTrip) {
   ASSERT_TRUE(catalog_result.has_value()) << catalog_result.error().message;
   auto& catalog = *catalog_result;
 
-  Namespace ns{.levels = {"iceberg_cpp_it_ns"}};
+  Namespace ns{.levels = {"iceberg_cpp_it_ns_create"}};
   (void)catalog->DropNamespace(ns);
   ASSERT_TRUE(catalog->CreateNamespace(ns, {}).has_value());
 
@@ -436,7 +436,7 @@ TEST_F(HiveCatalogIntegrationTest, UpdateTablePropertiesViaTableUpdate) {
   ASSERT_TRUE(catalog_result.has_value()) << catalog_result.error().message;
   auto& catalog = *catalog_result;
 
-  Namespace ns{.levels = {"iceberg_cpp_it_ns"}};
+  Namespace ns{.levels = {"iceberg_cpp_it_ns_update"}};
   (void)catalog->DropNamespace(ns);
   ASSERT_TRUE(catalog->CreateNamespace(ns, {}).has_value());
 
