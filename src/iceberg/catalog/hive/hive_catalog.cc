@@ -115,6 +115,17 @@ Status HiveCatalog::CreateNamespace(
 
 Result<std::vector<Namespace>> HiveCatalog::ListNamespaces(const Namespace& ns) const {
   if (!ns.levels.empty()) {
+    // HMS is flat: it has no notion of nested namespaces, so any non-empty
+    // parent either matches an existing database (in which case it has no
+    // children) or does not exist. Java's HiveCatalog throws
+    // `NoSuchNamespaceException` in the latter case and an empty list in
+    // the former; mirror that contract instead of swallowing both into
+    // an indistinguishable empty list.
+    ICEBERG_RETURN_UNEXPECTED(ValidateNamespace(ns));
+    ICEBERG_ASSIGN_OR_RAISE(auto exists, NamespaceExists(ns));
+    if (!exists) {
+      return NoSuchNamespace("Hive namespace {} does not exist.", ns.levels[0]);
+    }
     return std::vector<Namespace>{};
   }
   ICEBERG_ASSIGN_OR_RAISE(auto names, client_->GetAllDatabases());

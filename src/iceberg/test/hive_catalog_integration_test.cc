@@ -167,6 +167,28 @@ TEST_F(HiveCatalogIntegrationTest, NamespaceCrudRoundTrip) {
   ASSERT_TRUE(catalog->DropNamespace(ns).has_value());
 }
 
+TEST_F(HiveCatalogIntegrationTest, ListNamespacesRejectsMissingParent) {
+  // Java HiveCatalog throws NoSuchNamespaceException when listing a parent
+  // that doesn't map to an existing HMS database; an empty list is reserved
+  // for "the parent exists and just has no children".
+  auto catalog_result = HiveCatalog::Make(MakeProperties("arrow-fs-local"));
+  ASSERT_TRUE(catalog_result.has_value()) << catalog_result.error().message;
+  auto& catalog = *catalog_result;
+
+  Namespace missing{.levels = {"iceberg_cpp_it_no_such_ns"}};
+  (void)catalog->DropNamespace(missing);
+
+  auto result = catalog->ListNamespaces(missing);
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().kind, ErrorKind::kNoSuchNamespace);
+
+  ASSERT_TRUE(catalog->CreateNamespace(missing, {}).has_value());
+  auto children = catalog->ListNamespaces(missing);
+  ASSERT_TRUE(children.has_value()) << children.error().message;
+  EXPECT_TRUE(children->empty());
+  ASSERT_TRUE(catalog->DropNamespace(missing).has_value());
+}
+
 TEST_F(HiveCatalogIntegrationTest, TableExistsReturnsFalseForMissing) {
   auto catalog_result = HiveCatalog::Make(MakeProperties("arrow-fs-local"));
   ASSERT_TRUE(catalog_result.has_value()) << catalog_result.error().message;
