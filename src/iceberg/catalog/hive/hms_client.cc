@@ -141,12 +141,19 @@ namespace {
 
 using Apache::Hadoop::Hive::AlreadyExistsException;
 using Apache::Hadoop::Hive::Database;
+using Apache::Hadoop::Hive::FieldSchema;
+using Apache::Hadoop::Hive::GetTableRequest;
+using Apache::Hadoop::Hive::GetTableResult;
 using Apache::Hadoop::Hive::InvalidObjectException;
 using Apache::Hadoop::Hive::InvalidOperationException;
 using Apache::Hadoop::Hive::MetaException;
 using Apache::Hadoop::Hive::NoSuchObjectException;
 using Apache::Hadoop::Hive::PrincipalType;
+using Apache::Hadoop::Hive::SerDeInfo;
+using Apache::Hadoop::Hive::StorageDescriptor;
+using Apache::Hadoop::Hive::Table;
 using Apache::Hadoop::Hive::UnknownDBException;
+using Apache::Hadoop::Hive::UnknownTableException;
 
 Database ToThriftDatabase(const HiveDatabase& database) {
   Database thrift_db;
@@ -172,6 +179,73 @@ Database ToThriftDatabase(const HiveDatabase& database) {
     thrift_db.__set_ownerType(PrincipalType::GROUP);
   }
   return thrift_db;
+}
+
+Table ToThriftTable(const HiveTable& table) {
+  Table thrift_table;
+  thrift_table.__set_dbName(table.db_name);
+  thrift_table.__set_tableName(table.table_name);
+  if (!table.owner.empty()) {
+    thrift_table.__set_owner(table.owner);
+  }
+  if (!table.table_type.empty()) {
+    thrift_table.__set_tableType(table.table_type);
+  }
+  if (!table.parameters.empty()) {
+    thrift_table.__set_parameters(std::map<std::string, std::string>(
+        table.parameters.begin(), table.parameters.end()));
+  }
+
+  StorageDescriptor sd;
+  sd.__set_location(table.location);
+  if (!table.input_format.empty()) {
+    sd.__set_inputFormat(table.input_format);
+  }
+  if (!table.output_format.empty()) {
+    sd.__set_outputFormat(table.output_format);
+  }
+
+  std::vector<FieldSchema> cols;
+  cols.reserve(table.columns.size());
+  for (const auto& column : table.columns) {
+    FieldSchema field;
+    field.__set_name(column.name);
+    field.__set_type(column.type_string);
+    if (!column.comment.empty()) {
+      field.__set_comment(column.comment);
+    }
+    cols.push_back(std::move(field));
+  }
+  sd.__set_cols(std::move(cols));
+
+  SerDeInfo serde;
+  if (!table.serde.empty()) {
+    serde.__set_serializationLib(table.serde);
+  }
+  sd.__set_serdeInfo(std::move(serde));
+
+  thrift_table.__set_sd(std::move(sd));
+  return thrift_table;
+}
+
+HiveTable FromThriftTable(const Table& thrift_table) {
+  HiveTable table;
+  table.db_name = thrift_table.dbName;
+  table.table_name = thrift_table.tableName;
+  table.owner = thrift_table.owner;
+  table.table_type = thrift_table.tableType;
+  table.location = thrift_table.sd.location;
+  table.input_format = thrift_table.sd.inputFormat;
+  table.output_format = thrift_table.sd.outputFormat;
+  table.serde = thrift_table.sd.serdeInfo.serializationLib;
+  table.parameters.insert(thrift_table.parameters.begin(), thrift_table.parameters.end());
+
+  table.columns.reserve(thrift_table.sd.cols.size());
+  for (const auto& column : thrift_table.sd.cols) {
+    table.columns.push_back(HiveColumn{
+        .name = column.name, .type_string = column.type, .comment = column.comment});
+  }
+  return table;
 }
 
 HiveDatabase FromThriftDatabase(const Database& thrift_db) {
@@ -337,6 +411,101 @@ Status HmsClient::AlterDatabase(std::string_view name, const HiveDatabase& datab
     return MetaError("alter_database", e.message);
   } catch (const apache::thrift::TException& e) {
     return GenericThriftError("alter_database", e.what());
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Table operations. Same pattern as the database wrappers above.
+
+Result<std::vector<std::string>> HmsClient::GetAllTables(std::string_view db_name) {
+  std::vector<std::string> names;
+  try {
+    impl_->client->get_all_tables(names, std::string(db_name));
+    return names;
+  } catch (const NoSuchObjectException& e) {
+    return UnknownDBError("get_all_tables", e.message);
+  } catch (const UnknownDBException& e) {
+    return UnknownDBError("get_all_tables", e.message);
+  } catch (const MetaException& e) {
+    return MetaError("get_all_tables", e.message);
+  } catch (const apache::thrift::TException& e) {
+    return GenericThriftError("get_all_tables", e.what());
+  }
+}
+
+Result<HiveTable> HmsClient::GetTable(std::string_view db_name,
+                                      std::string_view table_name) {
+  GetTableRequest request;
+  request.__set_dbName(std::string(db_name));
+  request.__set_tblName(std::string(table_name));
+  GetTableResult result;
+  try {
+    impl_->client->get_table_req(result, request);
+    return FromThriftTable(result.table);
+  } catch (const NoSuchObjectException& e) {
+    return UnknownTableError("get_table", e.message);
+  } catch (const UnknownTableException& e) {
+    return UnknownTableError("get_table", e.message);
+  } catch (const UnknownDBException& e) {
+    return UnknownDBError("get_table", e.message);
+  } catch (const MetaException& e) {
+    return MetaError("get_table", e.message);
+  } catch (const apache::thrift::TException& e) {
+    return GenericThriftError("get_table", e.what());
+  }
+}
+
+Status HmsClient::CreateTable(const HiveTable& table) {
+  const Table thrift_table = ToThriftTable(table);
+  try {
+    impl_->client->create_table(thrift_table);
+    return {};
+  } catch (const AlreadyExistsException& e) {
+    return AlreadyExistsError("create_table", e.message);
+  } catch (const InvalidObjectException& e) {
+    return InvalidObjectError("create_table", e.message);
+  } catch (const NoSuchObjectException& e) {
+    return UnknownDBError("create_table", e.message);
+  } catch (const MetaException& e) {
+    return MetaError("create_table", e.message);
+  } catch (const apache::thrift::TException& e) {
+    return GenericThriftError("create_table", e.what());
+  }
+}
+
+Status HmsClient::DropTable(std::string_view db_name, std::string_view table_name,
+                            bool delete_data) {
+  try {
+    impl_->client->drop_table(std::string(db_name), std::string(table_name), delete_data);
+    return {};
+  } catch (const NoSuchObjectException& e) {
+    return UnknownTableError("drop_table", e.message);
+  } catch (const InvalidOperationException& e) {
+    return InvalidOperationError("drop_table", e.message);
+  } catch (const MetaException& e) {
+    return MetaError("drop_table", e.message);
+  } catch (const apache::thrift::TException& e) {
+    return GenericThriftError("drop_table", e.what());
+  }
+}
+
+Status HmsClient::AlterTable(std::string_view db_name, std::string_view table_name,
+                             const HiveTable& new_table) {
+  const Table thrift_table = ToThriftTable(new_table);
+  try {
+    impl_->client->alter_table(std::string(db_name), std::string(table_name),
+                               thrift_table);
+    return {};
+  } catch (const NoSuchObjectException& e) {
+    return UnknownTableError("alter_table", e.message);
+  } catch (const InvalidObjectException& e) {
+    return InvalidObjectError("alter_table", e.message);
+  } catch (const InvalidOperationException& e) {
+    return InvalidOperationError("alter_table", e.message);
+  } catch (const MetaException& e) {
+    return MetaError("alter_table", e.message);
+  } catch (const apache::thrift::TException& e) {
+    return GenericThriftError("alter_table", e.what());
   }
 }
 

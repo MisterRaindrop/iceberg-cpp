@@ -117,6 +117,40 @@ class ICEBERG_HIVE_EXPORT HmsClient {
 
   /// @}
 
+  /// \name Table operations
+  /// Wrappers around the HMS Thrift `*_table` calls. The conversion
+  /// between `HiveTable` and the generated Thrift `Table` lives in
+  /// hms_client.cc so Thrift types never leak into the public API.
+  /// @{
+
+  /// \brief List the names of every table in `db_name`.
+  Result<std::vector<std::string>> GetAllTables(std::string_view db_name);
+
+  /// \brief Load a single table by (database, table) name pair.
+  ///
+  /// Returns `kNoSuchTable` when the table does not exist.
+  Result<HiveTable> GetTable(std::string_view db_name, std::string_view table_name);
+
+  /// \brief Create the table described by `table`.
+  Status CreateTable(const HiveTable& table);
+
+  /// \brief Drop the table identified by `db_name` and `table_name`.
+  ///
+  /// `delete_data` is forwarded to HMS; iceberg_hive normally passes
+  /// false because data file lifecycle is managed via Iceberg snapshot
+  /// expiry rather than HMS.
+  Status DropTable(std::string_view db_name, std::string_view table_name,
+                   bool delete_data);
+
+  /// \brief Replace the existing table at (`db_name`, `table_name`)
+  /// with `new_table`. Used both for renames (when `new_table.db_name`
+  /// or `new_table.table_name` differs from the source) and for in-place
+  /// updates (parameter / location / columns) via the commit path.
+  Status AlterTable(std::string_view db_name, std::string_view table_name,
+                    const HiveTable& new_table);
+
+  /// @}
+
  private:
   class Impl;
   std::unique_ptr<Impl> impl_;
