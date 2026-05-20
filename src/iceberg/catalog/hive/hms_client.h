@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "iceberg/catalog/hive/hive_catalog_properties.h"
+#include "iceberg/catalog/hive/hive_utils.h"
 #include "iceberg/catalog/hive/iceberg_hive_export.h"
 #include "iceberg/result.h"
 
@@ -84,6 +85,37 @@ class ICEBERG_HIVE_EXPORT HmsClient {
   /// The first endpoint listed in `config.Uri()` is used; HA failover
   /// to subsequent endpoints is left to a future commit.
   static Result<std::unique_ptr<HmsClient>> Connect(const HiveCatalogProperties& config);
+
+  /// \name Database (namespace) operations
+  /// Wrappers around the HMS Thrift `*_database` calls. Each method
+  /// catches the specific Thrift exception subclasses and forwards
+  /// them to the factories in hive_errors.h, so callers see typed
+  /// `iceberg::Error` rather than raw C++ exceptions.
+  /// @{
+
+  /// \brief List the names of every database visible to this HMS.
+  Result<std::vector<std::string>> GetAllDatabases();
+
+  /// \brief Load a single database by name.
+  ///
+  /// Returns `kNoSuchNamespace` when the database does not exist.
+  Result<HiveDatabase> GetDatabase(std::string_view name);
+
+  /// \brief Create the database described by `database`.
+  ///
+  /// Returns `kAlreadyExists` when a database with the same name is
+  /// already present.
+  Status CreateDatabase(const HiveDatabase& database);
+
+  /// \brief Drop a database by name. `cascade` is forwarded directly to
+  /// HMS; when false, dropping a non-empty database returns
+  /// `kNotAllowed`.
+  Status DropDatabase(std::string_view name, bool cascade);
+
+  /// \brief Replace the database with `name` by `database`.
+  Status AlterDatabase(std::string_view name, const HiveDatabase& database);
+
+  /// @}
 
  private:
   class Impl;
