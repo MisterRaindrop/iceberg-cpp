@@ -28,12 +28,19 @@
 
 #include <nlohmann/json.hpp>
 
+#include "iceberg/catalog/hive/hive_table_operations.h"
 #include "iceberg/catalog/hive/hive_utils.h"
 #include "iceberg/catalog/hive/hms_client.h"
 #include "iceberg/file_io_registry.h"
 #include "iceberg/json_serde_internal.h"
+#include "iceberg/partition_spec.h"
+#include "iceberg/sort_order.h"
 #include "iceberg/table.h"
+#include "iceberg/table_metadata.h"
+#include "iceberg/table_requirement.h"
+#include "iceberg/table_update.h"
 #include "iceberg/util/macros.h"
+#include "iceberg/util/uuid.h"
 
 namespace iceberg::hive {
 
@@ -173,25 +180,76 @@ Result<std::vector<TableIdentifier>> HiveCatalog::ListTables(const Namespace& ns
 }
 
 Result<std::shared_ptr<Table>> HiveCatalog::CreateTable(
-    const TableIdentifier& /*identifier*/, const std::shared_ptr<Schema>& /*schema*/,
-    const std::shared_ptr<PartitionSpec>& /*spec*/,
-    const std::shared_ptr<SortOrder>& /*order*/, const std::string& /*location*/,
-    const std::unordered_map<std::string, std::string>& /*properties*/) {
-  // CreateTable is wired up alongside the commit / CAS path in C19/C21
-  // (HiveTableOperations::Commit). Until then callers should construct
-  // the metadata.json out of band (e.g. via `ToJsonString(metadata)`
-  // from json_serde_internal.h) and use RegisterTable.
-  return NotImplemented(
-      "HiveCatalog::CreateTable lands together with the CAS commit path "
-      "(C19/C21); use RegisterTable with a pre-written metadata.json in "
-      "the meantime.");
+    const TableIdentifier& identifier, const std::shared_ptr<Schema>& schema,
+    const std::shared_ptr<PartitionSpec>& spec, const std::shared_ptr<SortOrder>& order,
+    const std::string& location_in,
+    const std::unordered_map<std::string, std::string>& properties) {
+  ICEBERG_RETURN_UNEXPECTED(ValidateNamespace(identifier.ns));
+  ICEBERG_RETURN_UNEXPECTED(identifier.Validate());
+  if (!schema || !spec || !order) {
+    return InvalidArgument(
+        "HiveCatalog::CreateTable requires non-null schema, partition spec, "
+        "and sort order.");
+  }
+
+  std::string location = location_in;
+  if (location.empty()) {
+    location = GetDefaultTableLocation(config_.Get(HiveCatalogProperties::kWarehouse),
+                                       identifier.ns, identifier.name);
+  }
+
+  // Build the initial TableMetadata + serialise to JSON.
+  ICEBERG_ASSIGN_OR_RAISE(
+      auto metadata, TableMetadata::Make(*schema, *spec, *order, location, properties));
+  const std::string metadata_location = std::format(
+      "{}/metadata/00000-{}.metadata.json", location, Uuid::GenerateV4().ToString());
+  ICEBERG_ASSIGN_OR_RAISE(const auto json_str, ToJsonString(*metadata));
+  ICEBERG_RETURN_UNEXPECTED(file_io_->WriteFile(metadata_location, json_str));
+
+  // Convert + register in HMS. Roll back the metadata file on failure.
+  ICEBERG_ASSIGN_OR_RAISE(auto columns, SchemaToHiveColumns(*schema));
+  auto hive_table_or_error =
+      ConvertToHiveTable(identifier, columns, metadata_location, location, properties);
+  if (!hive_table_or_error.has_value()) {
+    (void)file_io_->DeleteFile(metadata_location);
+    return std::unexpected(hive_table_or_error.error());
+  }
+  auto create_status = client_->CreateTable(*hive_table_or_error);
+  if (!create_status.has_value()) {
+    (void)file_io_->DeleteFile(metadata_location);
+    return std::unexpected(create_status.error());
+  }
+
+  return Table::Make(identifier, std::shared_ptr<TableMetadata>(metadata.release()),
+                     metadata_location, file_io_, shared_from_this());
 }
 
 Result<std::shared_ptr<Table>> HiveCatalog::UpdateTable(
-    const TableIdentifier& /*identifier*/,
-    const std::vector<std::unique_ptr<TableRequirement>>& /*requirements*/,
-    const std::vector<std::unique_ptr<TableUpdate>>& /*updates*/) {
-  return NotImplemented("{}", kNotImplementedMessage);
+    const TableIdentifier& identifier,
+    const std::vector<std::unique_ptr<TableRequirement>>& requirements,
+    const std::vector<std::unique_ptr<TableUpdate>>& updates) {
+  ICEBERG_RETURN_UNEXPECTED(ValidateNamespace(identifier.ns));
+  ICEBERG_RETURN_UNEXPECTED(identifier.Validate());
+
+  HiveTableOperations ops(client_.get(), file_io_, identifier);
+  ICEBERG_ASSIGN_OR_RAISE(auto base, ops.Refresh());
+
+  // Validate requirements against the current metadata before mutating.
+  for (const auto& requirement : requirements) {
+    if (!requirement) continue;
+    ICEBERG_RETURN_UNEXPECTED(requirement->Validate(base.metadata.get()));
+  }
+
+  // Apply updates via TableMetadataBuilder and build the new metadata.
+  auto builder = TableMetadataBuilder::BuildFrom(base.metadata.get());
+  for (const auto& update : updates) {
+    if (!update) continue;
+    update->ApplyTo(*builder);
+  }
+  ICEBERG_ASSIGN_OR_RAISE(auto new_metadata, builder->Build());
+
+  ICEBERG_RETURN_UNEXPECTED(ops.Commit(base, *new_metadata));
+  return LoadTable(identifier);
 }
 
 Result<std::shared_ptr<Transaction>> HiveCatalog::StageCreateTable(
