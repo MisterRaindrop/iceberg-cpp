@@ -288,5 +288,6 @@ if(ICEBERG_BUILD_HIVE)
                         SOURCES
                         hive_errors_test.cc
                         hive_schema_test.cc
+                        hive_utils_test.cc
                         hms_client_test.cc)
 endif()
