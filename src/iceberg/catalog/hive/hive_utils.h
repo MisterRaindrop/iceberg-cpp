@@ -135,6 +135,16 @@ ICEBERG_HIVE_EXPORT Result<HiveTable> ConvertToHiveTable(
 ICEBERG_HIVE_EXPORT Result<std::string> GetMetadataLocation(
     const std::unordered_map<std::string, std::string>& table_parameters);
 
+/// \brief Validate that a HMS Table parameter map represents an Iceberg
+///        table by checking `table_type == "ICEBERG"` (case-insensitive).
+///        Returns `kNoSuchTable` when the parameter is absent or holds
+///        any other value, matching the guard Java's
+///        `BaseMetastoreTableOperations.refresh()` applies before reading
+///        `metadata_location`.
+ICEBERG_HIVE_EXPORT Status ValidateIcebergTable(
+    const TableIdentifier& identifier,
+    const std::unordered_map<std::string, std::string>& table_parameters);
+
 /// \brief Compute a default table location under `warehouse`. The
 ///        layout matches what iceberg-java and iceberg-rust pick:
 ///        `<warehouse>/<ns_with_dots>.db/<table_name>`.

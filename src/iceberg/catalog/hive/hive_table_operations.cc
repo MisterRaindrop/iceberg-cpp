@@ -48,6 +48,7 @@ Result<HiveTableMetadataSnapshot> HiveTableOperations::Refresh() {
 
   ICEBERG_ASSIGN_OR_RAISE(auto hive_table,
                           client_->GetTable(identifier_.ns.levels[0], identifier_.name));
+  ICEBERG_RETURN_UNEXPECTED(ValidateIcebergTable(identifier_, hive_table.parameters));
   ICEBERG_ASSIGN_OR_RAISE(auto metadata_location,
                           GetMetadataLocation(hive_table.parameters));
   ICEBERG_ASSIGN_OR_RAISE(auto metadata_json,

@@ -142,6 +142,28 @@ TEST(GetMetadataLocationTest, AbsenceMapsToNotFound) {
   EXPECT_EQ(loc.error().kind, ErrorKind::kNotFound);
 }
 
+TEST(ValidateIcebergTableTest, AcceptsCaseInsensitiveIcebergMarker) {
+  const TableIdentifier id{.ns = Namespace{{"sales"}}, .name = "orders"};
+  EXPECT_TRUE(ValidateIcebergTable(id, {{"table_type", "ICEBERG"}}).has_value());
+  EXPECT_TRUE(ValidateIcebergTable(id, {{"table_type", "iceberg"}}).has_value());
+  EXPECT_TRUE(ValidateIcebergTable(id, {{"table_type", "Iceberg"}}).has_value());
+}
+
+TEST(ValidateIcebergTableTest, RejectsMissingMarker) {
+  const TableIdentifier id{.ns = Namespace{{"sales"}}, .name = "orders"};
+  auto status = ValidateIcebergTable(id, {{"EXTERNAL", "TRUE"}});
+  ASSERT_FALSE(status.has_value());
+  EXPECT_EQ(status.error().kind, ErrorKind::kNoSuchTable);
+}
+
+TEST(ValidateIcebergTableTest, RejectsForeignTableType) {
+  const TableIdentifier id{.ns = Namespace{{"sales"}}, .name = "orders"};
+  auto status =
+      ValidateIcebergTable(id, {{"table_type", "MANAGED_TABLE"}, {"EXTERNAL", "TRUE"}});
+  ASSERT_FALSE(status.has_value());
+  EXPECT_EQ(status.error().kind, ErrorKind::kNoSuchTable);
+}
+
 TEST(GetDefaultTableLocationTest, TrimsTrailingSlashAndAppendsDbAndTable) {
   EXPECT_EQ(
       GetDefaultTableLocation("s3://bucket/wh/", Namespace{{"warehouse"}}, "orders"),

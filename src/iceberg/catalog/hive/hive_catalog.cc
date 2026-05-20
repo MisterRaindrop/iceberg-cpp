@@ -310,6 +310,7 @@ Result<std::shared_ptr<Table>> HiveCatalog::LoadTable(const TableIdentifier& ide
 
   ICEBERG_ASSIGN_OR_RAISE(auto hive_table,
                           client_->GetTable(identifier.ns.levels[0], identifier.name));
+  ICEBERG_RETURN_UNEXPECTED(ValidateIcebergTable(identifier, hive_table.parameters));
   ICEBERG_ASSIGN_OR_RAISE(auto metadata_location,
                           GetMetadataLocation(hive_table.parameters));
 

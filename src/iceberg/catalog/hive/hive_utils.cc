@@ -20,6 +20,7 @@
 #include "iceberg/catalog/hive/hive_utils.h"
 
 #include <array>
+#include <cctype>
 #include <format>
 #include <string>
 #include <string_view>
@@ -167,6 +168,39 @@ Result<std::string> GetMetadataLocation(
                     kMetadataLocationKey);
   }
   return it->second;
+}
+
+namespace {
+bool IEquals(std::string_view lhs, std::string_view rhs) {
+  if (lhs.size() != rhs.size()) {
+    return false;
+  }
+  for (std::size_t i = 0; i < lhs.size(); ++i) {
+    const auto a = static_cast<unsigned char>(lhs[i]);
+    const auto b = static_cast<unsigned char>(rhs[i]);
+    if (std::tolower(a) != std::tolower(b)) {
+      return false;
+    }
+  }
+  return true;
+}
+}  // namespace
+
+Status ValidateIcebergTable(
+    const TableIdentifier& identifier,
+    const std::unordered_map<std::string, std::string>& table_parameters) {
+  auto it = table_parameters.find(std::string(kTableTypeKey));
+  if (it == table_parameters.end() || it->second.empty()) {
+    return NoSuchTable(
+        "HMS table {} has no '{}' parameter; refusing to treat it as an Iceberg table.",
+        identifier.ToString(), kTableTypeKey);
+  }
+  if (!IEquals(it->second, kTableTypeIceberg)) {
+    return NoSuchTable("HMS table {} has '{}={}'; expected '{}' (case-insensitive).",
+                       identifier.ToString(), kTableTypeKey, it->second,
+                       kTableTypeIceberg);
+  }
+  return {};
 }
 
 std::string GetDefaultTableLocation(std::string_view warehouse, const Namespace& ns,
