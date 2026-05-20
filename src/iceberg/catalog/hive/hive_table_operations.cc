@@ -128,6 +128,18 @@ Result<std::string> HiveTableOperations::Commit(const HiveTableMetadataSnapshot&
   }
   HiveTable& current = current_or_error.value();
 
+  // Re-check the table_type marker even though Refresh already validated it.
+  // A concurrent Hive DDL (e.g., ALTER TABLE UNSET TBLPROPERTIES) could have
+  // stripped `table_type=ICEBERG` between Refresh and now; without this guard
+  // we would happily overwrite an unrelated Hive table's row with Iceberg
+  // metadata_location parameters.
+  if (auto validate = ValidateIcebergTable(identifier_, current.parameters);
+      !validate.has_value()) {
+    release_lock();
+    cleanup();
+    return std::unexpected(validate.error());
+  }
+
   auto current_location_or_error = GetMetadataLocation(current.parameters);
   if (!current_location_or_error.has_value()) {
     release_lock();
