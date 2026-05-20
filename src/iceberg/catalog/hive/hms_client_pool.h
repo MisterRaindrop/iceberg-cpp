@@ -72,6 +72,14 @@ class ICEBERG_HIVE_EXPORT HmsClientPool {
   /// the entire duration of `fn`, so callers can chain multiple RPCs on
   /// the same connection (e.g., `HiveTableOperations::Refresh` followed
   /// by `Commit`).
+  ///
+  /// Matches Java `ClientPoolImpl.run`'s reconnect-once contract: if
+  /// `fn` returns an error tagged `kServiceUnavailable` (raised by
+  /// `TransportError`, see `hive_errors.h`), the dead client is
+  /// discarded, a fresh one is built via `HmsClient::Connect`, and `fn`
+  /// is retried once. The second attempt's result -- success or any
+  /// error, including another transport failure -- is returned verbatim
+  /// so callers see at most one transparent reconnect per RPC sequence.
   template <typename F>
   auto Run(F&& fn) -> decltype(fn(std::declval<HmsClient*>())) {
     auto checkout = Checkout();
@@ -80,6 +88,15 @@ class ICEBERG_HIVE_EXPORT HmsClientPool {
     }
     auto client = std::move(*checkout);
     auto result = fn(client.get());
+    if (!result.has_value() && result.error().kind == ErrorKind::kServiceUnavailable) {
+      // Drop the broken connection without returning it to the idle queue.
+      auto fresh = Reconnect(std::move(client));
+      if (!fresh.has_value()) {
+        return std::unexpected(fresh.error());
+      }
+      client = std::move(*fresh);
+      result = fn(client.get());
+    }
     Checkin(std::move(client));
     return result;
   }
@@ -95,6 +112,13 @@ class ICEBERG_HIVE_EXPORT HmsClientPool {
 
   /// \brief Return a checked-out client to the idle queue.
   void Checkin(std::unique_ptr<HmsClient> client);
+
+  /// \brief Discard `stale` and build a replacement via
+  ///        `HmsClient::Connect`, keeping the `outstanding_` accounting
+  ///        intact. On replacement-build failure the slot is freed and
+  ///        the underlying error is returned so the caller can surface
+  ///        it directly.
+  Result<std::unique_ptr<HmsClient>> Reconnect(std::unique_ptr<HmsClient> stale);
 
   HiveCatalogProperties config_;
   std::size_t pool_size_;

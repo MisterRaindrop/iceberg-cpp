@@ -93,4 +93,23 @@ void HmsClientPool::Checkin(std::unique_ptr<HmsClient> client) {
   cv_.notify_one();
 }
 
+Result<std::unique_ptr<HmsClient>> HmsClientPool::Reconnect(
+    std::unique_ptr<HmsClient> stale) {
+  // Drop the broken transport first so its destructor's best-effort
+  // close runs while we still hold the outstanding slot. Connect outside
+  // the pool's mutex to avoid serialising the reconnect handshake.
+  stale.reset();
+  auto fresh = HmsClient::Connect(config_);
+  if (!fresh.has_value()) {
+    // Replenishment failed: free the slot we were holding so another
+    // caller can either pick up an idle client or attempt its own
+    // Connect.
+    std::lock_guard<std::mutex> lock(mu_);
+    --outstanding_;
+    cv_.notify_one();
+    return std::unexpected(fresh.error());
+  }
+  return std::move(*fresh);
+}
+
 }  // namespace iceberg::hive

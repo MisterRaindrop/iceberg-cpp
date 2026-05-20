@@ -69,6 +69,10 @@ std::unexpected<Error> MetaError(std::string_view context, std::string_view mess
   return IOError("HMS {} failed (MetaException): {}", context, message);
 }
 
+std::unexpected<Error> TransportError(std::string_view context, std::string_view what) {
+  return ServiceUnavailable("HMS {} transport error: {}", context, what);
+}
+
 std::unexpected<Error> GenericThriftError(std::string_view context,
                                           std::string_view what) {
   return IOError("Thrift error during HMS {}: {}", context, what);

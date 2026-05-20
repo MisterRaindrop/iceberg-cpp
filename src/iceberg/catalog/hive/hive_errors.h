@@ -80,9 +80,19 @@ ICEBERG_HIVE_EXPORT std::unexpected<Error> ConfigValSecurityError(
 ICEBERG_HIVE_EXPORT std::unexpected<Error> MetaError(std::string_view context,
                                                      std::string_view message);
 
-/// \brief Map any other Thrift transport or protocol exception (caught
-///        as `apache::thrift::TException`) to `ErrorKind::kIOError`.
-/// `what` should be the exception's `.what()` string.
+/// \brief Map `apache::thrift::transport::TTransportException` (socket
+///        closed, connection refused, frame size limit, etc.) to
+///        `ErrorKind::kServiceUnavailable`. Callers that own the
+///        `HmsClient` are expected to discard it and reconnect: the
+///        underlying transport is no longer usable.
+ICEBERG_HIVE_EXPORT std::unexpected<Error> TransportError(std::string_view context,
+                                                          std::string_view what);
+
+/// \brief Map any other Thrift protocol exception (caught as
+///        `apache::thrift::TException`) to `ErrorKind::kIOError`.
+///        `what` should be the exception's `.what()` string.
+///        TTransportException should be caught separately via
+///        `TransportError` so the pool can react to broken connections.
 ICEBERG_HIVE_EXPORT std::unexpected<Error> GenericThriftError(std::string_view context,
                                                               std::string_view what);
 

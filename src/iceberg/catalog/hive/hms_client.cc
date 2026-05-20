@@ -360,6 +360,9 @@ Result<std::vector<std::string>> HmsClient::GetAllDatabases() {
     return names;
   } catch (const MetaException& e) {
     return MetaError("get_all_databases", e.message);
+  } catch (const apache::thrift::transport::TTransportException& e) {
+    return TransportError("get_all_databases", e.what());
+
   } catch (const apache::thrift::TException& e) {
     return GenericThriftError("get_all_databases", e.what());
   }
@@ -376,6 +379,9 @@ Result<HiveDatabase> HmsClient::GetDatabase(std::string_view name) {
     return UnknownDBError("get_database", e.message);
   } catch (const MetaException& e) {
     return MetaError("get_database", e.message);
+  } catch (const apache::thrift::transport::TTransportException& e) {
+    return TransportError("get_database", e.what());
+
   } catch (const apache::thrift::TException& e) {
     return GenericThriftError("get_database", e.what());
   }
@@ -392,6 +398,9 @@ Status HmsClient::CreateDatabase(const HiveDatabase& database) {
     return InvalidObjectError("create_database", e.message);
   } catch (const MetaException& e) {
     return MetaError("create_database", e.message);
+  } catch (const apache::thrift::transport::TTransportException& e) {
+    return TransportError("create_database", e.what());
+
   } catch (const apache::thrift::TException& e) {
     return GenericThriftError("create_database", e.what());
   }
@@ -407,6 +416,9 @@ Status HmsClient::DropDatabase(std::string_view name, bool cascade) {
     return InvalidOperationError("drop_database", e.message);
   } catch (const MetaException& e) {
     return MetaError("drop_database", e.message);
+  } catch (const apache::thrift::transport::TTransportException& e) {
+    return TransportError("drop_database", e.what());
+
   } catch (const apache::thrift::TException& e) {
     return GenericThriftError("drop_database", e.what());
   }
@@ -423,6 +435,9 @@ Status HmsClient::AlterDatabase(std::string_view name, const HiveDatabase& datab
     return InvalidOperationError("alter_database", e.message);
   } catch (const MetaException& e) {
     return MetaError("alter_database", e.message);
+  } catch (const apache::thrift::transport::TTransportException& e) {
+    return TransportError("alter_database", e.what());
+
   } catch (const apache::thrift::TException& e) {
     return GenericThriftError("alter_database", e.what());
   }
@@ -442,6 +457,9 @@ Result<std::vector<std::string>> HmsClient::GetAllTables(std::string_view db_nam
     return UnknownDBError("get_all_tables", e.message);
   } catch (const MetaException& e) {
     return MetaError("get_all_tables", e.message);
+  } catch (const apache::thrift::transport::TTransportException& e) {
+    return TransportError("get_all_tables", e.what());
+
   } catch (const apache::thrift::TException& e) {
     return GenericThriftError("get_all_tables", e.what());
   }
@@ -464,6 +482,9 @@ Result<HiveTable> HmsClient::GetTable(std::string_view db_name,
     return UnknownDBError("get_table", e.message);
   } catch (const MetaException& e) {
     return MetaError("get_table", e.message);
+  } catch (const apache::thrift::transport::TTransportException& e) {
+    return TransportError("get_table", e.what());
+
   } catch (const apache::thrift::TException& e) {
     return GenericThriftError("get_table", e.what());
   }
@@ -482,6 +503,9 @@ Status HmsClient::CreateTable(const HiveTable& table) {
     return UnknownDBError("create_table", e.message);
   } catch (const MetaException& e) {
     return MetaError("create_table", e.message);
+  } catch (const apache::thrift::transport::TTransportException& e) {
+    return TransportError("create_table", e.what());
+
   } catch (const apache::thrift::TException& e) {
     return GenericThriftError("create_table", e.what());
   }
@@ -498,6 +522,9 @@ Status HmsClient::DropTable(std::string_view db_name, std::string_view table_nam
     return InvalidOperationError("drop_table", e.message);
   } catch (const MetaException& e) {
     return MetaError("drop_table", e.message);
+  } catch (const apache::thrift::transport::TTransportException& e) {
+    return TransportError("drop_table", e.what());
+
   } catch (const apache::thrift::TException& e) {
     return GenericThriftError("drop_table", e.what());
   }
@@ -518,6 +545,9 @@ Status HmsClient::AlterTable(std::string_view db_name, std::string_view table_na
     return InvalidOperationError("alter_table", e.message);
   } catch (const MetaException& e) {
     return MetaError("alter_table", e.message);
+  } catch (const apache::thrift::transport::TTransportException& e) {
+    return TransportError("alter_table", e.what());
+
   } catch (const apache::thrift::TException& e) {
     return GenericThriftError("alter_table", e.what());
   }
@@ -616,6 +646,9 @@ Result<HmsClient::HmsLockHandle> HmsClient::LockExclusive(std::string_view db_na
                         e.message);
   } catch (const MetaException& e) {
     return MetaError("lock", e.message);
+  } catch (const apache::thrift::transport::TTransportException& e) {
+    return TransportError("lock", e.what());
+
   } catch (const apache::thrift::TException& e) {
     return GenericThriftError("lock", e.what());
   }
@@ -666,6 +699,9 @@ Status HmsClient::Unlock(HmsLockHandle handle) {
     return InvalidOperationError("unlock", e.message);
   } catch (const MetaException& e) {
     return MetaError("unlock", e.message);
+  } catch (const apache::thrift::transport::TTransportException& e) {
+    return TransportError("unlock", e.what());
+
   } catch (const apache::thrift::TException& e) {
     return GenericThriftError("unlock", e.what());
   }
