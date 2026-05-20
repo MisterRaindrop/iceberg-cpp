@@ -40,15 +40,22 @@ namespace iceberg::hive {
 
 /// \brief Catalog implementation backed by a Hive Metastore.
 ///
-/// This class is intentionally a stub at this stage: every Catalog method
-/// returns ErrorKind::kNotImplemented so the iceberg_hive library can be
-/// linked, tested and shipped through CI before any HMS-talking logic
-/// arrives. Follow-up commits fill in:
-///   * `HmsClient` lifecycle and Thrift transport (C06)
-///   * Thrift exception → iceberg::Error mapping (C07)
-///   * Schema and namespace/table conversion helpers (C08, C09)
-///   * Namespace and table CRUD (C12, C13)
-///   * Commit / CAS via HiveTableOperations (C18–C21)
+/// Talks to HMS over Thrift via `HmsClient` and supports:
+///   * full namespace CRUD (create / list / properties / update / drop / exists)
+///   * table CRUD: `CreateTable` (writes initial metadata.json then registers in
+///     HMS, rolling back the metadata file on any HMS failure), `LoadTable`,
+///     `UpdateTable` (Refresh → TableMetadataBuilder.Apply → CAS commit),
+///     `DropTable(purge=false)`, `RenameTable`, `TableExists`, `RegisterTable`,
+///     `ListTables`
+///   * Commit path: write new metadata.json → `metadata_location` CAS via
+///     `alter_table` → on mismatch return `kCommitFailed` so `iceberg::Transaction`
+///     retries; failure paths best-effort delete the orphan metadata file
+///   * Optional HMS `EXCLUSIVE` table-level lock around the commit when
+///     `hive.lock-enabled=true`
+///
+/// `DropTable(purge=true)` and SASL/Kerberos authentication remain
+/// `kNotImplemented`; see `mkdocs/docs/catalogs/hive.md` for the full status
+/// matrix and remaining gaps.
 class ICEBERG_HIVE_EXPORT HiveCatalog : public Catalog,
                                         public std::enable_shared_from_this<HiveCatalog> {
  public:
