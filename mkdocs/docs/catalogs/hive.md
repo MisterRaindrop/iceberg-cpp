@@ -161,6 +161,11 @@ auto updated = catalog->UpdateTable(ident, requirements, updates);
 | `connect-timeout-ms` | `30000` | HMS connect timeout. |
 | `socket-timeout-ms` | `60000` | HMS read / write timeout. |
 | `hive.lock-enabled` | `false` | Wrap the commit path with an HMS EXCLUSIVE table-level `lock` / `unlock` for additional concurrency safety on top of `metadata_location` CAS. Recommended when many writers contend on the same table; safe to leave off otherwise (the CAS alone preserves single-writer correctness and `iceberg::Transaction` retries on `kCommitFailed`). |
+| `hive.lock-check-min-wait-ms` | `50` | Initial backoff between `check_lock` polls when HMS returns `WAITING`. Grows with a 1.5× factor up to `hive.lock-check-max-wait-ms`. Matches Java `HIVE_LOCK_CHECK_MIN_WAIT_MS`. |
+| `hive.lock-check-max-wait-ms` | `5000` | Cap on the per-poll wait. Matches Java `HIVE_LOCK_CHECK_MAX_WAIT_MS`. |
+| `hive.lock-acquire-timeout-ms` | `180000` | Total time the polling loop waits before giving up with `kCommitFailed`. Matches Java `HIVE_ACQUIRE_LOCK_TIMEOUT_MS` (3 minutes). |
+| `hive.lock-heartbeat-interval-ms` | `240000` | Period between background `heartbeat(0, lockId)` calls while a lock is held; the heartbeat actually fires at half this value. Matches Java `HIVE_LOCK_HEARTBEAT_INTERVAL_MS` (4 minutes). |
+| `hive.client-pool-size` | `2` | Number of `HmsClient` connections the catalog keeps around for parallel callers. Beyond this, callers block on a condition variable until a client is returned. Matches Java `CachedClientPool` default. |
 
 ## Thrift IDL provenance
 
