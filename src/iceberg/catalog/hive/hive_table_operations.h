@@ -60,6 +60,21 @@ class ICEBERG_HIVE_EXPORT HiveTableOperations {
   /// metadata file is malformed.
   Result<HiveTableMetadataSnapshot> Refresh();
 
+  /// \brief Atomically replace `base` with `new_metadata`.
+  ///
+  /// Writes a fresh metadata.json under `new_metadata.location`, then
+  /// CAS-checks HMS's current `metadata_location` parameter against
+  /// `base.metadata_location`. On mismatch returns `kCommitFailed`
+  /// (callers should retry via `iceberg::Transaction`). On any
+  /// failure (CAS, AlterTable, or thrown Thrift exception) the
+  /// freshly-written metadata file is best-effort deleted so the
+  /// warehouse stays free of orphans.
+  ///
+  /// Returns the location of the newly-written metadata file on
+  /// success so the caller can fold it into a refreshed snapshot.
+  Result<std::string> Commit(const HiveTableMetadataSnapshot& base,
+                             const TableMetadata& new_metadata);
+
   const TableIdentifier& identifier() const { return identifier_; }
 
  private:
