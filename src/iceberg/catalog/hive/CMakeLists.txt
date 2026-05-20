@@ -76,6 +76,7 @@ set(ICEBERG_HIVE_SOURCES
     hive_catalog.cc
     hive_catalog_properties.cc
     hive_errors.cc
+    hive_schema.cc
     hms_client.cc
     ${ICEBERG_HIVE_THRIFT_GEN_SOURCES})
 
