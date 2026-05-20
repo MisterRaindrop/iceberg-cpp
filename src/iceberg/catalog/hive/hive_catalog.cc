@@ -198,23 +198,24 @@ Result<std::shared_ptr<Table>> HiveCatalog::CreateTable(
                                        identifier.ns, identifier.name);
   }
 
-  // Build the initial TableMetadata + serialise to JSON.
+  // Build the initial TableMetadata + serialise to JSON. Do every step
+  // that can fail without side-effects on the filesystem first (schema
+  // conversion, JSON serialisation, HMS table construction) so a bad
+  // schema never leaves an orphan metadata.json in the warehouse.
   ICEBERG_ASSIGN_OR_RAISE(
       auto metadata, TableMetadata::Make(*schema, *spec, *order, location, properties));
   const std::string metadata_location = std::format(
       "{}/metadata/00000-{}.metadata.json", location, Uuid::GenerateV4().ToString());
   ICEBERG_ASSIGN_OR_RAISE(const auto json_str, ToJsonString(*metadata));
-  ICEBERG_RETURN_UNEXPECTED(file_io_->WriteFile(metadata_location, json_str));
-
-  // Convert + register in HMS. Roll back the metadata file on failure.
   ICEBERG_ASSIGN_OR_RAISE(auto columns, SchemaToHiveColumns(*schema));
-  auto hive_table_or_error =
-      ConvertToHiveTable(identifier, columns, metadata_location, location, properties);
-  if (!hive_table_or_error.has_value()) {
-    (void)file_io_->DeleteFile(metadata_location);
-    return std::unexpected(hive_table_or_error.error());
-  }
-  auto create_status = client_->CreateTable(*hive_table_or_error);
+  ICEBERG_ASSIGN_OR_RAISE(
+      auto hive_table,
+      ConvertToHiveTable(identifier, columns, metadata_location, location, properties));
+
+  // Only now write the file; if CreateTable in HMS fails we still need
+  // to roll back the file we just wrote.
+  ICEBERG_RETURN_UNEXPECTED(file_io_->WriteFile(metadata_location, json_str));
+  auto create_status = client_->CreateTable(hive_table);
   if (!create_status.has_value()) {
     (void)file_io_->DeleteFile(metadata_location);
     return std::unexpected(create_status.error());
