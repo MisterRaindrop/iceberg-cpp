@@ -68,9 +68,12 @@ class ICEBERG_HIVE_EXPORT HiveCatalog : public Catalog,
 
   /// \brief Construct a HiveCatalog from `config`.
   ///
-  /// The MVP factory only stores the configuration; HMS connection setup
-  /// is deferred to follow-up commits. Returns an error if the supplied
-  /// configuration is missing required fields (currently: the URI).
+  /// Resolves the URI / transport / timeout settings, opens the Thrift
+  /// connection to HMS, and builds the FileIO described by `io-impl` (or
+  /// auto-detects from the warehouse scheme when omitted). Returns
+  /// `kInvalidArgument` when required configuration (URI) is missing,
+  /// `kIOError` for HMS connection failures, or `kNotSupported` when the
+  /// requested FileIO scheme is unknown.
   static Result<std::shared_ptr<HiveCatalog>> Make(const HiveCatalogProperties& config);
 
   std::string_view name() const override;

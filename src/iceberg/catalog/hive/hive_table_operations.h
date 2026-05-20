@@ -34,9 +34,9 @@ class HmsClient;
 
 /// \brief Loaded TableMetadata together with the metadata file location.
 ///
-/// Returned by `HiveTableOperations::Refresh`. The Commit path (C19)
-/// will pass the same struct back in as the `base` so the CAS check has
-/// the previous metadata_location to assert against.
+/// Returned by `HiveTableOperations::Refresh` and passed back into
+/// `HiveTableOperations::Commit` as the `base` so the CAS check has the
+/// previous `metadata_location` to compare against.
 struct ICEBERG_HIVE_EXPORT HiveTableMetadataSnapshot {
   std::shared_ptr<TableMetadata> metadata;
   std::string metadata_location;
@@ -45,8 +45,11 @@ struct ICEBERG_HIVE_EXPORT HiveTableMetadataSnapshot {
 /// \brief Per-table HMS read / write orchestrator.
 ///
 /// Wraps the (HMS Thrift, FileIO) pair iceberg_hive needs to round-trip
-/// table metadata. Phase 1 only exposes `Refresh()` (read path);
-/// `Commit()` with `metadata_location` CAS lands in C19.
+/// table metadata. Exposes `Refresh()` (HMS GetTable + FileIO read of
+/// the metadata.json) and `Commit()` (write new metadata.json + CAS via
+/// `metadata_location` + optional HMS EXCLUSIVE table lock). On any
+/// commit failure the freshly-written metadata file is best-effort
+/// deleted so the warehouse stays free of orphan files.
 class ICEBERG_HIVE_EXPORT HiveTableOperations {
  public:
   /// \param lock_enabled If true, `Commit` wraps the
