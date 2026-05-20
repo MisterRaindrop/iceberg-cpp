@@ -182,15 +182,24 @@ Result<std::string> HiveTableOperations::Commit(const HiveTableMetadataSnapshot&
   // that introspect HMS (Hive `DESCRIBE`, Spark / Trino schema discovery)
   // see the post-evolution columns. Mirrors Java's
   // `HiveTableOperations.commitToExistingTable()` calling
-  // `setCols(HiveSchemaUtil.convert(newMetadata.schema()))`.
-  if (auto new_schema = new_metadata.Schema();
-      new_schema.has_value() && *new_schema != nullptr) {
-    if (auto columns = SchemaToHiveColumns(**new_schema); columns.has_value()) {
-      current.columns = std::move(*columns);
-    } else {
+  // `setCols(HiveSchemaUtil.convert(newMetadata.schema()))`. Propagate
+  // any failure from `Schema()` (e.g., dangling current_schema_id) so we
+  // do not silently leave HMS columns out of sync with metadata_location.
+  {
+    auto new_schema = new_metadata.Schema();
+    if (!new_schema.has_value()) {
       release_lock();
       cleanup();
-      return std::unexpected(columns.error());
+      return std::unexpected(new_schema.error());
+    }
+    if (*new_schema != nullptr) {
+      auto columns = SchemaToHiveColumns(**new_schema);
+      if (!columns.has_value()) {
+        release_lock();
+        cleanup();
+        return std::unexpected(columns.error());
+      }
+      current.columns = std::move(*columns);
     }
   }
   auto alter_status =
