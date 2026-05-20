@@ -41,11 +41,13 @@ HmsClientPool::~HmsClientPool() = default;
 
 Result<std::unique_ptr<HmsClientPool>> HmsClientPool::Make(
     const HiveCatalogProperties& config) {
-  auto pool_size =
-      static_cast<std::size_t>(config.Get(HiveCatalogProperties::kClientPoolSize));
-  if (pool_size < kMinPoolSize) {
-    pool_size = kMinPoolSize;
-  }
+  // Clamp the int value before casting so a negative configured size does
+  // not wrap to SIZE_MAX (which would let the pool grow without bound on
+  // every checkout).
+  const int configured = config.Get(HiveCatalogProperties::kClientPoolSize);
+  const std::size_t pool_size = configured < static_cast<int>(kMinPoolSize)
+                                    ? kMinPoolSize
+                                    : static_cast<std::size_t>(configured);
   // Open one client eagerly so configuration mistakes (bad URI, bad
   // transport, unreachable HMS) surface from `HiveCatalog::Make` rather
   // than the first catalog method call.

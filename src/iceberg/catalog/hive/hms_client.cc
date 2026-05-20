@@ -542,8 +542,11 @@ CheckLockOutcome PollCheckLock(Apache::Hadoop::Hive::ThriftHiveMetastoreClient* 
   using clock = std::chrono::steady_clock;
   const auto deadline =
       clock::now() + std::chrono::milliseconds(options.acquire_timeout_ms);
-  auto wait_ms = std::max(1, options.check_min_wait_ms);
-  const auto max_wait_ms = std::max(wait_ms, options.check_max_wait_ms);
+  // Use int64_t for the running wait so the `1.5x` backoff multiplication
+  // cannot overflow even if a caller passes pathological check_max_wait_ms.
+  std::int64_t wait_ms = std::max(1, options.check_min_wait_ms);
+  const std::int64_t max_wait_ms =
+      std::max<std::int64_t>(wait_ms, options.check_max_wait_ms);
 
   while (true) {
     if (clock::now() >= deadline) {
