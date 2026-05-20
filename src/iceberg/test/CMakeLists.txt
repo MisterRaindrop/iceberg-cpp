@@ -286,6 +286,7 @@ if(ICEBERG_BUILD_HIVE)
 
   add_hive_iceberg_test(hive_catalog_test
                         SOURCES
+                        hive_catalog_make_test.cc
                         hive_errors_test.cc
                         hive_schema_test.cc
                         hive_utils_test.cc
