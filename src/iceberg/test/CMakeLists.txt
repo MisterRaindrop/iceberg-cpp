@@ -290,4 +290,12 @@ if(ICEBERG_BUILD_HIVE)
                         hive_schema_test.cc
                         hive_utils_test.cc
                         hms_client_test.cc)
+
+  if(ICEBERG_BUILD_HIVE_INTEGRATION_TESTS)
+    add_hive_iceberg_test(hive_catalog_integration_test
+                          SOURCES
+                          hive_catalog_integration_test.cc
+                          util/cmd_util.cc
+                          util/docker_compose_util.cc)
+  endif()
 endif()
