@@ -61,19 +61,24 @@ jobs:
           CC: gcc-14
           CXX: g++-14
         run: |
+          # Build the integration test binary too (catches compile-time
+          # breakage of the docker-fixture suite in PRs) but DO NOT execute
+          # it -- those tests depend on a running HMS + MinIO stack that
+          # this default job does not provision. A separate nightly job is
+          # expected to bring up docker-compose and execute the suite.
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Debug \
             -DCMAKE_INSTALL_PREFIX=${ICEBERG_HOME} \
             -DICEBERG_BUILD_STATIC=ON \
             -DICEBERG_BUILD_SHARED=ON \
             -DICEBERG_BUILD_HIVE=ON \
-            -DICEBERG_BUILD_HIVE_INTEGRATION_TESTS=OFF
+            -DICEBERG_BUILD_HIVE_INTEGRATION_TESTS=ON
       - name: Build
         shell: bash
         run: cmake --build build --target install
       - name: Run hive_catalog_test
         shell: bash
-        run: ctest --test-dir build --output-on-failure -R 'hive_catalog_test'
-      - name: Run full ctest regression
+        run: ctest --test-dir build --output-on-failure -R '^hive_catalog_test$'
+      - name: Run full ctest regression (excluding HMS-docker integration)
         shell: bash
-        run: ctest --test-dir build --output-on-failure
+        run: ctest --test-dir build --output-on-failure -E 'hive_catalog_integration_test'
