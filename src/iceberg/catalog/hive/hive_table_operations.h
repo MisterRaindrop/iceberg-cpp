@@ -50,9 +50,13 @@ struct ICEBERG_HIVE_EXPORT HiveTableMetadataSnapshot {
 /// Wraps the (HMS Thrift, FileIO) pair iceberg_hive needs to round-trip
 /// table metadata. Exposes `Refresh()` (HMS GetTable + FileIO read of
 /// the metadata.json) and `Commit()` (write new metadata.json + CAS via
-/// `metadata_location` + optional HMS EXCLUSIVE table lock). On any
-/// commit failure the freshly-written metadata file is best-effort
-/// deleted so the warehouse stays free of orphan files.
+/// `metadata_location` + optional HMS EXCLUSIVE table lock). Commit
+/// failures that can be classified as definitively "did not land"
+/// (`kCommitFailed`, `kNoSuchTable`) best-effort delete the freshly-
+/// written metadata file so the warehouse stays free of orphans;
+/// failures that leave the outcome indeterminate (`kCommitStateUnknown`)
+/// intentionally KEEP the file because we cannot prove HMS no longer
+/// points at it.
 class ICEBERG_HIVE_EXPORT HiveTableOperations {
  public:
   /// \param lock_enabled If true, `Commit` wraps the
@@ -90,11 +94,17 @@ class ICEBERG_HIVE_EXPORT HiveTableOperations {
   ///
   /// Writes a fresh metadata.json under `new_metadata.location`, then
   /// CAS-checks HMS's current `metadata_location` parameter against
-  /// `base.metadata_location`. On mismatch returns `kCommitFailed`
-  /// (callers should retry via `iceberg::Transaction`). On any
-  /// failure (CAS, AlterTable, or thrown Thrift exception) the
-  /// freshly-written metadata file is best-effort deleted so the
-  /// warehouse stays free of orphans.
+  /// `base.metadata_location` via an `alter_table` call. On mismatch
+  /// returns `kCommitFailed` (callers should retry via
+  /// `iceberg::Transaction`).
+  ///
+  /// AlterTable failures go through a three-state recovery
+  /// (`checkCommitStatus`): if HMS now points at the new
+  /// `metadata_location` the commit landed silently; if it still points
+  /// at `base.metadata_location` the commit did not land and the file is
+  /// cleaned up; any other observed state is surfaced as
+  /// `kCommitStateUnknown` with the metadata file LEFT IN PLACE because
+  /// we cannot prove HMS does not reference it.
   ///
   /// Returns the location of the newly-written metadata file on
   /// success so the caller can fold it into a refreshed snapshot.
