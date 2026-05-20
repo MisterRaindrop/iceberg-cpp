@@ -86,6 +86,14 @@ class ICEBERG_HIVE_EXPORT HiveCatalogProperties
   /// Phase 2 (`HiveTableOperations::Commit`).
   inline static Entry<bool> kLockEnabled{"hive.lock-enabled", false};
 
+  /// \brief Size of the `HmsClient` pool the catalog keeps around. Each
+  /// catalog method checks a client out of the pool for the duration of
+  /// its RPC sequence and returns it when done, matching Java
+  /// `CachedClientPool`. Concurrent callers therefore get parallelism up
+  /// to this size; beyond that they block on a condition variable.
+  /// Defaults to `2`, matching Java's `client-pool-size` default.
+  inline static Entry<int> kClientPoolSize{"hive.client-pool-size", 2};
+
   /// \brief Build a HiveCatalogProperties with defaults applied.
   static HiveCatalogProperties default_properties();
 

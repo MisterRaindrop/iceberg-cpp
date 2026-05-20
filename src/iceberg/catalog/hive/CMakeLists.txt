@@ -80,6 +80,7 @@ set(ICEBERG_HIVE_SOURCES
     hive_table_operations.cc
     hive_utils.cc
     hms_client.cc
+    hms_client_pool.cc
     ${ICEBERG_HIVE_THRIFT_GEN_SOURCES})
 
 set(ICEBERG_HIVE_STATIC_BUILD_INTERFACE_LIBS)

@@ -31,6 +31,7 @@
 #include "iceberg/catalog/hive/hive_table_operations.h"
 #include "iceberg/catalog/hive/hive_utils.h"
 #include "iceberg/catalog/hive/hms_client.h"
+#include "iceberg/catalog/hive/hms_client_pool.h"
 #include "iceberg/file_io_registry.h"
 #include "iceberg/json_serde_internal.h"
 #include "iceberg/partition_spec.h"
@@ -88,21 +89,22 @@ Result<std::unique_ptr<FileIO>> MakeHiveFileIO(const HiveCatalogProperties& conf
 
 }  // namespace
 
-HiveCatalog::HiveCatalog(HiveCatalogProperties config, std::unique_ptr<HmsClient> client,
+HiveCatalog::HiveCatalog(HiveCatalogProperties config,
+                         std::unique_ptr<HmsClientPool> client_pool,
                          std::shared_ptr<FileIO> file_io)
     : config_(std::move(config)),
       name_(config_.Get(HiveCatalogProperties::kName)),
-      client_(std::move(client)),
+      client_pool_(std::move(client_pool)),
       file_io_(std::move(file_io)) {}
 
 HiveCatalog::~HiveCatalog() = default;
 
 Result<std::shared_ptr<HiveCatalog>> HiveCatalog::Make(
     const HiveCatalogProperties& config) {
-  ICEBERG_ASSIGN_OR_RAISE(auto client, HmsClient::Connect(config));
+  ICEBERG_ASSIGN_OR_RAISE(auto client_pool, HmsClientPool::Make(config));
   ICEBERG_ASSIGN_OR_RAISE(auto file_io, MakeHiveFileIO(config));
   return std::shared_ptr<HiveCatalog>(
-      new HiveCatalog(config, std::move(client), std::move(file_io)));
+      new HiveCatalog(config, std::move(client_pool), std::move(file_io)));
 }
 
 std::string_view HiveCatalog::name() const { return name_; }
@@ -110,84 +112,105 @@ std::string_view HiveCatalog::name() const { return name_; }
 Status HiveCatalog::CreateNamespace(
     const Namespace& ns, const std::unordered_map<std::string, std::string>& properties) {
   ICEBERG_ASSIGN_OR_RAISE(auto database, ConvertToHiveDatabase(ns, properties));
-  return client_->CreateDatabase(database);
+  return client_pool_->Run(
+      [&](HmsClient* client) { return client->CreateDatabase(database); });
 }
 
 Result<std::vector<Namespace>> HiveCatalog::ListNamespaces(const Namespace& ns) const {
-  if (!ns.levels.empty()) {
-    // HMS is flat: it has no notion of nested namespaces, so any non-empty
-    // parent either matches an existing database (in which case it has no
-    // children) or does not exist. Java's HiveCatalog throws
-    // `NoSuchNamespaceException` in the latter case and an empty list in
-    // the former; mirror that contract instead of swallowing both into
-    // an indistinguishable empty list.
-    ICEBERG_RETURN_UNEXPECTED(ValidateNamespace(ns));
-    ICEBERG_ASSIGN_OR_RAISE(auto exists, NamespaceExists(ns));
-    if (!exists) {
-      return NoSuchNamespace("Hive namespace {} does not exist.", ns.levels[0]);
+  // HMS is flat: it has no notion of nested namespaces, so any non-empty
+  // parent either matches an existing database (in which case it has no
+  // children) or does not exist. Java's HiveCatalog throws
+  // `NoSuchNamespaceException` in the latter case and an empty list in
+  // the former; mirror that contract instead of swallowing both into
+  // an indistinguishable empty list. Run the existence check + listing
+  // on a single pooled client to keep the read consistent.
+  return client_pool_->Run([&](HmsClient* client) -> Result<std::vector<Namespace>> {
+    if (!ns.levels.empty()) {
+      ICEBERG_RETURN_UNEXPECTED(ValidateNamespace(ns));
+      auto database = client->GetDatabase(ns.levels[0]);
+      if (!database.has_value()) {
+        if (database.error().kind == ErrorKind::kNoSuchNamespace) {
+          return NoSuchNamespace("Hive namespace {} does not exist.", ns.levels[0]);
+        }
+        return std::unexpected(database.error());
+      }
+      return std::vector<Namespace>{};
     }
-    return std::vector<Namespace>{};
-  }
-  ICEBERG_ASSIGN_OR_RAISE(auto names, client_->GetAllDatabases());
-  std::vector<Namespace> namespaces;
-  namespaces.reserve(names.size());
-  for (auto& db_name : names) {
-    namespaces.push_back(Namespace{.levels = {std::move(db_name)}});
-  }
-  return namespaces;
+    ICEBERG_ASSIGN_OR_RAISE(auto names, client->GetAllDatabases());
+    std::vector<Namespace> namespaces;
+    namespaces.reserve(names.size());
+    for (auto& db_name : names) {
+      namespaces.push_back(Namespace{.levels = {std::move(db_name)}});
+    }
+    return namespaces;
+  });
 }
 
 Result<std::unordered_map<std::string, std::string>> HiveCatalog::GetNamespaceProperties(
     const Namespace& ns) const {
   ICEBERG_RETURN_UNEXPECTED(ValidateNamespace(ns));
-  ICEBERG_ASSIGN_OR_RAISE(auto database, client_->GetDatabase(ns.levels[0]));
-  return ConvertFromHiveDatabase(database).properties;
+  return client_pool_->Run(
+      [&](HmsClient* client) -> Result<std::unordered_map<std::string, std::string>> {
+        ICEBERG_ASSIGN_OR_RAISE(auto database, client->GetDatabase(ns.levels[0]));
+        return ConvertFromHiveDatabase(database).properties;
+      });
 }
 
 Status HiveCatalog::DropNamespace(const Namespace& ns) {
   ICEBERG_RETURN_UNEXPECTED(ValidateNamespace(ns));
-  return client_->DropDatabase(ns.levels[0], /*cascade=*/false);
+  return client_pool_->Run([&](HmsClient* client) {
+    return client->DropDatabase(ns.levels[0], /*cascade=*/false);
+  });
 }
 
 Result<bool> HiveCatalog::NamespaceExists(const Namespace& ns) const {
   ICEBERG_RETURN_UNEXPECTED(ValidateNamespace(ns));
-  auto database = client_->GetDatabase(ns.levels[0]);
-  if (database.has_value()) {
-    return true;
-  }
-  if (database.error().kind == ErrorKind::kNoSuchNamespace) {
-    return false;
-  }
-  return std::unexpected(database.error());
+  return client_pool_->Run([&](HmsClient* client) -> Result<bool> {
+    auto database = client->GetDatabase(ns.levels[0]);
+    if (database.has_value()) {
+      return true;
+    }
+    if (database.error().kind == ErrorKind::kNoSuchNamespace) {
+      return false;
+    }
+    return std::unexpected(database.error());
+  });
 }
 
 Status HiveCatalog::UpdateNamespaceProperties(
     const Namespace& ns, const std::unordered_map<std::string, std::string>& updates,
     const std::unordered_set<std::string>& removals) {
   ICEBERG_RETURN_UNEXPECTED(ValidateNamespace(ns));
-  ICEBERG_ASSIGN_OR_RAISE(auto database, client_->GetDatabase(ns.levels[0]));
-
-  auto namespace_view = ConvertFromHiveDatabase(database);
-  auto& properties = namespace_view.properties;
-  for (const auto& key : removals) {
-    properties.erase(key);
-  }
-  for (const auto& [key, value] : updates) {
-    properties[key] = value;
-  }
-  ICEBERG_ASSIGN_OR_RAISE(auto altered, ConvertToHiveDatabase(ns, properties));
-  return client_->AlterDatabase(ns.levels[0], altered);
+  // Read-modify-write on the same pooled client so a concurrent writer
+  // cannot squeeze in between the GetDatabase and AlterDatabase calls
+  // observed via different sockets.
+  return client_pool_->Run([&](HmsClient* client) -> Status {
+    ICEBERG_ASSIGN_OR_RAISE(auto database, client->GetDatabase(ns.levels[0]));
+    auto namespace_view = ConvertFromHiveDatabase(database);
+    auto& properties = namespace_view.properties;
+    for (const auto& key : removals) {
+      properties.erase(key);
+    }
+    for (const auto& [key, value] : updates) {
+      properties[key] = value;
+    }
+    ICEBERG_ASSIGN_OR_RAISE(auto altered, ConvertToHiveDatabase(ns, properties));
+    return client->AlterDatabase(ns.levels[0], altered);
+  });
 }
 
 Result<std::vector<TableIdentifier>> HiveCatalog::ListTables(const Namespace& ns) const {
   ICEBERG_RETURN_UNEXPECTED(ValidateNamespace(ns));
-  ICEBERG_ASSIGN_OR_RAISE(auto names, client_->GetAllTables(ns.levels[0]));
-  std::vector<TableIdentifier> identifiers;
-  identifiers.reserve(names.size());
-  for (auto& table_name : names) {
-    identifiers.push_back(TableIdentifier{.ns = ns, .name = std::move(table_name)});
-  }
-  return identifiers;
+  return client_pool_->Run(
+      [&](HmsClient* client) -> Result<std::vector<TableIdentifier>> {
+        ICEBERG_ASSIGN_OR_RAISE(auto names, client->GetAllTables(ns.levels[0]));
+        std::vector<TableIdentifier> identifiers;
+        identifiers.reserve(names.size());
+        for (auto& table_name : names) {
+          identifiers.push_back(TableIdentifier{.ns = ns, .name = std::move(table_name)});
+        }
+        return identifiers;
+      });
 }
 
 Result<std::shared_ptr<Table>> HiveCatalog::CreateTable(
@@ -226,7 +249,8 @@ Result<std::shared_ptr<Table>> HiveCatalog::CreateTable(
   // Only now write the file; if CreateTable in HMS fails we still need
   // to roll back the file we just wrote.
   ICEBERG_RETURN_UNEXPECTED(file_io_->WriteFile(metadata_location, json_str));
-  auto create_status = client_->CreateTable(hive_table);
+  auto create_status = client_pool_->Run(
+      [&](HmsClient* client) { return client->CreateTable(hive_table); });
   if (!create_status.has_value()) {
     (void)file_io_->DeleteFile(metadata_location);
     return std::unexpected(create_status.error());
@@ -243,31 +267,36 @@ Result<std::shared_ptr<Table>> HiveCatalog::UpdateTable(
   ICEBERG_RETURN_UNEXPECTED(ValidateNamespace(identifier.ns));
   ICEBERG_RETURN_UNEXPECTED(identifier.Validate());
 
-  HiveTableOperations ops(
-      client_.get(), file_io_, identifier,
-      /*lock_enabled=*/config_.Get(HiveCatalogProperties::kLockEnabled));
-  ICEBERG_ASSIGN_OR_RAISE(auto base, ops.Refresh());
+  // Hold one pooled client for the entire Refresh -> Commit chain so the
+  // base snapshot, the CAS re-read, the AlterTable and (when enabled) the
+  // lock / unlock RPCs all observe the same TCP connection. Without this
+  // they could race against each other via separate sockets.
+  const bool lock_enabled = config_.Get(HiveCatalogProperties::kLockEnabled);
+  return client_pool_->Run([&](HmsClient* client) -> Result<std::shared_ptr<Table>> {
+    HiveTableOperations ops(client, file_io_, identifier, lock_enabled);
+    ICEBERG_ASSIGN_OR_RAISE(auto base, ops.Refresh());
 
-  // Validate requirements against the current metadata before mutating.
-  for (const auto& requirement : requirements) {
-    if (!requirement) continue;
-    ICEBERG_RETURN_UNEXPECTED(requirement->Validate(base.metadata.get()));
-  }
+    // Validate requirements against the current metadata before mutating.
+    for (const auto& requirement : requirements) {
+      if (!requirement) continue;
+      ICEBERG_RETURN_UNEXPECTED(requirement->Validate(base.metadata.get()));
+    }
 
-  // Apply updates via TableMetadataBuilder and build the new metadata.
-  auto builder = TableMetadataBuilder::BuildFrom(base.metadata.get());
-  for (const auto& update : updates) {
-    if (!update) continue;
-    update->ApplyTo(*builder);
-  }
-  ICEBERG_ASSIGN_OR_RAISE(auto new_metadata, builder->Build());
+    // Apply updates via TableMetadataBuilder and build the new metadata.
+    auto builder = TableMetadataBuilder::BuildFrom(base.metadata.get());
+    for (const auto& update : updates) {
+      if (!update) continue;
+      update->ApplyTo(*builder);
+    }
+    ICEBERG_ASSIGN_OR_RAISE(auto new_metadata, builder->Build());
 
-  ICEBERG_ASSIGN_OR_RAISE(auto new_metadata_location, ops.Commit(base, *new_metadata));
-  // Java BaseMetastoreCatalog returns the in-memory metadata directly here
-  // instead of re-reading from HMS. Mirror that to avoid a second GetTable +
-  // ReadFile per successful UpdateTable.
-  return Table::Make(identifier, std::shared_ptr<TableMetadata>(new_metadata.release()),
-                     std::move(new_metadata_location), file_io_, shared_from_this());
+    ICEBERG_ASSIGN_OR_RAISE(auto new_metadata_location, ops.Commit(base, *new_metadata));
+    // Java BaseMetastoreCatalog returns the in-memory metadata directly
+    // here instead of re-reading from HMS. Mirror that to avoid a second
+    // GetTable + ReadFile per successful UpdateTable.
+    return Table::Make(identifier, std::shared_ptr<TableMetadata>(new_metadata.release()),
+                       std::move(new_metadata_location), file_io_, shared_from_this());
+  });
 }
 
 Result<std::shared_ptr<Transaction>> HiveCatalog::StageCreateTable(
@@ -281,14 +310,16 @@ Result<std::shared_ptr<Transaction>> HiveCatalog::StageCreateTable(
 Result<bool> HiveCatalog::TableExists(const TableIdentifier& identifier) const {
   ICEBERG_RETURN_UNEXPECTED(ValidateNamespace(identifier.ns));
   ICEBERG_RETURN_UNEXPECTED(identifier.Validate());
-  auto table = client_->GetTable(identifier.ns.levels[0], identifier.name);
-  if (table.has_value()) {
-    return true;
-  }
-  if (table.error().kind == ErrorKind::kNoSuchTable) {
-    return false;
-  }
-  return std::unexpected(table.error());
+  return client_pool_->Run([&](HmsClient* client) -> Result<bool> {
+    auto table = client->GetTable(identifier.ns.levels[0], identifier.name);
+    if (table.has_value()) {
+      return true;
+    }
+    if (table.error().kind == ErrorKind::kNoSuchTable) {
+      return false;
+    }
+    return std::unexpected(table.error());
+  });
 }
 
 Status HiveCatalog::DropTable(const TableIdentifier& identifier, bool purge) {
@@ -305,12 +336,15 @@ Status HiveCatalog::DropTable(const TableIdentifier& identifier, bool purge) {
   }
   // Refuse to drop a row that does not carry the Iceberg marker; the user's
   // identifier may collide with a native Hive table that the catalog should
-  // not be allowed to delete.
-  ICEBERG_ASSIGN_OR_RAISE(auto table,
-                          client_->GetTable(identifier.ns.levels[0], identifier.name));
-  ICEBERG_RETURN_UNEXPECTED(ValidateIcebergTable(identifier, table.parameters));
-  return client_->DropTable(identifier.ns.levels[0], identifier.name,
-                            /*delete_data=*/false);
+  // not be allowed to delete. Read-then-delete on the same pooled client to
+  // close the obvious TOCTOU window.
+  return client_pool_->Run([&](HmsClient* client) -> Status {
+    ICEBERG_ASSIGN_OR_RAISE(auto table,
+                            client->GetTable(identifier.ns.levels[0], identifier.name));
+    ICEBERG_RETURN_UNEXPECTED(ValidateIcebergTable(identifier, table.parameters));
+    return client->DropTable(identifier.ns.levels[0], identifier.name,
+                             /*delete_data=*/false);
+  });
 }
 
 Status HiveCatalog::RenameTable(const TableIdentifier& from, const TableIdentifier& to) {
@@ -319,19 +353,22 @@ Status HiveCatalog::RenameTable(const TableIdentifier& from, const TableIdentifi
   ICEBERG_RETURN_UNEXPECTED(from.Validate());
   ICEBERG_RETURN_UNEXPECTED(to.Validate());
 
-  ICEBERG_ASSIGN_OR_RAISE(auto table, client_->GetTable(from.ns.levels[0], from.name));
-  ICEBERG_RETURN_UNEXPECTED(ValidateIcebergTable(from, table.parameters));
-  table.db_name = to.ns.levels[0];
-  table.table_name = to.name;
-  return client_->AlterTable(from.ns.levels[0], from.name, table);
+  return client_pool_->Run([&](HmsClient* client) -> Status {
+    ICEBERG_ASSIGN_OR_RAISE(auto table, client->GetTable(from.ns.levels[0], from.name));
+    ICEBERG_RETURN_UNEXPECTED(ValidateIcebergTable(from, table.parameters));
+    table.db_name = to.ns.levels[0];
+    table.table_name = to.name;
+    return client->AlterTable(from.ns.levels[0], from.name, table);
+  });
 }
 
 Result<std::shared_ptr<Table>> HiveCatalog::LoadTable(const TableIdentifier& identifier) {
   ICEBERG_RETURN_UNEXPECTED(ValidateNamespace(identifier.ns));
   ICEBERG_RETURN_UNEXPECTED(identifier.Validate());
 
-  ICEBERG_ASSIGN_OR_RAISE(auto hive_table,
-                          client_->GetTable(identifier.ns.levels[0], identifier.name));
+  ICEBERG_ASSIGN_OR_RAISE(auto hive_table, client_pool_->Run([&](HmsClient* client) {
+    return client->GetTable(identifier.ns.levels[0], identifier.name);
+  }));
   ICEBERG_RETURN_UNEXPECTED(ValidateIcebergTable(identifier, hive_table.parameters));
   ICEBERG_ASSIGN_OR_RAISE(auto metadata_location,
                           GetMetadataLocation(hive_table.parameters));
@@ -386,7 +423,8 @@ Result<std::shared_ptr<Table>> HiveCatalog::RegisterTable(
       auto hive_table,
       ConvertToHiveTable(identifier, columns, metadata_file_location, location,
                          /*table_properties=*/{}));
-  ICEBERG_RETURN_UNEXPECTED(client_->CreateTable(hive_table));
+  ICEBERG_RETURN_UNEXPECTED(client_pool_->Run(
+      [&](HmsClient* client) { return client->CreateTable(hive_table); }));
 
   return Table::Make(identifier, std::shared_ptr<TableMetadata>(metadata.release()),
                      metadata_file_location, file_io_, shared_from_this());

@@ -30,7 +30,7 @@
 #include "iceberg/result.h"
 
 namespace iceberg::hive {
-class HmsClient;
+class HmsClientPool;
 }  // namespace iceberg::hive
 
 /// \file iceberg/catalog/hive/hive_catalog.h
@@ -127,12 +127,12 @@ class ICEBERG_HIVE_EXPORT HiveCatalog : public Catalog,
       const std::string& metadata_file_location) override;
 
  private:
-  HiveCatalog(HiveCatalogProperties config, std::unique_ptr<HmsClient> client,
+  HiveCatalog(HiveCatalogProperties config, std::unique_ptr<HmsClientPool> client_pool,
               std::shared_ptr<FileIO> file_io);
 
   HiveCatalogProperties config_;
   std::string name_;
-  std::unique_ptr<HmsClient> client_;
+  std::unique_ptr<HmsClientPool> client_pool_;
   std::shared_ptr<FileIO> file_io_;
 };
 
