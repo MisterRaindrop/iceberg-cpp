@@ -20,6 +20,7 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "iceberg/catalog/hive/hive_catalog_properties.h"
@@ -67,14 +68,15 @@ class ICEBERG_HIVE_EXPORT HiveTableOperations {
   /// Default-constructed values match Java's HiveCatalog defaults
   /// (50ms / 5s / 3min / 4min heartbeat).
   /// \param heartbeat_config When `lock_enabled` is true and this
-  /// pointer is non-null, `Commit` starts an `HmsLockHeartbeat` on its
-  /// own dedicated connection using this config and stops it before
-  /// returning. When null, no heartbeat is sent and the lock is bounded
-  /// purely by HMS's `txn.timeout`.
-  HiveTableOperations(HmsClient* client, std::shared_ptr<FileIO> file_io,
-                      TableIdentifier identifier, bool lock_enabled = false,
-                      HmsLockOptions lock_options = {},
-                      const HiveCatalogProperties* heartbeat_config = nullptr);
+  /// optional is engaged, `Commit` starts an `HmsLockHeartbeat` on its
+  /// own dedicated connection (using the supplied config) and stops it
+  /// before returning. When empty, no heartbeat is sent and the lock is
+  /// bounded purely by HMS's `txn.timeout`. A copy is stored so the
+  /// heartbeat does not depend on the lifetime of any external object.
+  HiveTableOperations(
+      HmsClient* client, std::shared_ptr<FileIO> file_io, TableIdentifier identifier,
+      bool lock_enabled = false, HmsLockOptions lock_options = {},
+      std::optional<HiveCatalogProperties> heartbeat_config = std::nullopt);
 
   /// \brief Load the table's current metadata from HMS + FileIO.
   ///
@@ -107,7 +109,7 @@ class ICEBERG_HIVE_EXPORT HiveTableOperations {
   TableIdentifier identifier_;
   bool lock_enabled_;
   HmsLockOptions lock_options_;
-  const HiveCatalogProperties* heartbeat_config_;
+  std::optional<HiveCatalogProperties> heartbeat_config_;
 };
 
 }  // namespace iceberg::hive

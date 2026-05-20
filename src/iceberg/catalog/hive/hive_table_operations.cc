@@ -35,17 +35,16 @@
 
 namespace iceberg::hive {
 
-HiveTableOperations::HiveTableOperations(HmsClient* client,
-                                         std::shared_ptr<FileIO> file_io,
-                                         TableIdentifier identifier, bool lock_enabled,
-                                         HmsLockOptions lock_options,
-                                         const HiveCatalogProperties* heartbeat_config)
+HiveTableOperations::HiveTableOperations(
+    HmsClient* client, std::shared_ptr<FileIO> file_io, TableIdentifier identifier,
+    bool lock_enabled, HmsLockOptions lock_options,
+    std::optional<HiveCatalogProperties> heartbeat_config)
     : client_(client),
       file_io_(std::move(file_io)),
       identifier_(std::move(identifier)),
       lock_enabled_(lock_enabled),
       lock_options_(lock_options),
-      heartbeat_config_(heartbeat_config) {}
+      heartbeat_config_(std::move(heartbeat_config)) {}
 
 Result<HiveTableMetadataSnapshot> HiveTableOperations::Refresh() {
   ICEBERG_RETURN_UNEXPECTED(ValidateNamespace(identifier_.ns));
@@ -122,7 +121,7 @@ Result<std::string> HiveTableOperations::Commit(const HiveTableMetadataSnapshot&
     // Keep the lock alive against HMS's server-side txn.timeout. Failure
     // to start the heartbeat is non-fatal -- the CAS alone protects
     // correctness on short commits -- so we ignore the error and proceed.
-    if (heartbeat_config_ != nullptr && lock_options_.heartbeat_interval_ms > 0) {
+    if (heartbeat_config_.has_value() && lock_options_.heartbeat_interval_ms > 0) {
       auto hb = HmsLockHeartbeat::Start(*heartbeat_config_, lock_handle.lock_id,
                                         lock_options_.heartbeat_interval_ms);
       if (hb.has_value()) {

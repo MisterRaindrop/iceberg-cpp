@@ -568,6 +568,11 @@ namespace {
 struct CheckLockOutcome {
   LockState::type state;
   std::string error_message;
+  // Set when the polling loop bailed because the underlying Thrift
+  // transport failed. LockExclusive uses this to surface a
+  // `TransportError` (kServiceUnavailable) so HmsClientPool can drop the
+  // broken connection and reconnect, matching the non-polling RPC paths.
+  bool transport_failed = false;
 };
 
 CheckLockOutcome PollCheckLock(Apache::Hadoop::Hive::ThriftHiveMetastoreClient* client,
@@ -608,6 +613,11 @@ CheckLockOutcome PollCheckLock(Apache::Hadoop::Hive::ThriftHiveMetastoreClient* 
       return {
           .state = LockState::ABORT,
           .error_message = std::format("HMS check_lock MetaException: {}", e.message)};
+    } catch (const apache::thrift::transport::TTransportException& e) {
+      return {
+          .state = LockState::ABORT,
+          .error_message = std::format("HMS check_lock transport error: {}", e.what()),
+          .transport_failed = true};
     } catch (const apache::thrift::TException& e) {
       return {.state = LockState::ABORT,
               .error_message = std::format("HMS check_lock thrift error: {}", e.what())};
@@ -667,6 +677,13 @@ Result<HmsClient::HmsLockHandle> HmsClient::LockExclusive(std::string_view db_na
     auto outcome = PollCheckLock(impl_->client.get(), response.lockid, options);
     if (outcome.state == LockState::ACQUIRED) {
       return HmsLockHandle{.lock_id = response.lockid};
+    }
+    if (outcome.transport_failed) {
+      // Transport is dead -- Unlock on the same client would also fail
+      // and merely leak the queued lock at the HMS side. Surface
+      // kServiceUnavailable so HmsClientPool reconnects and the caller's
+      // next attempt can clean up via a fresh client.
+      return TransportError("check_lock", outcome.error_message);
     }
     // Release the queued handle before surfacing failure so we don't leak
     // a slot in HMS's wait list for the full server-side lease.
@@ -776,9 +793,15 @@ Result<std::unique_ptr<HmsLockHeartbeat>> HmsLockHeartbeat::Start(
   impl->client = std::move(client);
   impl->lock_id = lock_id;
   impl->interval_ms = interval_ms;
-  auto* impl_ptr = impl.get();
+  // Transfer ownership of `impl` into the heartbeater BEFORE starting
+  // the worker thread, so the lambda only captures the pointer that
+  // already lives inside the returned object. This makes the lifetime
+  // contract -- `HmsLockHeartbeat::~HmsLockHeartbeat` joins the thread
+  // -- structurally obvious instead of relying on RVO ordering.
+  std::unique_ptr<HmsLockHeartbeat> heartbeat(new HmsLockHeartbeat(std::move(impl)));
+  Impl* impl_ptr = heartbeat->impl_.get();
   impl_ptr->worker = std::thread([impl_ptr] { impl_ptr->Run(); });
-  return std::unique_ptr<HmsLockHeartbeat>(new HmsLockHeartbeat(std::move(impl)));
+  return heartbeat;
 }
 
 void HmsLockHeartbeat::Stop() {

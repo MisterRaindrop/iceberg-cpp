@@ -96,6 +96,14 @@ class ICEBERG_HIVE_EXPORT HmsClientPool {
       }
       client = std::move(*fresh);
       result = fn(client.get());
+      // Java `ClientPoolImpl.run` only retries once: if the fresh client
+      // also reports a transport failure, do NOT re-enqueue it -- that
+      // would let the next caller pick up a dead transport and start the
+      // reconnect loop all over again. Checkin(nullptr) frees the slot.
+      if (!result.has_value() && result.error().kind == ErrorKind::kServiceUnavailable) {
+        Checkin(nullptr);
+        return result;
+      }
     }
     Checkin(std::move(client));
     return result;

@@ -280,8 +280,9 @@ Result<std::shared_ptr<Table>> HiveCatalog::UpdateTable(
           config_.Get(HiveCatalogProperties::kLockHeartbeatIntervalMs),
   };
   return client_pool_->Run([&](HmsClient* client) -> Result<std::shared_ptr<Table>> {
-    HiveTableOperations ops(client, file_io_, identifier, lock_enabled, lock_options,
-                            lock_enabled ? &config_ : nullptr);
+    HiveTableOperations ops(
+        client, file_io_, identifier, lock_enabled, lock_options,
+        lock_enabled ? std::optional<HiveCatalogProperties>{config_} : std::nullopt);
     ICEBERG_ASSIGN_OR_RAISE(auto base, ops.Refresh());
 
     // Validate requirements against the current metadata before mutating.
