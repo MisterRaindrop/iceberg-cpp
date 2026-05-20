@@ -146,14 +146,24 @@ using Apache::Hadoop::Hive::GetTableRequest;
 using Apache::Hadoop::Hive::GetTableResult;
 using Apache::Hadoop::Hive::InvalidObjectException;
 using Apache::Hadoop::Hive::InvalidOperationException;
+using Apache::Hadoop::Hive::LockComponent;
+using Apache::Hadoop::Hive::LockLevel;
+using Apache::Hadoop::Hive::LockRequest;
+using Apache::Hadoop::Hive::LockResponse;
+using Apache::Hadoop::Hive::LockState;
+using Apache::Hadoop::Hive::LockType;
 using Apache::Hadoop::Hive::MetaException;
+using Apache::Hadoop::Hive::NoSuchLockException;
 using Apache::Hadoop::Hive::NoSuchObjectException;
 using Apache::Hadoop::Hive::PrincipalType;
 using Apache::Hadoop::Hive::SerDeInfo;
 using Apache::Hadoop::Hive::StorageDescriptor;
 using Apache::Hadoop::Hive::Table;
+using Apache::Hadoop::Hive::TxnAbortedException;
+using Apache::Hadoop::Hive::TxnOpenException;
 using Apache::Hadoop::Hive::UnknownDBException;
 using Apache::Hadoop::Hive::UnknownTableException;
+using Apache::Hadoop::Hive::UnlockRequest;
 
 Database ToThriftDatabase(const HiveDatabase& database) {
   Database thrift_db;
@@ -506,6 +516,69 @@ Status HmsClient::AlterTable(std::string_view db_name, std::string_view table_na
     return MetaError("alter_table", e.message);
   } catch (const apache::thrift::TException& e) {
     return GenericThriftError("alter_table", e.what());
+  }
+}
+
+// ---------------------------------------------------------------------------
+// HMS locks. Used only when the catalog is configured with
+// `hive.lock-enabled=true`. Failure to acquire the lock surfaces as
+// kCommitFailed so iceberg::Transaction's retry loop can roll forward.
+
+Result<HmsClient::HmsLockHandle> HmsClient::LockExclusive(std::string_view db_name,
+                                                          std::string_view table_name) {
+  LockComponent component;
+  component.__set_type(LockType::EXCLUSIVE);
+  component.__set_level(LockLevel::TABLE);
+  component.__set_dbname(std::string(db_name));
+  component.__set_tablename(std::string(table_name));
+  component.__set_isTransactional(false);
+  component.__set_isDynamicPartitionWrite(false);
+
+  LockRequest request;
+  request.__set_component({component});
+  // No transaction context; iceberg_hive uses HMS locks purely as an
+  // advisory mutex around metadata_location CAS.
+  request.__set_txnid(0);
+
+  LockResponse response;
+  try {
+    impl_->client->lock(response, request);
+  } catch (const TxnAbortedException& e) {
+    return CommitFailed("HMS aborted lock txn on {}.{}: {}", db_name, table_name,
+                        e.message);
+  } catch (const MetaException& e) {
+    return MetaError("lock", e.message);
+  } catch (const apache::thrift::TException& e) {
+    return GenericThriftError("lock", e.what());
+  }
+
+  if (response.state != LockState::ACQUIRED) {
+    return CommitFailed(
+        "HMS denied EXCLUSIVE lock on {}.{} (state={}, error={}); retry the "
+        "transaction.",
+        db_name, table_name, static_cast<int>(response.state), response.errorMessage);
+  }
+  return HmsLockHandle{.lock_id = response.lockid};
+}
+
+Status HmsClient::Unlock(HmsLockHandle handle) {
+  if (!handle.acquired()) {
+    return {};
+  }
+  UnlockRequest request;
+  request.__set_lockid(handle.lock_id);
+  try {
+    impl_->client->unlock(request);
+    return {};
+  } catch (const NoSuchLockException& e) {
+    return NotFound("HMS reports lock {} no longer exists: {}", handle.lock_id,
+                    e.message);
+  } catch (const TxnOpenException& e) {
+    return InvalidOperationError("unlock", e.message);
+  } catch (const MetaException& e) {
+    return MetaError("unlock", e.message);
+  } catch (const apache::thrift::TException& e) {
+    return GenericThriftError("unlock", e.what());
   }
 }
 

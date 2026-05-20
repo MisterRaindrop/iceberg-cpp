@@ -49,8 +49,15 @@ struct ICEBERG_HIVE_EXPORT HiveTableMetadataSnapshot {
 /// `Commit()` with `metadata_location` CAS lands in C19.
 class ICEBERG_HIVE_EXPORT HiveTableOperations {
  public:
+  /// \param lock_enabled If true, `Commit` wraps the
+  /// `GetTable -> AlterTable` critical section with an HMS EXCLUSIVE
+  /// TABLE-level lock for extra safety on top of `metadata_location`
+  /// CAS. Defaults to false; the CAS alone is sufficient for
+  /// single-writer correctness but high-concurrency deployments may
+  /// want the extra guard. Controlled by
+  /// `HiveCatalogProperties::kLockEnabled`.
   HiveTableOperations(HmsClient* client, std::shared_ptr<FileIO> file_io,
-                      TableIdentifier identifier);
+                      TableIdentifier identifier, bool lock_enabled = false);
 
   /// \brief Load the table's current metadata from HMS + FileIO.
   ///
@@ -81,6 +88,7 @@ class ICEBERG_HIVE_EXPORT HiveTableOperations {
   HmsClient* client_;
   std::shared_ptr<FileIO> file_io_;
   TableIdentifier identifier_;
+  bool lock_enabled_;
 };
 
 }  // namespace iceberg::hive

@@ -36,8 +36,11 @@ namespace iceberg::hive {
 
 HiveTableOperations::HiveTableOperations(HmsClient* client,
                                          std::shared_ptr<FileIO> file_io,
-                                         TableIdentifier identifier)
-    : client_(client), file_io_(std::move(file_io)), identifier_(std::move(identifier)) {}
+                                         TableIdentifier identifier, bool lock_enabled)
+    : client_(client),
+      file_io_(std::move(file_io)),
+      identifier_(std::move(identifier)),
+      lock_enabled_(lock_enabled) {}
 
 Result<HiveTableMetadataSnapshot> HiveTableOperations::Refresh() {
   ICEBERG_RETURN_UNEXPECTED(ValidateNamespace(identifier_.ns));
@@ -93,11 +96,32 @@ Result<std::string> HiveTableOperations::Commit(const HiveTableMetadataSnapshot&
   ICEBERG_RETURN_UNEXPECTED(file_io_->WriteFile(new_metadata_location, json_str));
 
   // 2-4. CAS via alter_table. Best-effort cleanup on every failure path
-  // so the warehouse never accumulates orphan metadata files.
+  // so the warehouse never accumulates orphan metadata files. When
+  // `lock_enabled_` is true, wrap the GetTable -> AlterTable section in
+  // an HMS EXCLUSIVE table-level lock; the CAS alone is sufficient for
+  // single-writer correctness, but high-concurrency deployments may
+  // prefer the explicit mutex.
   const auto cleanup = [&] { (void)file_io_->DeleteFile(new_metadata_location); };
+
+  HmsClient::HmsLockHandle lock_handle;
+  if (lock_enabled_) {
+    auto lock_or_error =
+        client_->LockExclusive(identifier_.ns.levels[0], identifier_.name);
+    if (!lock_or_error.has_value()) {
+      cleanup();
+      return std::unexpected(lock_or_error.error());
+    }
+    lock_handle = *lock_or_error;
+  }
+  const auto release_lock = [&] {
+    if (lock_handle.acquired()) {
+      (void)client_->Unlock(lock_handle);
+    }
+  };
 
   auto current_or_error = client_->GetTable(identifier_.ns.levels[0], identifier_.name);
   if (!current_or_error.has_value()) {
+    release_lock();
     cleanup();
     return std::unexpected(current_or_error.error());
   }
@@ -105,10 +129,12 @@ Result<std::string> HiveTableOperations::Commit(const HiveTableMetadataSnapshot&
 
   auto current_location_or_error = GetMetadataLocation(current.parameters);
   if (!current_location_or_error.has_value()) {
+    release_lock();
     cleanup();
     return std::unexpected(current_location_or_error.error());
   }
   if (*current_location_or_error != base.metadata_location) {
+    release_lock();
     cleanup();
     return CommitFailed(
         "HMS metadata_location for {} changed from '{}' to '{}'; retry the "
@@ -121,9 +147,11 @@ Result<std::string> HiveTableOperations::Commit(const HiveTableMetadataSnapshot&
   auto alter_status =
       client_->AlterTable(identifier_.ns.levels[0], identifier_.name, current);
   if (!alter_status.has_value()) {
+    release_lock();
     cleanup();
     return std::unexpected(alter_status.error());
   }
+  release_lock();
   return new_metadata_location;
 }
 

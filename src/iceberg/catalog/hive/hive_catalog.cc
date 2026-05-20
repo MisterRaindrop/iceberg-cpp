@@ -231,7 +231,9 @@ Result<std::shared_ptr<Table>> HiveCatalog::UpdateTable(
   ICEBERG_RETURN_UNEXPECTED(ValidateNamespace(identifier.ns));
   ICEBERG_RETURN_UNEXPECTED(identifier.Validate());
 
-  HiveTableOperations ops(client_.get(), file_io_, identifier);
+  HiveTableOperations ops(
+      client_.get(), file_io_, identifier,
+      /*lock_enabled=*/config_.Get(HiveCatalogProperties::kLockEnabled));
   ICEBERG_ASSIGN_OR_RAISE(auto base, ops.Refresh());
 
   // Validate requirements against the current metadata before mutating.

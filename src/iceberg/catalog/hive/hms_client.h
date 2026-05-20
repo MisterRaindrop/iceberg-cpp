@@ -151,6 +151,34 @@ class ICEBERG_HIVE_EXPORT HmsClient {
 
   /// @}
 
+  /// \name HMS locks (optional commit-path guard)
+  /// Wraps HMS `lock` / `unlock` so HiveTableOperations::Commit can
+  /// serialise the GetTable -> AlterTable critical section when the
+  /// catalog is configured with `hive.lock-enabled=true`.
+  /// @{
+
+  /// \brief Opaque handle returned by LockExclusive and consumed by
+  /// Unlock. Default-constructed handles carry a sentinel lock_id and
+  /// are treated as no-ops by Unlock.
+  struct ICEBERG_HIVE_EXPORT HmsLockHandle {
+    int64_t lock_id = -1;
+    bool acquired() const { return lock_id >= 0; }
+  };
+
+  /// \brief Acquire an EXCLUSIVE TABLE-level lock on
+  /// (`db_name`, `table_name`). Returns the LockResponse's lock id when
+  /// HMS reports `ACQUIRED`; any other state (`WAITING` / `NOT_ACQUIRED`
+  /// / `ABORT`) is surfaced as `kCommitFailed` so the caller's
+  /// transaction loop can retry.
+  Result<HmsLockHandle> LockExclusive(std::string_view db_name,
+                                      std::string_view table_name);
+
+  /// \brief Release a previously acquired lock. Idempotent for the
+  /// sentinel handle returned by HmsLockHandle{}.
+  Status Unlock(HmsLockHandle handle);
+
+  /// @}
+
  private:
   class Impl;
   std::unique_ptr<Impl> impl_;
