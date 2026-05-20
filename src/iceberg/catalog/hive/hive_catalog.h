@@ -26,6 +26,7 @@
 #include "iceberg/catalog.h"
 #include "iceberg/catalog/hive/hive_catalog_properties.h"
 #include "iceberg/catalog/hive/iceberg_hive_export.h"
+#include "iceberg/file_io.h"
 #include "iceberg/result.h"
 
 namespace iceberg::hive {
@@ -116,11 +117,13 @@ class ICEBERG_HIVE_EXPORT HiveCatalog : public Catalog,
       const std::string& metadata_file_location) override;
 
  private:
-  HiveCatalog(HiveCatalogProperties config, std::unique_ptr<HmsClient> client);
+  HiveCatalog(HiveCatalogProperties config, std::unique_ptr<HmsClient> client,
+              std::shared_ptr<FileIO> file_io);
 
   HiveCatalogProperties config_;
   std::string name_;
   std::unique_ptr<HmsClient> client_;
+  std::shared_ptr<FileIO> file_io_;
 };
 
 }  // namespace iceberg::hive

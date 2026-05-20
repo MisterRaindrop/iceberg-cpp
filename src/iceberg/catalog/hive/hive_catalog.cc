@@ -20,12 +20,19 @@
 #include "iceberg/catalog/hive/hive_catalog.h"
 
 #include <memory>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
+#include <nlohmann/json.hpp>
+
 #include "iceberg/catalog/hive/hive_utils.h"
 #include "iceberg/catalog/hive/hms_client.h"
+#include "iceberg/file_io_registry.h"
+#include "iceberg/json_serde_internal.h"
+#include "iceberg/table.h"
 #include "iceberg/util/macros.h"
 
 namespace iceberg::hive {
@@ -36,19 +43,59 @@ constexpr std::string_view kNotImplementedMessage =
     "HiveCatalog method is not yet implemented; "
     "see the iceberg-cpp HiveCatalog roadmap (Phase 1 / Phase 2 commits).";
 
+// Pick the FileIO implementation name for a given `config`. If the user
+// supplied `io-impl` explicitly, honour it; otherwise infer from the
+// warehouse URI's scheme (file:// or no scheme -> arrow-fs-local,
+// s3:// -> arrow-fs-s3). HDFS / GCS / Azure schemes are not auto-
+// detectable today.
+Result<std::string> ResolveIoImpl(const HiveCatalogProperties& config) {
+  std::string io_impl = config.Get(HiveCatalogProperties::kIOImpl);
+  if (!io_impl.empty()) {
+    return io_impl;
+  }
+  const std::string warehouse = config.Get(HiveCatalogProperties::kWarehouse);
+  if (warehouse.empty()) {
+    return std::string(FileIORegistry::kArrowLocalFileIO);
+  }
+  const auto pos = warehouse.find("://");
+  if (pos == std::string::npos) {
+    return std::string(FileIORegistry::kArrowLocalFileIO);
+  }
+  const auto scheme = std::string_view(warehouse).substr(0, pos);
+  if (scheme == "file") {
+    return std::string(FileIORegistry::kArrowLocalFileIO);
+  }
+  if (scheme == "s3") {
+    return std::string(FileIORegistry::kArrowS3FileIO);
+  }
+  return NotSupported(
+      "Cannot auto-detect FileIO for warehouse '{}'; set the '{}' property "
+      "explicitly.",
+      warehouse, HiveCatalogProperties::kIOImpl.key());
+}
+
+Result<std::unique_ptr<FileIO>> MakeHiveFileIO(const HiveCatalogProperties& config) {
+  ICEBERG_ASSIGN_OR_RAISE(auto io_impl, ResolveIoImpl(config));
+  return FileIORegistry::Load(io_impl, config.configs());
+}
+
 }  // namespace
 
-HiveCatalog::HiveCatalog(HiveCatalogProperties config, std::unique_ptr<HmsClient> client)
+HiveCatalog::HiveCatalog(HiveCatalogProperties config, std::unique_ptr<HmsClient> client,
+                         std::shared_ptr<FileIO> file_io)
     : config_(std::move(config)),
       name_(config_.Get(HiveCatalogProperties::kName)),
-      client_(std::move(client)) {}
+      client_(std::move(client)),
+      file_io_(std::move(file_io)) {}
 
 HiveCatalog::~HiveCatalog() = default;
 
 Result<std::shared_ptr<HiveCatalog>> HiveCatalog::Make(
     const HiveCatalogProperties& config) {
   ICEBERG_ASSIGN_OR_RAISE(auto client, HmsClient::Connect(config));
-  return std::shared_ptr<HiveCatalog>(new HiveCatalog(config, std::move(client)));
+  ICEBERG_ASSIGN_OR_RAISE(auto file_io, MakeHiveFileIO(config));
+  return std::shared_ptr<HiveCatalog>(
+      new HiveCatalog(config, std::move(client), std::move(file_io)));
 }
 
 std::string_view HiveCatalog::name() const { return name_; }
@@ -60,9 +107,6 @@ Status HiveCatalog::CreateNamespace(
 }
 
 Result<std::vector<Namespace>> HiveCatalog::ListNamespaces(const Namespace& ns) const {
-  // HMS has a flat namespace model. iceberg-rust returns an empty list
-  // whenever a parent is supplied; do the same here so the catalog
-  // behaves consistently across implementations.
   if (!ns.levels.empty()) {
     return std::vector<Namespace>{};
   }
@@ -84,9 +128,6 @@ Result<std::unordered_map<std::string, std::string>> HiveCatalog::GetNamespacePr
 
 Status HiveCatalog::DropNamespace(const Namespace& ns) {
   ICEBERG_RETURN_UNEXPECTED(ValidateNamespace(ns));
-  // iceberg-rust mirrors Java's behaviour by dropping with cascade=false;
-  // HMS surfaces "namespace not empty" as InvalidOperationException,
-  // which hive_errors maps to ErrorKind::kNotAllowed.
   return client_->DropDatabase(ns.levels[0], /*cascade=*/false);
 }
 
@@ -108,9 +149,6 @@ Status HiveCatalog::UpdateNamespaceProperties(
   ICEBERG_RETURN_UNEXPECTED(ValidateNamespace(ns));
   ICEBERG_ASSIGN_OR_RAISE(auto database, client_->GetDatabase(ns.levels[0]));
 
-  // Reconstruct the property map, apply removals first then updates, and
-  // hand the result back to ConvertToHiveDatabase so reserved keys are
-  // re-applied to the dedicated HiveDatabase fields.
   auto namespace_view = ConvertFromHiveDatabase(database);
   auto& properties = namespace_view.properties;
   for (const auto& key : removals) {
@@ -123,9 +161,15 @@ Status HiveCatalog::UpdateNamespaceProperties(
   return client_->AlterDatabase(ns.levels[0], altered);
 }
 
-Result<std::vector<TableIdentifier>> HiveCatalog::ListTables(
-    const Namespace& /*ns*/) const {
-  return NotImplemented("{}", kNotImplementedMessage);
+Result<std::vector<TableIdentifier>> HiveCatalog::ListTables(const Namespace& ns) const {
+  ICEBERG_RETURN_UNEXPECTED(ValidateNamespace(ns));
+  ICEBERG_ASSIGN_OR_RAISE(auto names, client_->GetAllTables(ns.levels[0]));
+  std::vector<TableIdentifier> identifiers;
+  identifiers.reserve(names.size());
+  for (auto& table_name : names) {
+    identifiers.push_back(TableIdentifier{.ns = ns, .name = std::move(table_name)});
+  }
+  return identifiers;
 }
 
 Result<std::shared_ptr<Table>> HiveCatalog::CreateTable(
@@ -133,7 +177,13 @@ Result<std::shared_ptr<Table>> HiveCatalog::CreateTable(
     const std::shared_ptr<PartitionSpec>& /*spec*/,
     const std::shared_ptr<SortOrder>& /*order*/, const std::string& /*location*/,
     const std::unordered_map<std::string, std::string>& /*properties*/) {
-  return NotImplemented("{}", kNotImplementedMessage);
+  // CreateTable requires serialising a fresh TableMetadata to JSON, which
+  // depends on the TableMetadataToJson helper added in C17. Until then,
+  // callers should construct the metadata file out of band and use
+  // RegisterTable.
+  return NotImplemented(
+      "HiveCatalog::CreateTable depends on TableMetadataToJson (see C17); "
+      "use RegisterTable with a pre-written metadata.json in the meantime.");
 }
 
 Result<std::shared_ptr<Table>> HiveCatalog::UpdateTable(
@@ -151,28 +201,110 @@ Result<std::shared_ptr<Transaction>> HiveCatalog::StageCreateTable(
   return NotImplemented("{}", kNotImplementedMessage);
 }
 
-Result<bool> HiveCatalog::TableExists(const TableIdentifier& /*identifier*/) const {
-  return NotImplemented("{}", kNotImplementedMessage);
+Result<bool> HiveCatalog::TableExists(const TableIdentifier& identifier) const {
+  ICEBERG_RETURN_UNEXPECTED(ValidateNamespace(identifier.ns));
+  ICEBERG_RETURN_UNEXPECTED(identifier.Validate());
+  auto table = client_->GetTable(identifier.ns.levels[0], identifier.name);
+  if (table.has_value()) {
+    return true;
+  }
+  if (table.error().kind == ErrorKind::kNoSuchTable) {
+    return false;
+  }
+  return std::unexpected(table.error());
 }
 
-Status HiveCatalog::DropTable(const TableIdentifier& /*identifier*/, bool /*purge*/) {
-  return NotImplemented("{}", kNotImplementedMessage);
+Status HiveCatalog::DropTable(const TableIdentifier& identifier, bool purge) {
+  ICEBERG_RETURN_UNEXPECTED(ValidateNamespace(identifier.ns));
+  ICEBERG_RETURN_UNEXPECTED(identifier.Validate());
+  // The full data-file purge requires walking the manifest tree; iceberg
+  // currently only deletes the HMS row + leaves data lifecycle to the
+  // expire-snapshots action (see C17/C19). Surface a clear error rather
+  // than silently dropping the table while leaving data behind.
+  if (purge) {
+    return NotImplemented(
+        "HiveCatalog::DropTable(purge=true) is not yet supported; call "
+        "DropTable(purge=false) and use ExpireSnapshots to clean data.");
+  }
+  return client_->DropTable(identifier.ns.levels[0], identifier.name,
+                            /*delete_data=*/false);
 }
 
-Status HiveCatalog::RenameTable(const TableIdentifier& /*from*/,
-                                const TableIdentifier& /*to*/) {
-  return NotImplemented("{}", kNotImplementedMessage);
+Status HiveCatalog::RenameTable(const TableIdentifier& from, const TableIdentifier& to) {
+  ICEBERG_RETURN_UNEXPECTED(ValidateNamespace(from.ns));
+  ICEBERG_RETURN_UNEXPECTED(ValidateNamespace(to.ns));
+  ICEBERG_RETURN_UNEXPECTED(from.Validate());
+  ICEBERG_RETURN_UNEXPECTED(to.Validate());
+
+  ICEBERG_ASSIGN_OR_RAISE(auto table, client_->GetTable(from.ns.levels[0], from.name));
+  table.db_name = to.ns.levels[0];
+  table.table_name = to.name;
+  return client_->AlterTable(from.ns.levels[0], from.name, table);
 }
 
-Result<std::shared_ptr<Table>> HiveCatalog::LoadTable(
-    const TableIdentifier& /*identifier*/) {
-  return NotImplemented("{}", kNotImplementedMessage);
+Result<std::shared_ptr<Table>> HiveCatalog::LoadTable(const TableIdentifier& identifier) {
+  ICEBERG_RETURN_UNEXPECTED(ValidateNamespace(identifier.ns));
+  ICEBERG_RETURN_UNEXPECTED(identifier.Validate());
+
+  ICEBERG_ASSIGN_OR_RAISE(auto hive_table,
+                          client_->GetTable(identifier.ns.levels[0], identifier.name));
+  ICEBERG_ASSIGN_OR_RAISE(auto metadata_location,
+                          GetMetadataLocation(hive_table.parameters));
+
+  ICEBERG_ASSIGN_OR_RAISE(auto metadata_json,
+                          file_io_->ReadFile(metadata_location, /*length=*/std::nullopt));
+
+  nlohmann::json metadata_obj;
+  try {
+    metadata_obj = nlohmann::json::parse(metadata_json);
+  } catch (const nlohmann::json::parse_error& e) {
+    return JsonParseError("Failed to parse metadata at '{}': {}", metadata_location,
+                          e.what());
+  }
+  ICEBERG_ASSIGN_OR_RAISE(auto metadata, TableMetadataFromJson(metadata_obj));
+
+  return Table::Make(identifier, std::shared_ptr<TableMetadata>(metadata.release()),
+                     std::move(metadata_location), file_io_, shared_from_this());
 }
 
 Result<std::shared_ptr<Table>> HiveCatalog::RegisterTable(
-    const TableIdentifier& /*identifier*/,
-    const std::string& /*metadata_file_location*/) {
-  return NotImplemented("{}", kNotImplementedMessage);
+    const TableIdentifier& identifier, const std::string& metadata_file_location) {
+  ICEBERG_RETURN_UNEXPECTED(ValidateNamespace(identifier.ns));
+  ICEBERG_RETURN_UNEXPECTED(identifier.Validate());
+
+  // RegisterTable assumes a pre-existing metadata.json. Read the columns
+  // from it so the HMS Table record exposes a faithful column list to
+  // Hive/Spark/Trino clients.
+  ICEBERG_ASSIGN_OR_RAISE(
+      auto metadata_json,
+      file_io_->ReadFile(metadata_file_location, /*length=*/std::nullopt));
+  nlohmann::json metadata_obj;
+  try {
+    metadata_obj = nlohmann::json::parse(metadata_json);
+  } catch (const nlohmann::json::parse_error& e) {
+    return JsonParseError("Failed to parse metadata at '{}': {}", metadata_file_location,
+                          e.what());
+  }
+  ICEBERG_ASSIGN_OR_RAISE(auto metadata, TableMetadataFromJson(metadata_obj));
+
+  std::vector<HiveColumn> columns;
+  auto schema = metadata->Schema();
+  if (schema.has_value() && *schema != nullptr) {
+    ICEBERG_ASSIGN_OR_RAISE(columns, SchemaToHiveColumns(**schema));
+  }
+  const std::string location =
+      metadata->location.empty()
+          ? GetDefaultTableLocation(config_.Get(HiveCatalogProperties::kWarehouse),
+                                    identifier.ns, identifier.name)
+          : metadata->location;
+  ICEBERG_ASSIGN_OR_RAISE(
+      auto hive_table,
+      ConvertToHiveTable(identifier, columns, metadata_file_location, location,
+                         /*table_properties=*/{}));
+  ICEBERG_RETURN_UNEXPECTED(client_->CreateTable(hive_table));
+
+  return Table::Make(identifier, std::shared_ptr<TableMetadata>(metadata.release()),
+                     metadata_file_location, file_io_, shared_from_this());
 }
 
 }  // namespace iceberg::hive
