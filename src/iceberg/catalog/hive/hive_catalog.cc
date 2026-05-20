@@ -288,6 +288,12 @@ Status HiveCatalog::DropTable(const TableIdentifier& identifier, bool purge) {
         "HiveCatalog::DropTable(purge=true) is not yet supported; call "
         "DropTable(purge=false) and use ExpireSnapshots to clean data.");
   }
+  // Refuse to drop a row that does not carry the Iceberg marker; the user's
+  // identifier may collide with a native Hive table that the catalog should
+  // not be allowed to delete.
+  ICEBERG_ASSIGN_OR_RAISE(auto table,
+                          client_->GetTable(identifier.ns.levels[0], identifier.name));
+  ICEBERG_RETURN_UNEXPECTED(ValidateIcebergTable(identifier, table.parameters));
   return client_->DropTable(identifier.ns.levels[0], identifier.name,
                             /*delete_data=*/false);
 }
