@@ -69,8 +69,15 @@ ICEBERG_HIVE_EXPORT Result<std::vector<HmsEndpoint>> ParseHmsUris(std::string_vi
 /// configuration errors surface as `iceberg::Error` rather than C++
 /// exceptions.
 ///
-/// Thrift-call wrappers (namespace / table CRUD) are added in
-/// follow-up commits (C10 / C11).
+/// Thrift-call wrappers cover the full namespace (database) and table
+/// CRUD surface plus EXCLUSIVE table-level locks. Each wrapper catches
+/// the Thrift exceptions Hive can throw (`NoSuchObjectException`,
+/// `MetaException`, etc.) and converts them to `iceberg::Error` via
+/// `hive_errors.h` so the public interface stays Thrift-free.
+///
+/// `HmsClient` is **not thread-safe** -- Apache Thrift's generated C++
+/// client serialises requests / responses on a single transport buffer.
+/// Callers must serialise access (e.g., one `HiveCatalog` per thread).
 class ICEBERG_HIVE_EXPORT HmsClient {
  public:
   ~HmsClient();
