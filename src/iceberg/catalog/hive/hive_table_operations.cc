@@ -37,11 +37,13 @@ namespace iceberg::hive {
 
 HiveTableOperations::HiveTableOperations(HmsClient* client,
                                          std::shared_ptr<FileIO> file_io,
-                                         TableIdentifier identifier, bool lock_enabled)
+                                         TableIdentifier identifier, bool lock_enabled,
+                                         HmsLockOptions lock_options)
     : client_(client),
       file_io_(std::move(file_io)),
       identifier_(std::move(identifier)),
-      lock_enabled_(lock_enabled) {}
+      lock_enabled_(lock_enabled),
+      lock_options_(lock_options) {}
 
 Result<HiveTableMetadataSnapshot> HiveTableOperations::Refresh() {
   ICEBERG_RETURN_UNEXPECTED(ValidateNamespace(identifier_.ns));
@@ -108,7 +110,7 @@ Result<std::string> HiveTableOperations::Commit(const HiveTableMetadataSnapshot&
   HmsClient::HmsLockHandle lock_handle;
   if (lock_enabled_) {
     auto lock_or_error =
-        client_->LockExclusive(identifier_.ns.levels[0], identifier_.name);
+        client_->LockExclusive(identifier_.ns.levels[0], identifier_.name, lock_options_);
     if (!lock_or_error.has_value()) {
       cleanup();
       return std::unexpected(lock_or_error.error());

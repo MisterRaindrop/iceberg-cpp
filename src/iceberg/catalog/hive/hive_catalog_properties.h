@@ -86,6 +86,21 @@ class ICEBERG_HIVE_EXPORT HiveCatalogProperties
   /// Phase 2 (`HiveTableOperations::Commit`).
   inline static Entry<bool> kLockEnabled{"hive.lock-enabled", false};
 
+  /// \brief Initial / minimum wait between `check_lock` polls when HMS
+  /// returns `WAITING`. Doubled (capped at `kLockCheckMaxWaitMs`) after
+  /// every poll until acquired or the acquire timeout fires. Defaults to
+  /// 50ms, matching Java `HIVE_LOCK_CHECK_MIN_WAIT_MS`.
+  inline static Entry<int> kLockCheckMinWaitMs{"hive.lock-check-min-wait-ms", 50};
+
+  /// \brief Maximum wait between `check_lock` polls. Defaults to 5000ms,
+  /// matching Java `HIVE_LOCK_CHECK_MAX_WAIT_MS`.
+  inline static Entry<int> kLockCheckMaxWaitMs{"hive.lock-check-max-wait-ms", 5000};
+
+  /// \brief Total time the polling loop waits for ACQUIRED before giving
+  /// up with `kCommitFailed`. Defaults to 180000ms (3 minutes), matching
+  /// Java `HIVE_ACQUIRE_LOCK_TIMEOUT_MS`.
+  inline static Entry<int> kLockAcquireTimeoutMs{"hive.lock-acquire-timeout-ms", 180000};
+
   /// \brief Size of the `HmsClient` pool the catalog keeps around. Each
   /// catalog method checks a client out of the pool for the duration of
   /// its RPC sequence and returns it when done, matching Java

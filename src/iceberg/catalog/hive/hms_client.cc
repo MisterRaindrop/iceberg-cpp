@@ -19,12 +19,16 @@
 
 #include "iceberg/catalog/hive/hms_client.h"
 
+#include <algorithm>
 #include <cctype>
 #include <charconv>
+#include <chrono>
+#include <format>
 #include <memory>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -524,8 +528,69 @@ Status HmsClient::AlterTable(std::string_view db_name, std::string_view table_na
 // `hive.lock-enabled=true`. Failure to acquire the lock surfaces as
 // kCommitFailed so iceberg::Transaction's retry loop can roll forward.
 
+namespace {
+// Poll `check_lock(lockid)` until ACQUIRED, a final-failure state, or the
+// caller's acquire timeout. Returns the final LockState (which the caller
+// then maps to either an HmsLockHandle or a CommitFailed error).
+struct CheckLockOutcome {
+  LockState::type state;
+  std::string error_message;
+};
+
+CheckLockOutcome PollCheckLock(Apache::Hadoop::Hive::ThriftHiveMetastoreClient* client,
+                               int64_t lockid, const HmsLockOptions& options) {
+  using clock = std::chrono::steady_clock;
+  const auto deadline =
+      clock::now() + std::chrono::milliseconds(options.acquire_timeout_ms);
+  auto wait_ms = std::max(1, options.check_min_wait_ms);
+  const auto max_wait_ms = std::max(wait_ms, options.check_max_wait_ms);
+
+  while (true) {
+    if (clock::now() >= deadline) {
+      return {.state = LockState::WAITING,
+              .error_message = "acquire timeout elapsed before HMS acquired the lock"};
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
+
+    LockResponse response;
+    Apache::Hadoop::Hive::CheckLockRequest request;
+    request.__set_lockid(lockid);
+    try {
+      client->check_lock(response, request);
+    } catch (const NoSuchLockException& e) {
+      return {.state = LockState::ABORT,
+              .error_message =
+                  std::format("HMS check_lock: lock {} vanished: {}", lockid, e.message)};
+    } catch (const TxnAbortedException& e) {
+      return {.state = LockState::ABORT,
+              .error_message = std::format("HMS check_lock: txn aborted: {}", e.message)};
+    } catch (const TxnOpenException& e) {
+      return {
+          .state = LockState::ABORT,
+          .error_message = std::format("HMS check_lock: txn open error: {}", e.message)};
+    } catch (const MetaException& e) {
+      return {
+          .state = LockState::ABORT,
+          .error_message = std::format("HMS check_lock MetaException: {}", e.message)};
+    } catch (const apache::thrift::TException& e) {
+      return {.state = LockState::ABORT,
+              .error_message = std::format("HMS check_lock thrift error: {}", e.what())};
+    }
+    if (response.state == LockState::ACQUIRED) {
+      return {.state = response.state, .error_message = ""};
+    }
+    if (response.state != LockState::WAITING) {
+      return {.state = response.state, .error_message = response.errorMessage};
+    }
+    // Exponential backoff with cap, matching Java's `Tasks.exponentialBackoff(1.5)`.
+    wait_ms = std::min(max_wait_ms, (wait_ms * 3 + 1) / 2);
+  }
+}
+}  // namespace
+
 Result<HmsClient::HmsLockHandle> HmsClient::LockExclusive(std::string_view db_name,
-                                                          std::string_view table_name) {
+                                                          std::string_view table_name,
+                                                          const HmsLockOptions& options) {
   LockComponent component;
   component.__set_type(LockType::EXCLUSIVE);
   component.__set_level(LockLevel::TABLE);
@@ -552,19 +617,34 @@ Result<HmsClient::HmsLockHandle> HmsClient::LockExclusive(std::string_view db_na
     return GenericThriftError("lock", e.what());
   }
 
-  if (response.state != LockState::ACQUIRED) {
-    // HMS still assigns a valid `lockid` for non-ACQUIRED responses
-    // (WAITING / NOT_ACQUIRED / ABORT) and the request stays queued on
-    // the server until it times out (typically 10 minutes). Release it
-    // explicitly so we don't block subsequent EXCLUSIVE requests on the
-    // same table for the entire HMS lease window.
+  if (response.state == LockState::ACQUIRED) {
+    return HmsLockHandle{.lock_id = response.lockid};
+  }
+  if (response.state == LockState::WAITING) {
+    // Poll until ACQUIRED, a final failure, or timeout. Java's Tasks
+    // helper does this same exponential-backoff loop; do not reuse the
+    // initial CommitFailed path so high-contention deployments actually
+    // get a chance to acquire the lock.
+    auto outcome = PollCheckLock(impl_->client.get(), response.lockid, options);
+    if (outcome.state == LockState::ACQUIRED) {
+      return HmsLockHandle{.lock_id = response.lockid};
+    }
+    // Release the queued handle before surfacing failure so we don't leak
+    // a slot in HMS's wait list for the full server-side lease.
     (void)Unlock(HmsLockHandle{.lock_id = response.lockid});
     return CommitFailed(
-        "HMS denied EXCLUSIVE lock on {}.{} (state={}, error={}); retry the "
-        "transaction.",
-        db_name, table_name, static_cast<int>(response.state), response.errorMessage);
+        "HMS denied EXCLUSIVE lock on {}.{} after polling (state={}, error={}); "
+        "retry the transaction.",
+        db_name, table_name, static_cast<int>(outcome.state), outcome.error_message);
   }
-  return HmsLockHandle{.lock_id = response.lockid};
+
+  // Initial NOT_ACQUIRED / ABORT -- HMS already has a final answer; no
+  // point polling. Free the queued handle and bail.
+  (void)Unlock(HmsLockHandle{.lock_id = response.lockid});
+  return CommitFailed(
+      "HMS denied EXCLUSIVE lock on {}.{} (state={}, error={}); retry the "
+      "transaction.",
+      db_name, table_name, static_cast<int>(response.state), response.errorMessage);
 }
 
 Status HmsClient::Unlock(HmsLockHandle handle) {

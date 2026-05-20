@@ -22,6 +22,7 @@
 #include <memory>
 #include <string>
 
+#include "iceberg/catalog/hive/hms_client.h"
 #include "iceberg/catalog/hive/iceberg_hive_export.h"
 #include "iceberg/file_io.h"
 #include "iceberg/result.h"
@@ -59,8 +60,13 @@ class ICEBERG_HIVE_EXPORT HiveTableOperations {
   /// single-writer correctness but high-concurrency deployments may
   /// want the extra guard. Controlled by
   /// `HiveCatalogProperties::kLockEnabled`.
+  /// \param lock_options Polling intervals + acquire timeout passed
+  /// through to `HmsClient::LockExclusive`. Ignored when `lock_enabled`
+  /// is false. Default-constructed values match Java's HiveCatalog
+  /// defaults (50ms / 5s / 3min).
   HiveTableOperations(HmsClient* client, std::shared_ptr<FileIO> file_io,
-                      TableIdentifier identifier, bool lock_enabled = false);
+                      TableIdentifier identifier, bool lock_enabled = false,
+                      HmsLockOptions lock_options = {});
 
   /// \brief Load the table's current metadata from HMS + FileIO.
   ///
@@ -92,6 +98,7 @@ class ICEBERG_HIVE_EXPORT HiveTableOperations {
   std::shared_ptr<FileIO> file_io_;
   TableIdentifier identifier_;
   bool lock_enabled_;
+  HmsLockOptions lock_options_;
 };
 
 }  // namespace iceberg::hive

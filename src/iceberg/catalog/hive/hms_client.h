@@ -60,6 +60,15 @@ struct ICEBERG_HIVE_EXPORT HmsEndpoint {
 /// produce a non-empty host and a port within (0, 65535].
 ICEBERG_HIVE_EXPORT Result<std::vector<HmsEndpoint>> ParseHmsUris(std::string_view uri);
 
+/// \brief Tunable timeouts for `HmsClient::LockExclusive`'s polling
+/// loop. Mirrors Java's `hive.lock-check-min-wait-ms` /
+/// `max-wait-ms` / `acquire-timeout-ms`.
+struct ICEBERG_HIVE_EXPORT HmsLockOptions {
+  int32_t check_min_wait_ms = 50;
+  int32_t check_max_wait_ms = 5000;
+  int32_t acquire_timeout_ms = 180000;
+};
+
 /// \brief A live connection to a Hive Metastore over Thrift.
 ///
 /// The class encapsulates the TSocket / TTransport / TProtocol /
@@ -173,12 +182,21 @@ class ICEBERG_HIVE_EXPORT HmsClient {
   };
 
   /// \brief Acquire an EXCLUSIVE TABLE-level lock on
-  /// (`db_name`, `table_name`). Returns the LockResponse's lock id when
-  /// HMS reports `ACQUIRED`; any other state (`WAITING` / `NOT_ACQUIRED`
-  /// / `ABORT`) is surfaced as `kCommitFailed` so the caller's
-  /// transaction loop can retry.
+  /// (`db_name`, `table_name`).
+  ///
+  /// On the initial `lock` call:
+  ///   * `ACQUIRED`     -> returns the lock id immediately.
+  ///   * `WAITING`      -> polls `check_lock` with exponential backoff
+  ///                       between `check_min_wait_ms` and
+  ///                       `check_max_wait_ms`, for at most
+  ///                       `acquire_timeout_ms`. Returns the lock id
+  ///                       once HMS reports `ACQUIRED`.
+  ///   * `NOT_ACQUIRED` / `ABORT` / timeout -> the queued handle is
+  ///                       released and `kCommitFailed` is returned so
+  ///                       the caller's transaction loop can retry.
   Result<HmsLockHandle> LockExclusive(std::string_view db_name,
-                                      std::string_view table_name);
+                                      std::string_view table_name,
+                                      const HmsLockOptions& options = {});
 
   /// \brief Release a previously acquired lock. Idempotent for the
   /// sentinel handle returned by HmsLockHandle{}.

@@ -272,8 +272,13 @@ Result<std::shared_ptr<Table>> HiveCatalog::UpdateTable(
   // lock / unlock RPCs all observe the same TCP connection. Without this
   // they could race against each other via separate sockets.
   const bool lock_enabled = config_.Get(HiveCatalogProperties::kLockEnabled);
+  const HmsLockOptions lock_options{
+      .check_min_wait_ms = config_.Get(HiveCatalogProperties::kLockCheckMinWaitMs),
+      .check_max_wait_ms = config_.Get(HiveCatalogProperties::kLockCheckMaxWaitMs),
+      .acquire_timeout_ms = config_.Get(HiveCatalogProperties::kLockAcquireTimeoutMs),
+  };
   return client_pool_->Run([&](HmsClient* client) -> Result<std::shared_ptr<Table>> {
-    HiveTableOperations ops(client, file_io_, identifier, lock_enabled);
+    HiveTableOperations ops(client, file_io_, identifier, lock_enabled, lock_options);
     ICEBERG_ASSIGN_OR_RAISE(auto base, ops.Refresh());
 
     // Validate requirements against the current metadata before mutating.
