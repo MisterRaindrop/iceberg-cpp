@@ -596,8 +596,11 @@ function(resolve_thrift_dependency)
   # `iceberg_hive` exposes `thrift::thrift` in its INSTALL_INTERFACE link
   # libraries, so downstream `find_package(IcebergCpp)` consumers must be
   # able to resolve that target. Record Thrift as a system dependency so
-  # `iceberg-config.cmake.in` calls `find_dependency(Thrift)` for them.
-  list(APPEND ICEBERG_SYSTEM_DEPENDENCIES Thrift)
+  # `iceberg-config.cmake.in` calls `find_dependency(thrift)` for them.
+  # Use the lowercase name to match Apache Thrift's own install path
+  # `<prefix>/lib/cmake/thrift/thrift-config.cmake` -- the capital-T form
+  # silently misses that directory on case-sensitive Linux filesystems.
+  list(APPEND ICEBERG_SYSTEM_DEPENDENCIES thrift)
   set(ICEBERG_SYSTEM_DEPENDENCIES
       ${ICEBERG_SYSTEM_DEPENDENCIES}
       PARENT_SCOPE)
