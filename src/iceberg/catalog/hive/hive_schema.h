@@ -57,8 +57,9 @@ struct ICEBERG_HIVE_EXPORT HiveColumn {
 ///   long    -> bigint
 ///   float   -> float
 ///   double  -> double
-///   date    -> date
-///   timestamp -> timestamp
+///   date                 -> date
+///   timestamp            -> timestamp
+///   timestamptz          -> timestamp (lossy, matches Java / Rust)
 ///   time / string / uuid -> string
 ///   binary / fixed       -> binary
 ///   decimal(p, s)        -> decimal(p,s)
@@ -66,10 +67,9 @@ struct ICEBERG_HIVE_EXPORT HiveColumn {
 ///   list<T>              -> array<T>
 ///   map<K, V>            -> map<K,V>
 ///
-/// `timestamptz` is rejected with `kNotSupported` because Hive does
-/// not have a corresponding column type. Callers should either drop
-/// the column from the Hive view or coerce to a `timestamp` before
-/// invoking this helper.
+/// `timestamptz` is downgraded to Hive `timestamp`; Hive itself has no
+/// timezone-aware type, and the real semantics live in the Iceberg
+/// metadata, so the HMS DDL is advisory only.
 ICEBERG_HIVE_EXPORT Result<std::string> TypeToHiveString(const Type& type);
 
 /// \brief Convert each top-level field in `schema` to a `HiveColumn`.
