@@ -23,16 +23,23 @@ The `iceberg_hive` library exposes an Iceberg [`Catalog`](https://iceberg.apache
 
 ## Status
 
-| Capability | Phase 1 | Phase 2 |
-|---|:-:|:-:|
-| Namespace CRUD (create / list / properties / update / drop / exists) | ✅ | ✅ |
-| Table list / drop / rename / exists | ✅ | ✅ |
-| `LoadTable` (read existing metadata.json) | ✅ | ✅ |
-| `RegisterTable` (attach an existing metadata.json) | ✅ | ✅ |
-| `CreateTable` (write a fresh metadata.json) | ❌ (depends on `TableMetadataToJson`) | ✅ |
-| `UpdateTable` (commit with `metadata_location` CAS) | ❌ | ✅ |
-| Optional HMS `lock` / `unlock` around commit | ❌ | ✅ |
-| SASL / Kerberos authentication | ❌ | Phase 3 |
+| Capability | Phase 1 | Phase 2 | Phase 3 |
+|---|:-:|:-:|:-:|
+| Namespace CRUD (create / list / properties / update / drop / exists) | ✅ | ✅ | ✅ |
+| Table list / drop / rename / exists | ✅ | ✅ | ✅ |
+| `LoadTable` (read existing metadata.json) | ✅ | ✅ | ✅ |
+| `RegisterTable` (attach an existing metadata.json) | ✅ | ✅ | ✅ |
+| `CreateTable` (write a fresh metadata.json) | ❌ | ✅ | ✅ |
+| `UpdateTable` (commit with `metadata_location` CAS) | ❌ | ✅ | ✅ |
+| Optional HMS `lock` / `unlock` around commit | ❌ | ✅ (`hive.lock-enabled=true`) | ✅ |
+| `DropTable(purge=true)` (delete table + data files) | ❌ | ❌ (use `expire_snapshots`) | ❌ |
+| SASL / Kerberos authentication | ❌ | ❌ | Planned |
+
+> **Phase status, today (post Phase 2):** Phase 1 + Phase 2 are
+> shipped. The library exposes the full namespace / table read+write
+> CRUD over HMS with `metadata_location` compare-and-swap commit,
+> optional HMS-side locking, and Spark/Trino-compatible table
+> parameters. SASL / Kerberos integration is the main remaining piece.
 
 ## Build
 
@@ -67,6 +74,8 @@ target_link_libraries(my_app PRIVATE iceberg::iceberg_hive)
 
 ## Usage
 
+### Connect to a Hive Metastore
+
 ```cpp
 #include "iceberg/catalog/hive/hive_catalog.h"
 #include "iceberg/catalog/hive/hive_catalog_properties.h"
@@ -93,6 +102,53 @@ auto catalog = std::move(*catalog_result);
                                {{"owner", "data-platform"}});
 ```
 
+### Create + load a table
+
+```cpp
+using iceberg::Namespace;
+using iceberg::TableIdentifier;
+using iceberg::PartitionField;
+using iceberg::PartitionSpec;
+using iceberg::Schema;
+using iceberg::SchemaField;
+using iceberg::SortOrder;
+
+auto schema = std::make_shared<Schema>(std::vector<SchemaField>{
+    SchemaField::MakeRequired(1, "id", iceberg::int64()),
+    SchemaField::MakeRequired(2, "amount", iceberg::float64()),
+});
+auto spec = PartitionSpec::Make(/*spec_id=*/0, /*fields=*/{}).value();
+TableIdentifier ident{.ns = Namespace{{"warehouse"}}, .name = "orders"};
+
+auto table = catalog->CreateTable(ident, schema, std::move(spec),
+                                   SortOrder::Unsorted(),
+                                   /*location=*/"",      // defaults to <warehouse>/warehouse.db/orders
+                                   /*properties=*/{}).value();
+
+// Later: re-open the same table from any process pointing at the same HMS.
+auto reloaded = catalog->LoadTable(ident).value();
+```
+
+### Commit a TableUpdate (CAS retry-safe)
+
+```cpp
+#include "iceberg/table_update.h"
+#include "iceberg/transaction.h"
+
+std::vector<std::unique_ptr<iceberg::TableRequirement>> requirements;
+std::vector<std::unique_ptr<iceberg::TableUpdate>> updates;
+updates.push_back(std::make_unique<iceberg::table::SetProperties>(
+    std::unordered_map<std::string, std::string>{{"format-version", "2"}}));
+
+// HiveCatalog::UpdateTable internally calls HiveTableOperations::Commit,
+// which writes a fresh metadata.json, compare-and-swaps HMS's
+// `metadata_location` parameter, and cleans up the orphan file on any
+// failure path. CAS mismatches surface as ErrorKind::kCommitFailed so
+// iceberg::Transaction can retry the whole change set against the new
+// base.
+auto updated = catalog->UpdateTable(ident, requirements, updates);
+```
+
 ## Configuration properties
 
 | Key | Default | Description |
@@ -104,7 +160,7 @@ auto catalog = std::move(*catalog_result);
 | `thrift-transport` | `buffered` | `buffered` or `framed`. Match what your HMS deployment expects. |
 | `connect-timeout-ms` | `30000` | HMS connect timeout. |
 | `socket-timeout-ms` | `60000` | HMS read / write timeout. |
-| `hive.lock-enabled` | `false` | When Phase 2 lands, wraps the commit path with HMS `lock` / `unlock` for additional concurrency safety on top of `metadata_location` CAS. |
+| `hive.lock-enabled` | `false` | Wrap the commit path with an HMS EXCLUSIVE table-level `lock` / `unlock` for additional concurrency safety on top of `metadata_location` CAS. Recommended when many writers contend on the same table; safe to leave off otherwise (the CAS alone preserves single-writer correctness and `iceberg::Transaction` retries on `kCommitFailed`). |
 
 ## Thrift IDL provenance
 
