@@ -553,6 +553,12 @@ Result<HmsClient::HmsLockHandle> HmsClient::LockExclusive(std::string_view db_na
   }
 
   if (response.state != LockState::ACQUIRED) {
+    // HMS still assigns a valid `lockid` for non-ACQUIRED responses
+    // (WAITING / NOT_ACQUIRED / ABORT) and the request stays queued on
+    // the server until it times out (typically 10 minutes). Release it
+    // explicitly so we don't block subsequent EXCLUSIVE requests on the
+    // same table for the entire HMS lease window.
+    (void)Unlock(HmsLockHandle{.lock_id = response.lockid});
     return CommitFailed(
         "HMS denied EXCLUSIVE lock on {}.{} (state={}, error={}); retry the "
         "transaction.",
