@@ -21,7 +21,9 @@
 #include <string>
 
 #include <gtest/gtest.h>
+#include <nlohmann/json.hpp>
 
+#include "iceberg/json_serde_internal.h"
 #include "iceberg/partition_field.h"
 #include "iceberg/partition_spec.h"
 #include "iceberg/schema.h"
@@ -432,5 +434,27 @@ TEST(MetadataSerdeTest, DeserializeV2MissingSortOrder) {
   ReadTableMetadataExpectError("TableMetadataV2MissingSortOrder.json",
                                "sort-orders must exist");
 }
+
+namespace {
+
+void AssertRoundTrip(const std::string& fixture) {
+  ICEBERG_UNWRAP_OR_FAIL(auto original, ReadTableMetadataFromResource(fixture));
+  ICEBERG_UNWRAP_OR_FAIL(auto json_string, ToJsonString(*original));
+  ICEBERG_UNWRAP_OR_FAIL(auto reparsed,
+                         TableMetadataFromJson(nlohmann::json::parse(json_string)));
+  EXPECT_EQ(*reparsed, *original) << "TableMetadata round-trip mismatch for fixture "
+                                  << fixture << "; serialized form: " << json_string;
+}
+
+}  // namespace
+
+// Round-trip protection for ToJsonString(TableMetadata) — the helper that
+// HiveCatalog's commit path (C19) leans on to write fresh metadata.json
+// files. Without these regressions, a future refactor of ToJson could
+// silently drop fields and Phase 2's CAS would still appear to work but
+// would write malformed metadata to HMS.
+TEST(MetadataSerdeTest, RoundTripV1) { AssertRoundTrip("TableMetadataV1Valid.json"); }
+
+TEST(MetadataSerdeTest, RoundTripV2) { AssertRoundTrip("TableMetadataV2Valid.json"); }
 
 }  // namespace iceberg

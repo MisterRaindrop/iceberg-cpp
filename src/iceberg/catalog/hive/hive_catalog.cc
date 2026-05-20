@@ -177,13 +177,14 @@ Result<std::shared_ptr<Table>> HiveCatalog::CreateTable(
     const std::shared_ptr<PartitionSpec>& /*spec*/,
     const std::shared_ptr<SortOrder>& /*order*/, const std::string& /*location*/,
     const std::unordered_map<std::string, std::string>& /*properties*/) {
-  // CreateTable requires serialising a fresh TableMetadata to JSON, which
-  // depends on the TableMetadataToJson helper added in C17. Until then,
-  // callers should construct the metadata file out of band and use
-  // RegisterTable.
+  // CreateTable is wired up alongside the commit / CAS path in C19/C21
+  // (HiveTableOperations::Commit). Until then callers should construct
+  // the metadata.json out of band (e.g. via `ToJsonString(metadata)`
+  // from json_serde_internal.h) and use RegisterTable.
   return NotImplemented(
-      "HiveCatalog::CreateTable depends on TableMetadataToJson (see C17); "
-      "use RegisterTable with a pre-written metadata.json in the meantime.");
+      "HiveCatalog::CreateTable lands together with the CAS commit path "
+      "(C19/C21); use RegisterTable with a pre-written metadata.json in "
+      "the meantime.");
 }
 
 Result<std::shared_ptr<Table>> HiveCatalog::UpdateTable(
