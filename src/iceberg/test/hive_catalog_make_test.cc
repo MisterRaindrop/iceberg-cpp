@@ -61,20 +61,14 @@ TEST(HiveCatalogMakeTest, UnreachableHmsIsIoError) {
   EXPECT_EQ(catalog.error().kind, ErrorKind::kIOError);
 }
 
-TEST(HiveCatalogMakeTest, UnknownIoImplIsNotSupported) {
-  // io-impl must be one of the registered FileIO names (or empty for
-  // auto-detect). An unknown impl name must surface a typed error rather
-  // than crash inside the registry lookup.
-  auto catalog = HiveCatalog::Make(HiveCatalogProperties::FromMap(
-      {{std::string(HiveCatalogProperties::kUri.key()), "127.0.0.1:1"},
-       {std::string(HiveCatalogProperties::kConnectTimeoutMs.key()), "200"},
-       {std::string(HiveCatalogProperties::kIOImpl.key()), "no-such-io-impl"}}));
-  ASSERT_FALSE(catalog.has_value());
-  // The exact ErrorKind depends on whether Connect or FileIO registry
-  // fails first; both kIOError (unreachable HMS) and kInvalid /
-  // kNotFound (FileIO registry) are acceptable signals. The key
-  // invariant is that no successful catalog is returned.
-}
+// Note: io-impl validation (FileIORegistry::Load) currently happens AFTER
+// the eager HMS handshake in `HiveCatalog::Make`, so a unit test that
+// targets an unreachable HMS first surfaces `kIOError` from the
+// connection attempt -- not the FileIO registry error. Asserting the
+// FileIO validation path therefore requires either a reachable HMS or a
+// mock client, neither of which is available in this unit suite. The
+// docker-backed integration test covers a reachable-HMS scenario; the
+// FileIO-only failure mode is not yet directly exercised.
 
 TEST(HiveCatalogMakeTest, AmbiguousIpv6UriIsInvalidArgument) {
   auto catalog = HiveCatalog::Make(HiveCatalogProperties::FromMap(

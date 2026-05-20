@@ -19,25 +19,25 @@
 
 # Hive Catalog
 
-The `iceberg_hive` library exposes an Iceberg [`Catalog`](https://iceberg.apache.org/docs/latest/api/) implementation backed by a Hive Metastore (HMS). It is a port of `iceberg-rust`'s `iceberg-catalog-hms` crate with the addition of a Java-style commit / CAS path landing in Phase 2.
+The `iceberg_hive` library exposes an Iceberg [`Catalog`](https://iceberg.apache.org/docs/latest/api/) implementation backed by a Hive Metastore (HMS). It started as a port of `iceberg-rust`'s `iceberg-catalog-hms` crate and was extended with a Java-style commit / CAS path (`HiveTableOperations`), an optional HMS-side lock around commits, a connection pool, and a lock heartbeat thread.
 
 ## Status
 
-| Capability | Phase 1 | Phase 2 | Phase 3 |
-|---|:-:|:-:|:-:|
-| Namespace CRUD (create / list / properties / update / drop / exists) | ✅ | ✅ | ✅ |
-| Table list / drop / rename / exists | ✅ | ✅ | ✅ |
-| `LoadTable` (read existing metadata.json) | ✅ | ✅ | ✅ |
-| `RegisterTable` (attach an existing metadata.json) | ✅ | ✅ | ✅ |
-| `CreateTable` (write a fresh metadata.json) | ❌ | ✅ | ✅ |
-| `UpdateTable` (commit with `metadata_location` CAS) | ❌ | ✅ | ✅ |
-| Optional HMS `lock` / `unlock` around commit | ❌ | ✅ (`hive.lock-enabled=true`) | ✅ |
-| `DropTable(purge=true)` (delete table + data files) | ❌ | ❌ (use `expire_snapshots`) | ❌ |
-| SASL / Kerberos authentication | ❌ | ❌ | Planned |
+| Capability | Shipped |
+|---|:-:|
+| Namespace CRUD (create / list / properties / update / drop / exists) | ✅ |
+| Table list / drop / rename / exists (filtered to `table_type=ICEBERG`) | ✅ |
+| `LoadTable` (read existing metadata.json) | ✅ |
+| `RegisterTable` (attach an existing metadata.json) | ✅ |
+| `CreateTable` (write a fresh metadata.json) | ✅ |
+| `UpdateTable` (commit with `metadata_location` CAS + three-state recovery) | ✅ |
+| Optional HMS `lock` / `unlock` + polling + heartbeat around commit | ✅ (`hive.lock-enabled=true`) |
+| `HmsClientPool` connection pool with reconnect-on-transport-failure | ✅ (`hive.client-pool-size`) |
+| `DropTable(purge=true)` (delete table + data files) | ❌ (use `expire_snapshots`) |
+| SASL / Kerberos authentication | ❌ (planned) |
 
-> **Phase status, today (post Phase 2):** Phase 1 + Phase 2 are
-> shipped. The library exposes the full namespace / table read+write
-> CRUD over HMS with `metadata_location` compare-and-swap commit,
+> **Today's surface:** namespace / table read+write CRUD over HMS with
+> `metadata_location` compare-and-swap commit,
 > optional HMS-side locking, and Spark/Trino-compatible table
 > parameters. SASL / Kerberos integration is the main remaining piece.
 
