@@ -176,18 +176,61 @@ Result<std::string> HiveTableOperations::Commit(const HiveTableMetadataSnapshot&
   auto alter_status =
       client_->AlterTable(identifier_.ns.levels[0], identifier_.name, current);
   if (!alter_status.has_value()) {
+    // AlterTable may have actually landed on HMS even though the Thrift
+    // response was lost. Mirror Java's `checkCommitStatus` and re-read the
+    // table once to classify the failure:
+    //   * `metadata_location == new`  -> commit landed; treat as success.
+    //   * `metadata_location == base` -> commit didn't land; retriable
+    //                                    (`kCommitFailed`).
+    //   * any other value             -> someone else committed; the new
+    //                                    metadata file is now orphaned but
+    //                                    we cannot safely delete it without
+    //                                    proof, so surface
+    //                                    `kCommitStateUnknown` (no retry).
+    //   * GetTable -> kNoSuchTable    -> table was dropped concurrently;
+    //                                    retriable (`kCommitFailed`).
+    //   * GetTable -> any other error -> indeterminate; surface
+    //                                    `kCommitStateUnknown`.
+    auto verify = client_->GetTable(identifier_.ns.levels[0], identifier_.name);
+    if (!verify.has_value()) {
+      release_lock();
+      if (verify.error().kind == ErrorKind::kNoSuchTable) {
+        cleanup();
+        return CommitFailed(
+            "HMS AlterTable failed and target table was dropped concurrently; "
+            "retry the transaction (msg={}).",
+            alter_status.error().message);
+      }
+      // Don't cleanup -- we don't know whether AlterTable actually landed,
+      // so deleting new_metadata_location could orphan a committed table.
+      return CommitStateUnknown(
+          "HMS AlterTable failed and verification GetTable also failed; "
+          "the commit may or may not have landed (alter={}, verify={}).",
+          alter_status.error().message, verify.error().message);
+    }
+    auto verify_location = GetMetadataLocation(verify.value().parameters);
+    if (verify_location.has_value() && *verify_location == new_metadata_location) {
+      // Commit landed despite the exception; keep the metadata file.
+      release_lock();
+      return new_metadata_location;
+    }
     release_lock();
-    cleanup();
-    // Any AlterTable failure from this point onward (transient MetaException,
-    // Thrift transport error, lost connection) leaves the HMS row in its
-    // pre-CAS state from our perspective. Surface it as kCommitFailed so
-    // iceberg::Transaction's commit-retry loop (MakeCommitRetryRunner) can
-    // refresh and try again; the retry budget bounds infinite loops on
-    // genuinely permanent errors.
-    return CommitFailed(
-        "HMS AlterTable failed for {}; retry the transaction (kind={}, msg={}).",
-        identifier_.ToString(), static_cast<int>(alter_status.error().kind),
-        alter_status.error().message);
+    if (verify_location.has_value() && *verify_location == base.metadata_location) {
+      cleanup();
+      return CommitFailed(
+          "HMS AlterTable failed for {}; retry the transaction (kind={}, msg={}).",
+          identifier_.ToString(), static_cast<int>(alter_status.error().kind),
+          alter_status.error().message);
+    }
+    // Indeterminate: a third committer landed something, or the table now
+    // lacks metadata_location entirely. Don't delete our file because we
+    // can't tell whether it is the live one.
+    return CommitStateUnknown(
+        "HMS AlterTable failed and HMS now reports an unexpected "
+        "metadata_location for {}; treat the commit as undefined "
+        "(alter={}, observed={}).",
+        identifier_.ToString(), alter_status.error().message,
+        verify_location.has_value() ? *verify_location : std::string("<missing>"));
   }
   release_lock();
   return new_metadata_location;
