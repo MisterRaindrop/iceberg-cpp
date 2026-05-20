@@ -25,6 +25,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "iceberg/catalog/hive/hive_schema.h"
 #include "iceberg/catalog/hive/hive_utils.h"
 #include "iceberg/catalog/hive/hms_client.h"
 #include "iceberg/json_serde_internal.h"
@@ -157,6 +158,21 @@ Result<std::string> HiveTableOperations::Commit(const HiveTableMetadataSnapshot&
 
   current.parameters[std::string(kMetadataLocationKey)] = new_metadata_location;
   current.parameters[std::string(kPreviousMetadataLocationKey)] = base.metadata_location;
+  // Keep the HMS column list in sync with the committed schema so engines
+  // that introspect HMS (Hive `DESCRIBE`, Spark / Trino schema discovery)
+  // see the post-evolution columns. Mirrors Java's
+  // `HiveTableOperations.commitToExistingTable()` calling
+  // `setCols(HiveSchemaUtil.convert(newMetadata.schema()))`.
+  if (auto new_schema = new_metadata.Schema();
+      new_schema.has_value() && *new_schema != nullptr) {
+    if (auto columns = SchemaToHiveColumns(**new_schema); columns.has_value()) {
+      current.columns = std::move(*columns);
+    } else {
+      release_lock();
+      cleanup();
+      return std::unexpected(columns.error());
+    }
+  }
   auto alter_status =
       client_->AlterTable(identifier_.ns.levels[0], identifier_.name, current);
   if (!alter_status.has_value()) {
