@@ -592,6 +592,15 @@ function(resolve_thrift_dependency)
     set_target_properties(thrift::compiler PROPERTIES IMPORTED_LOCATION
                                                       "${THRIFT_COMPILER_EXECUTABLE}")
   endif()
+
+  # `iceberg_hive` exposes `thrift::thrift` in its INSTALL_INTERFACE link
+  # libraries, so downstream `find_package(IcebergCpp)` consumers must be
+  # able to resolve that target. Record Thrift as a system dependency so
+  # `iceberg-config.cmake.in` calls `find_dependency(Thrift)` for them.
+  list(APPEND ICEBERG_SYSTEM_DEPENDENCIES Thrift)
+  set(ICEBERG_SYSTEM_DEPENDENCIES
+      ${ICEBERG_SYSTEM_DEPENDENCIES}
+      PARENT_SCOPE)
 endfunction()
 
 resolve_zlib_dependency()
