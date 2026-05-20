@@ -262,8 +262,12 @@ Result<std::shared_ptr<Table>> HiveCatalog::UpdateTable(
   }
   ICEBERG_ASSIGN_OR_RAISE(auto new_metadata, builder->Build());
 
-  ICEBERG_RETURN_UNEXPECTED(ops.Commit(base, *new_metadata));
-  return LoadTable(identifier);
+  ICEBERG_ASSIGN_OR_RAISE(auto new_metadata_location, ops.Commit(base, *new_metadata));
+  // Java BaseMetastoreCatalog returns the in-memory metadata directly here
+  // instead of re-reading from HMS. Mirror that to avoid a second GetTable +
+  // ReadFile per successful UpdateTable.
+  return Table::Make(identifier, std::shared_ptr<TableMetadata>(new_metadata.release()),
+                     std::move(new_metadata_location), file_io_, shared_from_this());
 }
 
 Result<std::shared_ptr<Transaction>> HiveCatalog::StageCreateTable(
