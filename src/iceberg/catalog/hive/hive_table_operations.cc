@@ -150,7 +150,16 @@ Result<std::string> HiveTableOperations::Commit(const HiveTableMetadataSnapshot&
   if (!alter_status.has_value()) {
     release_lock();
     cleanup();
-    return std::unexpected(alter_status.error());
+    // Any AlterTable failure from this point onward (transient MetaException,
+    // Thrift transport error, lost connection) leaves the HMS row in its
+    // pre-CAS state from our perspective. Surface it as kCommitFailed so
+    // iceberg::Transaction's commit-retry loop (MakeCommitRetryRunner) can
+    // refresh and try again; the retry budget bounds infinite loops on
+    // genuinely permanent errors.
+    return CommitFailed(
+        "HMS AlterTable failed for {}; retry the transaction (kind={}, msg={}).",
+        identifier_.ToString(), static_cast<int>(alter_status.error().kind),
+        alter_status.error().message);
   }
   release_lock();
   return new_metadata_location;
