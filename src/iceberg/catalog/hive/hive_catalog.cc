@@ -299,6 +299,7 @@ Status HiveCatalog::RenameTable(const TableIdentifier& from, const TableIdentifi
   ICEBERG_RETURN_UNEXPECTED(to.Validate());
 
   ICEBERG_ASSIGN_OR_RAISE(auto table, client_->GetTable(from.ns.levels[0], from.name));
+  ICEBERG_RETURN_UNEXPECTED(ValidateIcebergTable(from, table.parameters));
   table.db_name = to.ns.levels[0];
   table.table_name = to.name;
   return client_->AlterTable(from.ns.levels[0], from.name, table);
