@@ -48,8 +48,8 @@ namespace iceberg::hive {
 namespace {
 
 constexpr std::string_view kNotImplementedMessage =
-    "HiveCatalog method is not yet implemented; "
-    "see the iceberg-cpp HiveCatalog roadmap (Phase 1 / Phase 2 commits).";
+    "HiveCatalog method is not yet implemented; see mkdocs/docs/catalogs/hive.md "
+    "for the current status matrix.";
 
 // Pick the FileIO implementation name for a given `config`. If the user
 // supplied `io-impl` explicitly, honour it; otherwise infer from the
@@ -362,8 +362,8 @@ Status HiveCatalog::DropTable(const TableIdentifier& identifier, bool purge) {
   ICEBERG_RETURN_UNEXPECTED(identifier.Validate());
   // The full data-file purge requires walking the manifest tree; iceberg
   // currently only deletes the HMS row + leaves data lifecycle to the
-  // expire-snapshots action (see C17/C19). Surface a clear error rather
-  // than silently dropping the table while leaving data behind.
+  // expire-snapshots action. Surface a clear error rather than silently
+  // dropping the table while leaving data behind.
   if (purge) {
     return NotImplemented(
         "HiveCatalog::DropTable(purge=true) is not yet supported; call "

@@ -40,9 +40,11 @@ enum class HiveThriftTransport : uint8_t { kBuffered, kFramed };
 
 /// \brief Configuration for the iceberg_hive HiveCatalog.
 ///
-/// HMS connection settings (URI, transport, timeouts) plus warehouse / FileIO
-/// metadata. Authentication (SASL/Kerberos) and HMS-side locking are out of
-/// scope for the MVP and are introduced in later commits.
+/// HMS connection settings (URI, transport, timeouts), warehouse / FileIO
+/// metadata, the optional commit-path HMS lock + heartbeat (`hive.lock-*`)
+/// and the client connection pool (`hive.client-pool-size`). SASL/Kerberos
+/// authentication is still future work; see `mkdocs/docs/catalogs/hive.md`
+/// for the current status matrix.
 class ICEBERG_HIVE_EXPORT HiveCatalogProperties
     : public ConfigBase<HiveCatalogProperties> {
  public:
@@ -82,8 +84,8 @@ class ICEBERG_HIVE_EXPORT HiveCatalogProperties
   /// \brief When true, wrap the commit path with HMS `lock` / `unlock` for
   /// extra safety on top of the metadata_location CAS. Defaults to false
   /// because CAS already handles single-writer correctness; turn this on
-  /// for environments with high write concurrency. Honored starting in
-  /// Phase 2 (`HiveTableOperations::Commit`).
+  /// for environments with high write concurrency. Honored by
+  /// `HiveTableOperations::Commit`.
   inline static Entry<bool> kLockEnabled{"hive.lock-enabled", false};
 
   /// \brief Initial / minimum wait between `check_lock` polls when HMS

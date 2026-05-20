@@ -85,9 +85,12 @@ struct ICEBERG_HIVE_EXPORT HmsLockOptions {
 /// `MetaException`, etc.) and converts them to `iceberg::Error` via
 /// `hive_errors.h` so the public interface stays Thrift-free.
 ///
-/// `HmsClient` is **not thread-safe** -- Apache Thrift's generated C++
-/// client serialises requests / responses on a single transport buffer.
-/// Callers must serialise access (e.g., one `HiveCatalog` per thread).
+/// A single `HmsClient` is **not thread-safe** -- Apache Thrift's
+/// generated C++ client serialises requests and responses on one
+/// transport buffer. Concurrent users must own their own client (the
+/// usual path is via `HmsClientPool`, which is what `HiveCatalog` uses
+/// internally so that `HiveCatalog` itself is safe to share across
+/// threads).
 class ICEBERG_HIVE_EXPORT HmsClient {
  public:
   ~HmsClient();
