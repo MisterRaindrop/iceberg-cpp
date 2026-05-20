@@ -51,11 +51,11 @@ Result<std::string> PrimitiveToHive(const Type& type) {
     case TypeId::kDate:
       return std::string("date");
     case TypeId::kTimestamp:
-      return std::string("timestamp");
     case TypeId::kTimestampTz:
-      return NotSupported(
-          "Iceberg timestamptz has no Hive column equivalent; convert to "
-          "timestamp or drop the column from the Hive view.");
+      // Hive has no timezone-aware timestamp; the HMS DDL is advisory and
+      // the real semantics live in the Iceberg metadata. Java and Rust
+      // both downgrade timestamptz to `timestamp` here.
+      return std::string("timestamp");
     case TypeId::kTime:
     case TypeId::kString:
     case TypeId::kUuid:

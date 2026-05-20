@@ -69,10 +69,10 @@ TEST(TypeToHiveStringTest, DecimalIncludesPrecisionAndScale) {
   EXPECT_EQ(ToHive(decimal(38, 9)), "decimal(38,9)");
 }
 
-TEST(TypeToHiveStringTest, TimestampTzIsNotSupported) {
-  auto result = TypeToHiveString(*timestamp_tz());
-  ASSERT_FALSE(result.has_value());
-  EXPECT_EQ(result.error().kind, ErrorKind::kNotSupported);
+TEST(TypeToHiveStringTest, TimestampTzMapsToTimestamp) {
+  // Hive has no timezone-aware timestamp; both Java and Rust downgrade
+  // timestamptz to plain `timestamp` in the HMS DDL.
+  EXPECT_EQ(ToHive(timestamp_tz()), "timestamp");
 }
 
 TEST(TypeToHiveStringTest, StructFlattensFieldList) {
@@ -118,14 +118,15 @@ TEST(TypeToHiveStringTest, StructInsideListEmitsArrayOfStruct) {
   EXPECT_EQ(*result, "array<struct<name:string,age:int>>");
 }
 
-TEST(TypeToHiveStringTest, StructPropagatesUnsupportedTimestampTz) {
-  // A struct with a timestamptz column must bubble up the NotSupported
-  // error, not silently drop the field.
+TEST(TypeToHiveStringTest, StructDowngradesTimestampTzToTimestamp) {
+  // A struct with a timestamptz column emits `timestamp` for that field,
+  // matching Java HiveSchemaUtil. The Iceberg metadata retains the tz
+  // semantics; the HMS DDL is advisory.
   StructType struct_type(
       {SchemaField(1, "a", int32(), true), SchemaField(2, "b", timestamp_tz(), true)});
   auto result = TypeToHiveString(struct_type);
-  ASSERT_FALSE(result.has_value());
-  EXPECT_EQ(result.error().kind, ErrorKind::kNotSupported);
+  ASSERT_TRUE(result.has_value()) << result.error().message;
+  EXPECT_EQ(*result, "struct<a:int,b:timestamp>");
 }
 
 TEST(SchemaToHiveColumnsTest, FlatSchemaProducesOneColumnPerField) {
@@ -169,11 +170,16 @@ TEST(SchemaToHiveColumnsTest, FieldDocBecomesColumnComment) {
   EXPECT_EQ((*columns)[0].comment, "Synthetic primary key.");
 }
 
-TEST(SchemaToHiveColumnsTest, UnsupportedFieldTypeFailsWholeConversion) {
+TEST(SchemaToHiveColumnsTest, TimestampTzColumnDowngradesToTimestamp) {
+  // Java and Rust both write `timestamptz` as Hive `timestamp` in the
+  // advisory HMS DDL. A hard rejection would break CreateTable for any
+  // schema with a tz-aware timestamp column.
   Schema schema({SchemaField(1, "ts", timestamp_tz(), true)}, /*schema_id=*/1);
   auto columns = SchemaToHiveColumns(schema);
-  ASSERT_FALSE(columns.has_value());
-  EXPECT_EQ(columns.error().kind, ErrorKind::kNotSupported);
+  ASSERT_TRUE(columns.has_value()) << columns.error().message;
+  ASSERT_EQ(columns->size(), 1);
+  EXPECT_EQ((*columns)[0].name, "ts");
+  EXPECT_EQ((*columns)[0].type_string, "timestamp");
 }
 
 }  // namespace iceberg::hive
