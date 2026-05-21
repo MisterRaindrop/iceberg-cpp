@@ -19,11 +19,12 @@
 
 #include "iceberg/catalog/hadoop/hadoop_catalog.h"
 
-#include <iostream>
+#include <format>
 #include <string_view>
 #include <utility>
 
 #include "iceberg/catalog/hadoop/hadoop_file_layout.h"
+#include "iceberg/catalog/hadoop/hadoop_log.h"
 #include "iceberg/catalog/hadoop/hadoop_table_operations.h"
 #include "iceberg/file_io.h"
 #include "iceberg/file_io_registry.h"
@@ -49,11 +50,11 @@ constexpr std::string_view kStubMessage =
 void MaybeWarnS3Warehouse(std::string_view warehouse) {
   if (warehouse.starts_with("s3://") || warehouse.starts_with("s3a://") ||
       warehouse.starts_with("s3n://")) {
-    std::cerr << "[iceberg::hadoop] WARNING: HadoopCatalog on object storage ('"
-              << warehouse
-              << "') has non-atomic rename; concurrent commits may corrupt "
-                 "version-hint.text. Prefer Glue/REST/Hive for S3 workloads."
-              << '\n';
+    LogWarning(std::format(
+        "HadoopCatalog on object storage ('{}') has non-atomic rename; concurrent "
+        "commits may corrupt version-hint.text. Prefer Glue/REST/Hive for S3 "
+        "workloads.",
+        warehouse));
   }
 }
 
@@ -253,8 +254,7 @@ bool SuppressedPermissionError(const HadoopCatalogProperties& config, const Erro
     return false;
   }
   if (err.kind == ErrorKind::kForbidden || err.kind == ErrorKind::kNotAuthorized) {
-    std::cerr << "[iceberg::hadoop] WARNING (suppress-permission-error): " << err.message
-              << '\n';
+    LogWarning(std::format("suppress-permission-error: {}", err.message));
     return true;
   }
   return false;

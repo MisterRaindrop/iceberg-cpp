@@ -20,6 +20,7 @@ set(ICEBERG_HADOOP_SOURCES
     hadoop_catalog_properties.cc
     hadoop_file_layout.cc
     hadoop_lock_manager.cc
+    hadoop_log.cc
     hadoop_table_operations.cc
     hadoop_tables.cc)
 

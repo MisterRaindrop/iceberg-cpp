@@ -19,7 +19,12 @@
 
 #include "iceberg/catalog/hadoop/hadoop_catalog_properties.h"
 
+#include <string>
+#include <vector>
+
 #include <gtest/gtest.h>
+
+#include "iceberg/catalog/hadoop/hadoop_log.h"
 
 namespace iceberg::hadoop {
 
@@ -126,6 +131,19 @@ TEST(HadoopCatalogPropertiesTest, ValidateRejectsUnknownLockImpl) {
   auto res = bad.Validate();
   ASSERT_FALSE(res.has_value());
   EXPECT_EQ(ErrorKind::kInvalidArgument, res.error().kind);
+}
+
+TEST(HadoopCatalogLogTest, WarningHandlerInterceptsMessages) {
+  std::vector<std::string> captured;
+  SetWarningHandler([&captured](std::string_view msg) { captured.emplace_back(msg); });
+  LogWarning("hello");
+  LogWarning("world");
+  // Restore default for other tests.
+  SetWarningHandler(nullptr);
+
+  ASSERT_EQ(captured.size(), 2);
+  EXPECT_EQ(captured[0], "hello");
+  EXPECT_EQ(captured[1], "world");
 }
 
 TEST(HadoopCatalogPropertiesTest, ExtractHadoopConfReturnsPrefixedKeysOnly) {
