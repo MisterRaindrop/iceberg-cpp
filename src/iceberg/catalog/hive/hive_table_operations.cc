@@ -155,8 +155,28 @@ Result<std::string> HiveTableOperations::Commit(const HiveTableMetadataSnapshot&
         identifier_.ToString(), base.metadata_location, *current_location_or_error);
   }
 
+  // Sync HMS table parameters with the new Iceberg properties so that
+  // SetProperties / RemoveProperties applied via UpdateTable propagate to
+  // engines that read HMS directly (Hive `DESCRIBE FORMATTED`, Spark /
+  // Trino metadata cache, etc.). Keys present in the base metadata's
+  // properties but absent from the new one are erased; everything else
+  // in `current.parameters` (HMS-internal keys, ownership, transient
+  // timestamps) is left intact. The Iceberg marker keys are reaffirmed
+  // afterward in case a user property tried to shadow them.
+  const auto& base_props = base.metadata->properties.configs();
+  const auto& new_props = new_metadata.properties.configs();
+  for (const auto& [key, _] : base_props) {
+    if (!new_props.contains(key)) {
+      current.parameters.erase(key);
+    }
+  }
+  for (const auto& [key, value] : new_props) {
+    current.parameters[key] = value;
+  }
   current.parameters[std::string(kMetadataLocationKey)] = new_metadata_location;
   current.parameters[std::string(kPreviousMetadataLocationKey)] = base.metadata_location;
+  current.parameters[std::string(kTableTypeKey)] = std::string(kTableTypeIceberg);
+  current.parameters[std::string(kExternalKey)] = std::string(kExternalTrue);
   // Keep the HMS column list in sync with the committed schema so engines
   // that introspect HMS (Hive `DESCRIBE`, Spark / Trino schema discovery)
   // see the post-evolution columns. Mirrors Java's
