@@ -42,4 +42,25 @@ class GZipDecompressor {
   std::unique_ptr<ZlibImpl> zlib_impl_;
 };
 
+class GZipCompressor {
+ public:
+  GZipCompressor();
+
+  ~GZipCompressor();
+
+  /// \brief Initialise the deflate stream. Safe to call lazily; Compress()
+  /// will invoke it on first use if the caller does not.
+  Status Init();
+
+  /// \brief Compress \p data using gzip framing (zlib's windowBits = 15 + 16).
+  /// Returns the compressed bytes; the empty input case round-trips to an
+  /// empty (or near-empty) gzip frame -- callers should not rely on the
+  /// exact representation of empty input.
+  Result<std::string> Compress(const std::string& data);
+
+ private:
+  class ZlibDeflateImpl;
+  std::unique_ptr<ZlibDeflateImpl> zlib_impl_;
+};
+
 }  // namespace iceberg

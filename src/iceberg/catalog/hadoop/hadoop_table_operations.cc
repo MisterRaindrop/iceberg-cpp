@@ -24,7 +24,15 @@
 #include <string_view>
 #include <utility>
 
+#include <nlohmann/json.hpp>
+
 #include "iceberg/catalog/hadoop/hadoop_file_layout.h"
+#include "iceberg/json_serde_internal.h"
+#include "iceberg/partition_spec.h"
+#include "iceberg/schema.h"
+#include "iceberg/sort_order.h"
+#include "iceberg/table_properties.h"
+#include "iceberg/util/gzip_internal.h"
 #include "iceberg/util/macros.h"
 
 namespace iceberg::hadoop {
@@ -159,6 +167,40 @@ namespace {
 
 constexpr std::string_view kWriteMetadataLocation = "write.metadata.location";
 
+// Resolve the codec the writer should use for `metadata`. Defaults to
+// `none` when the property is unset.
+Result<MetadataCompressionCodec> ResolveCommitCodec(const TableMetadata& metadata) {
+  const auto codec_name =
+      metadata.properties.Get<std::string>(TableProperties::kMetadataCompression);
+  return ParseMetadataCompressionCodec(codec_name);
+}
+
+// Serialise + (optionally) compress `metadata` and write it to `location` via
+// FileIO. Mirrors the behaviour the Java HadoopTableOperations achieves via
+// TableMetadataParser.Codec.
+Status WriteMetadataWithCodec(FileIO& file_io, const std::string& location,
+                              const TableMetadata& metadata,
+                              MetadataCompressionCodec codec) {
+  auto json = ToJson(metadata);
+  ICEBERG_ASSIGN_OR_RAISE(std::string body, ToJsonString(json));
+  switch (codec) {
+    case MetadataCompressionCodec::kNone:
+      break;
+    case MetadataCompressionCodec::kGzip: {
+      GZipCompressor compressor;
+      ICEBERG_RETURN_UNEXPECTED(compressor.Init());
+      ICEBERG_ASSIGN_OR_RAISE(body, compressor.Compress(body));
+      break;
+    }
+    case MetadataCompressionCodec::kZstd:
+      return NotSupported(
+          "write.metadata.compression-codec=zstd is recognised by the codec helpers "
+          "but zstd serialisation is not yet implemented in iceberg-cpp; use "
+          "'none' or 'gzip'.");
+  }
+  return file_io.WriteFile(location, body);
+}
+
 // RAII guard that releases a held lock when leaving the Commit scope. The
 // guard is no-op when no lock manager is wired in (e.g. during unit tests
 // that exercise the algorithm without acquiring) which keeps the body of
@@ -225,10 +267,11 @@ Status HadoopTableOperations::Commit(const TableMetadata& base,
         current.version, current_version_);
   }
 
-  // (5) MVP: write `vN.metadata.json` without codec. Codec support is added
-  // in H15 once the gzip writer is wired in.
+  // (5) Pick the codec from the updated metadata's table properties. The
+  // filename suffix follows the codec so a `.gz` file decodes correctly on
+  // the next Refresh.
   const int64_t next_version = current.version + 1;
-  const auto codec = MetadataCompressionCodec::kNone;
+  ICEBERG_ASSIGN_OR_RAISE(auto codec, ResolveCommitCodec(updated));
   const std::string target = MetadataFilePath(table_dir_, next_version, codec);
 
   // (6) Fail-if-exists belt: even if the lock manager raced, refuse to clobber
@@ -240,8 +283,8 @@ Status HadoopTableOperations::Commit(const TableMetadata& base,
         target);
   }
 
-  // (7) Write the new metadata file.
-  ICEBERG_RETURN_UNEXPECTED(TableMetadataUtil::Write(*file_io_, target, updated));
+  // (7) Write the new metadata file using the resolved codec.
+  ICEBERG_RETURN_UNEXPECTED(WriteMetadataWithCodec(*file_io_, target, updated, codec));
 
   // (8) Update version-hint.text atomically: write tmp -> delete old -> rename.
   const std::string hint = VersionHintPath(table_dir_);

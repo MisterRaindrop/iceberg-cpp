@@ -35,6 +35,7 @@
 #include "iceberg/catalog/hadoop/hadoop_catalog_properties.h"
 #include "iceberg/catalog/hadoop/hadoop_file_layout.h"
 #include "iceberg/catalog/hadoop/hadoop_lock_manager.h"
+#include "iceberg/table_properties.h"
 #include "iceberg/test/matchers.h"
 #include "iceberg/test/temp_file_test_base.h"
 #include "iceberg/test/test_resource.h"
@@ -265,6 +266,32 @@ TEST_F(HadoopCommitTest, FileLockManagerAcquiresAndDetectsStale) {
   ICEBERG_UNWRAP_OR_FAIL(auto stolen, file_lock->Acquire(table_dir_, "newcomer"));
   EXPECT_TRUE(stolen);
   EXPECT_TRUE(file_lock->Release(table_dir_, "newcomer").has_value());
+}
+
+TEST_F(HadoopCommitTest, CommitHonoursGzipCodec) {
+  const std::string body = SlurpResource("TableMetadataV1Valid.json");
+  SeedMetadataFile(1, MetadataCompressionCodec::kNone, body);
+  SeedVersionHint("1");
+
+  HadoopTableOperations ops(file_io_, table_dir_, lock_manager_, "owner");
+  ICEBERG_UNWRAP_OR_FAIL(auto base, ops.Refresh());
+  TableMetadata updated = *base;
+  updated.properties.Set(TableProperties::kMetadataCompression, std::string("gzip"));
+  // Sanity-check that Set actually round-trips through ConfigBase.
+  ASSERT_EQ("gzip", updated.properties.Get(TableProperties::kMetadataCompression));
+
+  ASSERT_TRUE(ops.Commit(*base, updated).has_value());
+  EXPECT_EQ(ops.current_version(), 2);
+  EXPECT_TRUE(ops.current_metadata_location().ends_with("v2.metadata.json.gz"))
+      << ops.current_metadata_location();
+
+  // The new file must be valid gzip (not the raw JSON). Refresh reads it back
+  // through TableMetadataUtil::Read which already decodes gzip suffixes, so a
+  // successful re-Refresh is the round-trip assertion we want.
+  HadoopTableOperations fresh(file_io_, table_dir_);
+  ICEBERG_UNWRAP_OR_FAIL(auto reloaded, fresh.Refresh());
+  ASSERT_NE(reloaded, nullptr);
+  EXPECT_EQ(fresh.current_version(), 2);
 }
 
 TEST_F(HadoopCommitTest, ConcurrentCommitsConvergeWithRetries) {

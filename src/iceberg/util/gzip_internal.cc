@@ -92,4 +92,66 @@ Result<std::string> GZipDecompressor::Decompress(const std::string& compressed_d
   return zlib_impl_->Decompress(compressed_data);
 }
 
+class GZipCompressor::ZlibDeflateImpl {
+ public:
+  ZlibDeflateImpl() { memset(&stream_, 0, sizeof(stream_)); }
+
+  ~ZlibDeflateImpl() {
+    if (initialized_) {
+      deflateEnd(&stream_);
+    }
+  }
+
+  Status Init() {
+    if (initialized_) {
+      return {};
+    }
+    // windowBits = 15 + 16 selects the gzip wrapper (matches what zcat / file
+    // reading code in iceberg-cpp expects when given a `.gz` metadata file).
+    constexpr int kWindowBits = 15 + 16;
+    constexpr int kMemLevel = 8;  // zlib default
+    int ret = deflateInit2(&stream_, Z_DEFAULT_COMPRESSION, Z_DEFLATED, kWindowBits,
+                           kMemLevel, Z_DEFAULT_STRATEGY);
+    if (ret != Z_OK) {
+      return DecompressError("deflateInit2 failed, result:{}", ret);
+    }
+    initialized_ = true;
+    return {};
+  }
+
+  Result<std::string> Compress(const std::string& data) {
+    ICEBERG_RETURN_UNEXPECTED(Init());
+    stream_.avail_in = static_cast<uInt>(data.size());
+    stream_.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(data.data()));
+
+    std::vector<char> out_buffer(32 * 1024);
+    std::string result;
+    int ret = 0;
+    do {
+      stream_.avail_out = static_cast<uInt>(out_buffer.size());
+      stream_.next_out = reinterpret_cast<Bytef*>(out_buffer.data());
+      ret = deflate(&stream_, Z_FINISH);
+      if (ret != Z_OK && ret != Z_STREAM_END && ret != Z_BUF_ERROR) {
+        return DecompressError("deflate failed, result:{}", ret);
+      }
+      result.append(out_buffer.data(), out_buffer.size() - stream_.avail_out);
+    } while (ret != Z_STREAM_END);
+    return result;
+  }
+
+ private:
+  bool initialized_ = false;
+  z_stream stream_;
+};
+
+GZipCompressor::GZipCompressor() : zlib_impl_(std::make_unique<ZlibDeflateImpl>()) {}
+
+GZipCompressor::~GZipCompressor() = default;
+
+Status GZipCompressor::Init() { return zlib_impl_->Init(); }
+
+Result<std::string> GZipCompressor::Compress(const std::string& data) {
+  return zlib_impl_->Compress(data);
+}
+
 }  // namespace iceberg
