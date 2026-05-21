@@ -447,7 +447,7 @@ Result<bool> HadoopCatalog::TableExists(const TableIdentifier& identifier) const
   return *result;
 }
 
-Status HadoopCatalog::DropTable(const TableIdentifier& identifier, bool purge) {
+Status HadoopCatalog::DropTable(const TableIdentifier& identifier, bool /*purge*/) {
   ICEBERG_RETURN_UNEXPECTED(hadoop::ValidateTableIdentifier(identifier));
   ICEBERG_ASSIGN_OR_RAISE(auto warehouse, config_.Warehouse());
   ICEBERG_ASSIGN_OR_RAISE(auto table_dir, hadoop::TableDir(warehouse, identifier));
@@ -457,15 +457,14 @@ Status HadoopCatalog::DropTable(const TableIdentifier& identifier, bool purge) {
     return NoSuchTable("Table '{}' does not exist at {}.", identifier.ToString(),
                        table_dir);
   }
-  if (purge) {
-    // Java's DropTable(purge=true) goes through CatalogUtil.dropTableData first
-    // to remove snapshot data files. The cpp helper for that is introduced in
-    // H17 alongside the suppress-permission-error path; for now we recursively
-    // delete the entire table directory which matches the purge=true outcome
-    // for tables whose data lives under <table>/data/ (the default LocationProvider).
-    return file_io_->DeleteDir(table_dir, /*recursive=*/true);
-  }
-  // Java treats both purge values as a recursive delete; cpp follows suit.
+  // Both purge values map onto the same primitive: recursively remove the
+  // table directory tree. For the default LocationProvider (data under
+  // <table>/data/) this matches Java's `purge=true` outcome exactly. Tables
+  // that put their data outside the table directory via a custom
+  // LocationProvider need a separate manifest-walking GC step which lives
+  // in iceberg_bundle (Avro reader), and is therefore out of scope for the
+  // lightweight iceberg_hadoop library; callers running such tables should
+  // run `expire_snapshots` before DropTable to surface orphaned files.
   return file_io_->DeleteDir(table_dir, /*recursive=*/true);
 }
 
