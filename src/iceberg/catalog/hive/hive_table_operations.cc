@@ -26,10 +26,8 @@
 #include "iceberg/catalog/hive/hive_schema.h"
 #include "iceberg/catalog/hive/hive_utils.h"
 #include "iceberg/catalog/hive/hms_client.h"
-#include "iceberg/json_serde_internal.h"
 #include "iceberg/table_metadata.h"
 #include "iceberg/util/macros.h"
-#include "iceberg/util/uuid.h"
 
 namespace iceberg::hive {
 
@@ -66,32 +64,21 @@ Result<HiveTableMetadataSnapshot> HiveTableOperations::Refresh() {
   };
 }
 
-namespace {
-
-std::string NewMetadataLocation(const TableMetadata& new_metadata,
-                                std::size_t base_version) {
-  // Mirror Java HiveTableOperations: <root>/metadata/<NNNNN>-<uuid>.metadata.json
-  // where NNNNN is a 5-digit zero-padded version derived from the base
-  // metadata_log length (the next version after `base`).
-  return std::format("{}/metadata/{:05}-{}.metadata.json", new_metadata.location,
-                     base_version + 1, Uuid::GenerateV4().ToString());
-}
-
-}  // namespace
-
 Result<std::string> HiveTableOperations::Commit(const HiveTableMetadataSnapshot& base,
-                                                const TableMetadata& new_metadata) {
+                                                TableMetadata& new_metadata) {
   ICEBERG_RETURN_UNEXPECTED(ValidateNamespace(identifier_.ns));
   ICEBERG_RETURN_UNEXPECTED(identifier_.Validate());
   if (!base.metadata) {
     return InvalidArgument("HiveTableOperations::Commit requires a base snapshot.");
   }
 
-  // 1. Serialise the new metadata and write it to a fresh file.
-  const std::string new_metadata_location =
-      NewMetadataLocation(new_metadata, base.metadata->metadata_log.size());
-  ICEBERG_ASSIGN_OR_RAISE(const auto json_str, ToJsonString(new_metadata));
-  ICEBERG_RETURN_UNEXPECTED(file_io_->WriteFile(new_metadata_location, json_str));
+  // 1. Serialise + write the new metadata via `TableMetadataUtil::Write`
+  // so the version comes from the base file's filename (not the in-memory
+  // `metadata_log`), the `write.metadata.path` property is honored, and
+  // `write.metadata.compression-codec` chooses the file extension.
+  ICEBERG_ASSIGN_OR_RAISE(const std::string new_metadata_location,
+                          TableMetadataUtil::Write(*file_io_, base.metadata.get(),
+                                                   base.metadata_location, new_metadata));
 
   // 2-4. CAS via alter_table. Best-effort cleanup on every failure path
   // so the warehouse never accumulates orphan metadata files. When

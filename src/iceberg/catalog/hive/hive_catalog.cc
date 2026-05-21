@@ -31,7 +31,6 @@
 #include "iceberg/catalog/hive/hms_client.h"
 #include "iceberg/catalog/hive/hms_client_pool.h"
 #include "iceberg/file_io_registry.h"
-#include "iceberg/json_serde_internal.h"
 #include "iceberg/partition_spec.h"
 #include "iceberg/sort_order.h"
 #include "iceberg/table.h"
@@ -39,7 +38,6 @@
 #include "iceberg/table_requirement.h"
 #include "iceberg/table_update.h"
 #include "iceberg/util/macros.h"
-#include "iceberg/util/uuid.h"
 
 namespace iceberg::hive {
 
@@ -245,23 +243,22 @@ Result<std::shared_ptr<Table>> HiveCatalog::CreateTable(
                                        identifier.ns, identifier.name);
   }
 
-  // Build the initial TableMetadata + serialise to JSON. Do every step
-  // that can fail without side-effects on the filesystem first (schema
-  // conversion, JSON serialisation, HMS table construction) so a bad
-  // schema never leaves an orphan metadata.json in the warehouse.
+  // Build the initial TableMetadata. Run every check that can fail
+  // without filesystem side-effects first (schema conversion) so a bad
+  // schema never leaves an orphan metadata.json. Then have
+  // `TableMetadataUtil::Write` pick the actual on-disk location, which
+  // honors `write.metadata.path` and `write.metadata.compression-codec`
+  // and produces the canonical `00000-<uuid>(.gz).metadata.json` shape.
   ICEBERG_ASSIGN_OR_RAISE(
       auto metadata, TableMetadata::Make(*schema, *spec, *order, location, properties));
-  const std::string metadata_location = std::format(
-      "{}/metadata/00000-{}.metadata.json", location, Uuid::GenerateV4().ToString());
-  ICEBERG_ASSIGN_OR_RAISE(const auto json_str, ToJsonString(*metadata));
   ICEBERG_ASSIGN_OR_RAISE(auto columns, SchemaToHiveColumns(*schema));
+  ICEBERG_ASSIGN_OR_RAISE(
+      const std::string metadata_location,
+      TableMetadataUtil::Write(*file_io_, /*base=*/nullptr,
+                               /*base_metadata_location=*/"", *metadata));
   ICEBERG_ASSIGN_OR_RAISE(
       auto hive_table,
       ConvertToHiveTable(identifier, columns, metadata_location, location, properties));
-
-  // Only now write the file; if CreateTable in HMS fails we still need
-  // to roll back the file we just wrote.
-  ICEBERG_RETURN_UNEXPECTED(file_io_->WriteFile(metadata_location, json_str));
 
   // CheckCommitStatus-style recovery for CreateTable: when HMS reports a
   // failure we cannot blindly delete `metadata_location`, because the
@@ -342,7 +339,13 @@ Result<std::shared_ptr<Table>> HiveCatalog::UpdateTable(
     }
 
     // Apply updates via TableMetadataBuilder and build the new metadata.
+    // Wire the base's metadata_location into the builder so the new
+    // metadata's `previous-metadata-location` field is set and the
+    // metadata_log lineage grows correctly. Without this the log stays
+    // empty and `TableMetadataUtil::Write` would derive the new version
+    // from a truncated log size instead of the base file's name.
     auto builder = TableMetadataBuilder::BuildFrom(base.metadata.get());
+    builder->SetPreviousMetadataLocation(base.metadata_location);
     for (const auto& update : updates) {
       if (!update) continue;
       update->ApplyTo(*builder);

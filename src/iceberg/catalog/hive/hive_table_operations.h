@@ -109,7 +109,7 @@ class ICEBERG_HIVE_EXPORT HiveTableOperations {
   /// Returns the location of the newly-written metadata file on
   /// success so the caller can fold it into a refreshed snapshot.
   Result<std::string> Commit(const HiveTableMetadataSnapshot& base,
-                             const TableMetadata& new_metadata);
+                             TableMetadata& new_metadata);
 
   const TableIdentifier& identifier() const { return identifier_; }
 
