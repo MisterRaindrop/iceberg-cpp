@@ -277,7 +277,14 @@ if(ICEBERG_BUILD_HADOOP)
     add_executable(${test_name})
     target_include_directories(${test_name} PRIVATE "${CMAKE_BINARY_DIR}/iceberg/test/")
     target_sources(${test_name} PRIVATE ${ARG_SOURCES})
-    target_link_libraries(${test_name} PRIVATE GTest::gmock_main iceberg_hadoop_static)
+    if(ARG_USE_BUNDLE)
+      target_link_libraries(${test_name}
+                            PRIVATE iceberg_hadoop_static
+                                    "$<IF:$<TARGET_EXISTS:iceberg_bundle_static>,iceberg_bundle_static,iceberg_bundle_shared>"
+                                    GTest::gmock_main)
+    else()
+      target_link_libraries(${test_name} PRIVATE GTest::gmock_main iceberg_hadoop_static)
+    endif()
     if(MSVC_TOOLCHAIN)
       target_compile_options(${test_name} PRIVATE /bigobj)
     endif()
@@ -286,4 +293,9 @@ if(ICEBERG_BUILD_HADOOP)
 
   add_hadoop_iceberg_test(hadoop_catalog_test SOURCES hadoop_catalog_properties_test.cc
                           hadoop_file_layout_test.cc)
+
+  if(ICEBERG_BUILD_BUNDLE)
+    add_hadoop_iceberg_test(hadoop_catalog_namespace_test USE_BUNDLE SOURCES
+                            hadoop_catalog_namespace_test.cc)
+  endif()
 endif()

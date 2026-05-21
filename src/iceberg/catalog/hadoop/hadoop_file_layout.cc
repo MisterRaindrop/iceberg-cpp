@@ -162,6 +162,39 @@ std::string NamespacePropertiesPath(std::string_view ns_dir) {
   return JoinUnderRoot(ns_dir, "namespace.properties");
 }
 
+Result<bool> IsHadoopTableDir(FileIO& file_io, std::string_view dir_location) {
+  // A HadoopCatalog table contains a metadata/ subdirectory with at least one
+  // v{N}.metadata.json[.codec] file. We probe the metadata dir first and only
+  // list its contents if it exists, to avoid expensive listings on plain
+  // namespace directories.
+  const std::string metadata_dir = MetadataDir(dir_location);
+  ICEBERG_ASSIGN_OR_RAISE(auto exists, file_io.Exists(metadata_dir));
+  if (!exists) {
+    return false;
+  }
+  ICEBERG_ASSIGN_OR_RAISE(auto is_dir, file_io.IsDirectory(metadata_dir));
+  if (!is_dir) {
+    return false;
+  }
+  ICEBERG_ASSIGN_OR_RAISE(auto entries, file_io.ListDir(metadata_dir));
+  for (const auto& entry : entries) {
+    if (entry.is_directory) {
+      continue;
+    }
+    // Extract just the file name portion. arrow_fs returns paths in the
+    // canonical form, but we don't need the directory portion here.
+    std::string_view name = entry.location;
+    auto slash = name.find_last_of('/');
+    if (slash != std::string_view::npos) {
+      name.remove_prefix(slash + 1);
+    }
+    if (ParseMetadataFileName(name).has_value()) {
+      return true;
+    }
+  }
+  return false;
+}
+
 Result<MetadataFileRef> ParseMetadataFileName(std::string_view file_name) {
   if (!file_name.starts_with(kVersionPrefix)) {
     return InvalidArgument(

@@ -24,6 +24,7 @@
 #include <string_view>
 
 #include "iceberg/catalog/hadoop/iceberg_hadoop_export.h"
+#include "iceberg/file_io.h"
 #include "iceberg/result.h"
 #include "iceberg/table_identifier.h"
 
@@ -119,5 +120,16 @@ struct MetadataFileRef {
 /// (e.g. UUID-prefixed temp files left behind by a partial commit).
 ICEBERG_HADOOP_EXPORT Result<MetadataFileRef> ParseMetadataFileName(
     std::string_view file_name);
+
+/// \brief Determine whether `dir_location` resolves to a HadoopCatalog table
+/// directory.
+///
+/// A directory qualifies when it contains a `metadata/` subdirectory that has
+/// at least one `v{N}.metadata.json[.codec]` file (matching the HadoopCatalog
+/// commit layout). The check tolerates a missing or non-directory parent (in
+/// which case the result is false). Any underlying FileIO failure other than
+/// "not found" is propagated.
+ICEBERG_HADOOP_EXPORT Result<bool> IsHadoopTableDir(FileIO& file_io,
+                                                    std::string_view dir_location);
 
 }  // namespace iceberg::hadoop
