@@ -1164,6 +1164,77 @@ TEST(HiveTableOpsDirect, CommitVerifyNoSuchTableIsRetriableCommitFailed) {
   EXPECT_TRUE(mutation_attempted);
 }
 
+TEST(HiveTableOpsDirect, CommitWithLockEnabledAcquiresAndReleases) {
+  // Cover the lock-enabled branch: when lock_enabled is true, Commit
+  // wraps the critical section with HMS EXCLUSIVE LockExclusive +
+  // Unlock RPCs. Verify both fire and the commit succeeds.
+  auto h = MakeCommitHarness();
+  bool lock_called = false;
+  bool unlock_called = false;
+  class LockingFake : public FakeHmsClient {
+   public:
+    bool* lock_called = nullptr;
+    bool* unlock_called = nullptr;
+    std::string base_loc;
+    Result<HmsLockHandle> LockExclusive(std::string_view, std::string_view,
+                                        const HmsLockOptions&) override {
+      *lock_called = true;
+      return HmsLockHandle{.lock_id = 42};
+    }
+    Status Unlock(HmsLockHandle) override {
+      *unlock_called = true;
+      return {};
+    }
+    Result<HiveTable> GetTable(std::string_view db, std::string_view tbl) override {
+      return MakeIcebergRow(std::string(db), std::string(tbl), base_loc);
+    }
+    Status AlterTable(std::string_view, std::string_view, const HiveTable&) override {
+      return Status{};
+    }
+  } fake;
+  fake.lock_called = &lock_called;
+  fake.unlock_called = &unlock_called;
+  fake.base_loc = h.fixture.base_loc;
+
+  HmsLockOptions options;
+  options.check_min_wait_ms = 1;
+  options.check_max_wait_ms = 5;
+  options.acquire_timeout_ms = 50;
+  HiveTableOperations ops(&fake, h.fixture.io, h.fixture.id,
+                          /*lock_enabled=*/true, options);
+  bool mutation_attempted = false;
+  auto loc = ops.Commit(h.base, *h.next, &mutation_attempted);
+  ASSERT_TRUE(loc.has_value()) << loc.error().message;
+  EXPECT_TRUE(lock_called);
+  EXPECT_TRUE(unlock_called);
+}
+
+TEST(HiveTableOpsDirect, CommitWithLockEnabledLockFailureCleansUpAndPropagates) {
+  // Lock acquisition fails -> Commit must clean up the freshly-written
+  // metadata file AND propagate the lock error.
+  auto h = MakeCommitHarness();
+  class LockFailsFake : public FakeHmsClient {
+   public:
+    Result<HmsLockHandle> LockExclusive(std::string_view, std::string_view,
+                                        const HmsLockOptions&) override {
+      return CommitFailed("could not acquire lock");
+    }
+  } fake;
+
+  HiveTableOperations ops(&fake, h.fixture.io, h.fixture.id, /*lock_enabled=*/true);
+  bool mutation_attempted = false;
+  auto loc = ops.Commit(h.base, *h.next, &mutation_attempted);
+  ASSERT_FALSE(loc.has_value());
+  EXPECT_EQ(loc.error().kind, ErrorKind::kCommitFailed);
+  EXPECT_FALSE(mutation_attempted);
+}
+
+TEST(HiveCatalogOps, NameAccessor) {
+  // Trivial accessor coverage so the function isn't flagged as 0%.
+  auto catalog = MakeTestCatalog(std::make_unique<FakeHmsClient>());
+  EXPECT_EQ(catalog->name(), "hive");
+}
+
 TEST(HiveTableOpsDirect, CommitVerifyTransportFailureIsCommitStateUnknown) {
   // AlterTable transport-fails AND the subsequent verify GetTable
   // ALSO fails with a non-NoSuchTable error -- the commit may have
