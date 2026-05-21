@@ -156,6 +156,15 @@ Result<LockBody> DecodeLockBody(std::string_view body) {
 
 }  // namespace
 
+struct FileLockManager::HeartbeatState {
+  std::string lock_path;
+  std::string owner_id;
+  std::atomic<bool> stop{false};
+  std::mutex wake_mutex;
+  std::condition_variable wake_cv;
+  std::thread thread;
+};
+
 FileLockManager::FileLockManager(std::shared_ptr<FileIO> file_io,
                                  const HadoopCatalogProperties& config)
     : file_io_(std::move(file_io)),
@@ -163,10 +172,65 @@ FileLockManager::FileLockManager(std::shared_ptr<FileIO> file_io,
           config.Get(HadoopCatalogProperties::kLockAcquireTimeoutMs))),
       acquire_interval_(std::chrono::milliseconds(
           config.Get(HadoopCatalogProperties::kLockAcquireIntervalMs))),
+      heartbeat_interval_(std::chrono::milliseconds(
+          config.Get(HadoopCatalogProperties::kLockHeartbeatIntervalMs))),
       heartbeat_timeout_(std::chrono::milliseconds(
           config.Get(HadoopCatalogProperties::kLockHeartbeatTimeoutMs))) {}
 
-FileLockManager::~FileLockManager() = default;
+FileLockManager::~FileLockManager() {
+  // Stop any heartbeats still running -- typically Release should have
+  // drained the map, but defensive cleanup avoids leaking threads if the
+  // manager is destroyed while a lock is held.
+  std::vector<std::unique_ptr<HeartbeatState>> drain;
+  {
+    std::lock_guard lk(states_mutex_);
+    drain.reserve(states_.size());
+    for (auto& [_, state] : states_) {
+      drain.push_back(std::move(state));
+    }
+    states_.clear();
+  }
+  for (auto& state : drain) {
+    StopHeartbeat(std::move(state));
+  }
+}
+
+void FileLockManager::RunHeartbeat(HeartbeatState* state) {
+  while (true) {
+    std::unique_lock lk(state->wake_mutex);
+    state->wake_cv.wait_for(lk, heartbeat_interval_,
+                            [state] { return state->stop.load(); });
+    if (state->stop.load()) {
+      return;
+    }
+    lk.unlock();
+
+    // Refresh the on-disk timestamp, but only if we still own the lock.
+    // If another process stole it (we hung past heartbeat-timeout-ms), we
+    // must not clobber the stealer's lock body.
+    auto body = file_io_->ReadFile(state->lock_path, /*length=*/std::nullopt);
+    if (!body.has_value()) {
+      continue;  // file gone; might be released elsewhere
+    }
+    auto decoded = DecodeLockBody(*body);
+    if (!decoded.has_value() || decoded->owner != state->owner_id) {
+      continue;
+    }
+    std::ignore = file_io_->WriteFile(
+        state->lock_path, EncodeLockBody(state->owner_id, MillisSinceEpoch()));
+  }
+}
+
+void FileLockManager::StopHeartbeat(std::unique_ptr<HeartbeatState> state) {
+  {
+    std::lock_guard lk(state->wake_mutex);
+    state->stop.store(true);
+  }
+  state->wake_cv.notify_all();
+  if (state->thread.joinable()) {
+    state->thread.join();
+  }
+}
 
 Result<bool> FileLockManager::Acquire(const std::string& entity_id,
                                       const std::string& owner_id) {
@@ -188,6 +252,17 @@ Result<bool> FileLockManager::Acquire(const std::string& entity_id,
         auto flush = write.has_value() ? (*stream)->Flush() : Status{};
         auto close_status = (*stream)->Close();
         if (write.has_value() && flush.has_value() && close_status.has_value()) {
+          // Spawn the heartbeat thread so a legitimately slow commit does
+          // not get its lock stolen by the stale-lock GC.
+          auto state = std::make_unique<HeartbeatState>();
+          state->lock_path = lock_path;
+          state->owner_id = owner_id;
+          HeartbeatState* state_ptr = state.get();
+          state->thread = std::thread([this, state_ptr] { RunHeartbeat(state_ptr); });
+          {
+            std::lock_guard lk(states_mutex_);
+            states_.emplace(entity_id, std::move(state));
+          }
           return true;
         }
         std::ignore = file_io_->DeleteFile(lock_path);
@@ -222,6 +297,22 @@ Status FileLockManager::Release(const std::string& entity_id,
     return InvalidArgument("FileLockManager: FileIO is null.");
   }
   const std::string lock_path = LockFilePath(entity_id);
+
+  // Stop the heartbeat thread before reading the on-disk body so the
+  // background refresh cannot race with our delete.
+  std::unique_ptr<HeartbeatState> state;
+  {
+    std::lock_guard lk(states_mutex_);
+    auto it = states_.find(entity_id);
+    if (it != states_.end()) {
+      state = std::move(it->second);
+      states_.erase(it);
+    }
+  }
+  if (state != nullptr) {
+    StopHeartbeat(std::move(state));
+  }
+
   ICEBERG_ASSIGN_OR_RAISE(auto body, file_io_->ReadFile(lock_path, std::nullopt));
   ICEBERG_ASSIGN_OR_RAISE(auto decoded, DecodeLockBody(body));
   if (decoded.owner != owner_id) {

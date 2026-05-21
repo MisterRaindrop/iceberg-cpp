@@ -21,7 +21,9 @@
 
 #include <chrono>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 
 #include "iceberg/catalog/hadoop/hadoop_catalog_properties.h"
 #include "iceberg/catalog/hadoop/iceberg_hadoop_export.h"
@@ -96,10 +98,12 @@ class ICEBERG_HADOOP_EXPORT InMemoryLockManager : public LockManager {
 /// recorded timestamp is older than `lock.heartbeat-timeout-ms`. Stale
 /// locks are deleted and re-acquired by the next caller.
 ///
-/// MVP scope (matches the H14 plan note): there is no background heartbeat
-/// thread yet. Commits are expected to complete within
-/// `lock.heartbeat-timeout-ms` (15 s by default) which is comfortable for
-/// typical metadata writes; the heartbeat refresh is a follow-up.
+/// A background heartbeat thread refreshes the lock's timestamp every
+/// `lock.heartbeat-interval-ms` so that legitimately slow commits do not
+/// race against the stale-lock GC. The thread verifies the lock still
+/// belongs to us before refreshing -- if another process stole the lock
+/// (we hung past `heartbeat-timeout-ms`), the heartbeat becomes a no-op and
+/// Release will surface kNotAllowed.
 class ICEBERG_HADOOP_EXPORT FileLockManager : public LockManager {
  public:
   FileLockManager(std::shared_ptr<FileIO> file_io, const HadoopCatalogProperties& config);
@@ -110,10 +114,18 @@ class ICEBERG_HADOOP_EXPORT FileLockManager : public LockManager {
   Status Release(const std::string& entity_id, const std::string& owner_id) override;
 
  private:
+  struct HeartbeatState;
+  void RunHeartbeat(HeartbeatState* state);
+  void StopHeartbeat(std::unique_ptr<HeartbeatState> state);
+
   std::shared_ptr<FileIO> file_io_;
   std::chrono::milliseconds acquire_timeout_;
   std::chrono::milliseconds acquire_interval_;
+  std::chrono::milliseconds heartbeat_interval_;
   std::chrono::milliseconds heartbeat_timeout_;
+
+  std::mutex states_mutex_;
+  std::unordered_map<std::string, std::unique_ptr<HeartbeatState>> states_;
 };
 
 /// \brief Resolve and construct a `LockManager` from the catalog properties.
