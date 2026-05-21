@@ -52,6 +52,8 @@ markdown_extensions:
 nav:
   - Home: index.md
   - Getting Started: getting-started.md
+  - Catalogs:
+    - Hadoop Catalog: catalogs/hadoop.md
   - Contributing: contributing.md
   - Releases:
     - Release History: releases.md
