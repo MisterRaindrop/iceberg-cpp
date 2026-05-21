@@ -33,6 +33,7 @@
 #include "iceberg/table_update.h"
 #include "iceberg/util/checked_cast.h"
 #include "iceberg/util/macros.h"
+#include "iceberg/util/uuid.h"
 
 namespace iceberg::hadoop {
 
@@ -328,29 +329,81 @@ Result<std::shared_ptr<Table>> HadoopCatalog::CreateTable(
   ICEBERG_ASSIGN_OR_RAISE(auto metadata, TableMetadata::Make(*schema, *spec, *order,
                                                              base_location, properties));
 
-  // Ensure the metadata directory exists before writing the version-1 file.
+  // Ensure the metadata directory exists before publishing v1.
   const std::string metadata_dir = hadoop::MetadataDir(table_dir);
   ICEBERG_RETURN_UNEXPECTED(file_io_->CreateDir(metadata_dir));
 
+  // Acquire the lock manager so two concurrent CreateTable calls on the
+  // same identifier cannot both pass the IsHadoopTableDir guard and then
+  // race to overwrite each other. Mirrors the Commit-time serialisation in
+  // HadoopTableOperations.
+  const std::string create_owner =
+      name_ + ":create:" + identifier.ToString() + ":" + Uuid::GenerateV7().ToString();
+  ICEBERG_ASSIGN_OR_RAISE(auto acquired, lock_manager_->Acquire(table_dir, create_owner));
+  if (!acquired) {
+    return CommitFailed(
+        "HadoopCatalog::CreateTable: failed to acquire table lock for '{}' within "
+        "the configured timeout.",
+        table_dir);
+  }
+  // Re-check after taking the lock; another thread may have committed v1
+  // while we were waiting.
+  auto recheck = hadoop::IsHadoopTableDir(*file_io_, table_dir);
+  if (!recheck.has_value()) {
+    std::ignore = lock_manager_->Release(table_dir, create_owner);
+    return std::unexpected<Error>(recheck.error());
+  }
+  if (*recheck) {
+    std::ignore = lock_manager_->Release(table_dir, create_owner);
+    return AlreadyExists("Table '{}' already exists at {}.", identifier.ToString(),
+                         table_dir);
+  }
+
+  // Write the v1 metadata via a UUID-named temp file, then atomic rename.
+  // Same logic as HadoopTableOperations::Commit -- shields the catalog from
+  // orphan files left over by a crashed creator (whose UUID name does NOT
+  // match ParseMetadataFileName, so listdir-based recovery ignores it).
   const std::string metadata_path =
       hadoop::MetadataFilePath(table_dir, /*version=*/1, MetadataCompressionCodec::kNone);
+  const std::string temp_path = std::format("{}/{}-v1.metadata.json.tmp", metadata_dir,
+                                            Uuid::GenerateV7().ToString());
 
-  auto write_result = TableMetadataUtil::Write(*file_io_, metadata_path, *metadata);
+  auto write_result = TableMetadataUtil::Write(*file_io_, temp_path, *metadata);
   if (!write_result.has_value()) {
-    // Best-effort cleanup of the freshly written file so a retry can succeed.
-    std::ignore = file_io_->DeleteFile(metadata_path);
+    std::ignore = file_io_->DeleteFile(temp_path);
+    std::ignore = lock_manager_->Release(table_dir, create_owner);
     return std::unexpected<Error>(write_result.error());
   }
-
-  // Write version-hint.text so subsequent Refresh calls find the new file
-  // even on filesystems whose listdir order is non-deterministic.
-  auto hint_result =
-      file_io_->WriteFile(hadoop::VersionHintPath(table_dir), std::string("1\n"));
-  if (!hint_result.has_value()) {
-    std::ignore = file_io_->DeleteFile(metadata_path);
-    return std::unexpected<Error>(hint_result.error());
+  auto rename_result = file_io_->Rename(temp_path, metadata_path, /*overwrite=*/false);
+  if (!rename_result.has_value()) {
+    std::ignore = file_io_->DeleteFile(temp_path);
+    std::ignore = lock_manager_->Release(table_dir, create_owner);
+    return AlreadyExists(
+        "HadoopCatalog::CreateTable: v1.metadata.json already exists at {} "
+        "(possibly an orphan from a crashed creator).",
+        metadata_path);
   }
 
+  // Write version-hint.text via temp + rename so a crashed creator does
+  // not leave the hint pointing at a non-existent version.
+  const std::string hint_path = hadoop::VersionHintPath(table_dir);
+  const std::string hint_tmp = hint_path + ".tmp";
+  auto hint_write = file_io_->WriteFile(hint_tmp, std::string("1\n"));
+  if (!hint_write.has_value()) {
+    std::ignore = file_io_->DeleteFile(metadata_path);
+    std::ignore = lock_manager_->Release(table_dir, create_owner);
+    return std::unexpected<Error>(hint_write.error());
+  }
+  std::ignore = file_io_->DeleteFile(hint_path);  // best-effort
+  auto hint_rename = file_io_->Rename(hint_tmp, hint_path, /*overwrite=*/false);
+  if (!hint_rename.has_value()) {
+    std::ignore = file_io_->DeleteFile(hint_tmp);
+    std::ignore = file_io_->DeleteFile(metadata_path);
+    std::ignore = lock_manager_->Release(table_dir, create_owner);
+    return std::unexpected<Error>(hint_rename.error());
+  }
+
+  std::ignore = lock_manager_->Release(table_dir, create_owner);
   std::shared_ptr<TableMetadata> metadata_ptr = std::move(metadata);
   return Table::Make(identifier, metadata_ptr, metadata_path, file_io_,
                      shared_from_this());
