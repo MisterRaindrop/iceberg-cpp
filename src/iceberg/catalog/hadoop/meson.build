@@ -21,6 +21,7 @@ iceberg_hadoop_sources = files(
     'hadoop_file_layout.cc',
     'hadoop_lock_manager.cc',
     'hadoop_table_operations.cc',
+    'hadoop_tables.cc',
 )
 
 iceberg_hadoop_build_deps = [iceberg_dep]
@@ -52,6 +53,7 @@ install_headers(
         'hadoop_file_layout.h',
         'hadoop_lock_manager.h',
         'hadoop_table_operations.h',
+        'hadoop_tables.h',
         'iceberg_hadoop_export.h',
     ],
     subdir: 'iceberg/catalog/hadoop',

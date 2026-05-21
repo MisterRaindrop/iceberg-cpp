@@ -20,7 +20,8 @@ set(ICEBERG_HADOOP_SOURCES
     hadoop_catalog_properties.cc
     hadoop_file_layout.cc
     hadoop_lock_manager.cc
-    hadoop_table_operations.cc)
+    hadoop_table_operations.cc
+    hadoop_tables.cc)
 
 set(ICEBERG_HADOOP_STATIC_BUILD_INTERFACE_LIBS)
 set(ICEBERG_HADOOP_SHARED_BUILD_INTERFACE_LIBS)

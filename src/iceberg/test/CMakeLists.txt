@@ -299,5 +299,6 @@ if(ICEBERG_BUILD_HADOOP)
                             hadoop_catalog_namespace_test.cc)
     add_hadoop_iceberg_test(hadoop_table_operations_test USE_BUNDLE SOURCES
                             hadoop_table_operations_test.cc)
+    add_hadoop_iceberg_test(hadoop_tables_test USE_BUNDLE SOURCES hadoop_tables_test.cc)
   endif()
 endif()
