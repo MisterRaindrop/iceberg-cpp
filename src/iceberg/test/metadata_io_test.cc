@@ -138,6 +138,32 @@ TEST_F(MetadataIOTest, ReadWriteCompressedMetadata) {
   EXPECT_EQ(*metadata_read, metadata);
 }
 
+TEST_F(MetadataIOTest, WriteCompressedMetadataRoundTrip) {
+  // Regression: previously `TableMetadataUtil::Write` only honored the
+  // codec at the filename-extension layer (via `NewTableMetadataFilePath`)
+  // and wrote plain JSON into a file named `.gz.metadata.json`, so the
+  // round-trip Read tried to gunzip JSON and failed with a zlib error.
+  // Force compression via the property path so `NewTableMetadataFilePath`
+  // picks the `.gz.metadata.json` suffix and exercise the
+  // base-and-filename-overload of `Write`.
+  TableMetadata base = PrepareMetadata();
+  ICEBERG_UNWRAP_OR_FAIL(auto base_loc,
+                         TableMetadataUtil::Write(*io_, nullptr, "", base));
+
+  TableMetadata next = PrepareMetadata();
+  next.properties.Set(TableProperties::kMetadataCompression, std::string("gzip"));
+  next.metadata_log.push_back(
+      {.timestamp_ms = TimePointMsFromUnixMs(1515100955770), .metadata_file = base_loc});
+
+  ICEBERG_UNWRAP_OR_FAIL(auto next_loc,
+                         TableMetadataUtil::Write(*io_, &base, base_loc, next));
+  EXPECT_THAT(next_loc, testing::EndsWith(".gz.metadata.json"));
+
+  auto reread = TableMetadataUtil::Read(*io_, next_loc);
+  ASSERT_THAT(reread, IsOk());
+  EXPECT_EQ(*reread.value(), next);
+}
+
 TEST_F(MetadataIOTest, WriteMetadataWithBase) {
   TableMetadata base = PrepareMetadata();
 

@@ -27,6 +27,7 @@
 namespace iceberg {
 
 class ZlibImpl;
+class ZlibDeflateImpl;
 
 class GZipDecompressor {
  public:
@@ -40,6 +41,26 @@ class GZipDecompressor {
 
  private:
   std::unique_ptr<ZlibImpl> zlib_impl_;
+};
+
+/// \brief One-shot gzip compressor.
+///
+/// Mirrors `GZipDecompressor`'s lifecycle (`Init` once, `Compress` once)
+/// and emits a gzip stream (RFC 1952) so the output round-trips through
+/// `GZipDecompressor` and through standard tools (`gunzip`, Arrow's
+/// `arrow::util::Codec::Create(arrow::Compression::GZIP)`).
+class GZipCompressor {
+ public:
+  GZipCompressor();
+
+  ~GZipCompressor();
+
+  Status Init();
+
+  Result<std::string> Compress(const std::string& data);
+
+ private:
+  std::unique_ptr<ZlibDeflateImpl> zlib_impl_;
 };
 
 }  // namespace iceberg

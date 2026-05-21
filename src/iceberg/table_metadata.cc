@@ -486,6 +486,19 @@ Status TableMetadataUtil::Write(FileIO& io, const std::string& location,
                                 const TableMetadata& metadata) {
   auto json = ToJson(metadata);
   ICEBERG_ASSIGN_OR_RAISE(auto json_string, ToJsonString(json));
+  // Honor the codec encoded into the filename so a file named
+  // `<n>.gz.metadata.json` actually contains a gzip stream.
+  // `NewTableMetadataFilePath` already derives the extension from
+  // `write.metadata.compression-codec`; without the matching encode here,
+  // the subsequent `TableMetadataUtil::Read` would try to gunzip plain
+  // JSON and fail. Mirrors Java `TableMetadataParser.write` /
+  // `Codec.from(filename).encode(...)`.
+  ICEBERG_ASSIGN_OR_RAISE(auto codec_type, Codec::FromFileName(location));
+  if (codec_type == MetadataFileCodecType::kGzip) {
+    auto compressor = std::make_unique<GZipCompressor>();
+    ICEBERG_RETURN_UNEXPECTED(compressor->Init());
+    ICEBERG_ASSIGN_OR_RAISE(json_string, compressor->Compress(json_string));
+  }
   return io.WriteFile(location, json_string);
 }
 
