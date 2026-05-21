@@ -28,8 +28,14 @@
 #include "iceberg/catalog/hadoop/hadoop_catalog.h"
 #include "iceberg/catalog/hadoop/hadoop_catalog_properties.h"
 #include "iceberg/catalog/hadoop/hadoop_file_layout.h"
+#include "iceberg/partition_spec.h"
+#include "iceberg/schema.h"
+#include "iceberg/schema_field.h"
+#include "iceberg/sort_order.h"
+#include "iceberg/table.h"
 #include "iceberg/test/matchers.h"
 #include "iceberg/test/temp_file_test_base.h"
+#include "iceberg/type.h"
 
 namespace iceberg::hadoop {
 
@@ -178,6 +184,28 @@ TEST_F(HadoopCatalogNamespaceTest, UpdateNamespacePropertiesIsNotSupported) {
       catalog_->UpdateNamespaceProperties(Namespace{.levels = {"db"}}, {{"k", "v"}}, {});
   ASSERT_FALSE(res.has_value());
   EXPECT_EQ(ErrorKind::kNotSupported, res.error().kind);
+}
+
+TEST_F(HadoopCatalogNamespaceTest, CreateThenLoadTableRoundTrip) {
+  ASSERT_TRUE(catalog_->CreateNamespace(Namespace{.levels = {"db"}}, {}).has_value());
+  TableIdentifier id{.ns = Namespace{.levels = {"db"}}, .name = "events"};
+
+  auto schema = std::make_shared<Schema>(
+      std::vector<SchemaField>{SchemaField::MakeRequired(1, "id", int64())});
+  auto spec = PartitionSpec::Unpartitioned();
+  auto order = SortOrder::Unsorted();
+  auto created = catalog_->CreateTable(id, schema, spec, order, /*location=*/"", {});
+  ASSERT_TRUE(created.has_value()) << created.error().message;
+  EXPECT_EQ((*created)->name(), id);
+
+  auto loaded = catalog_->LoadTable(id);
+  ASSERT_TRUE(loaded.has_value()) << loaded.error().message;
+  EXPECT_EQ((*loaded)->name(), id);
+
+  // Creating again over the existing table must fail with kAlreadyExists.
+  auto again = catalog_->CreateTable(id, schema, spec, order, /*location=*/"", {});
+  ASSERT_FALSE(again.has_value());
+  EXPECT_EQ(ErrorKind::kAlreadyExists, again.error().kind);
 }
 
 }  // namespace iceberg::hadoop

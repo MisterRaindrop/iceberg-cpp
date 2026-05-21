@@ -24,7 +24,10 @@
 #include <utility>
 
 #include "iceberg/catalog/hadoop/hadoop_file_layout.h"
+#include "iceberg/catalog/hadoop/hadoop_table_operations.h"
 #include "iceberg/file_io.h"
+#include "iceberg/table.h"
+#include "iceberg/table_metadata.h"
 #include "iceberg/util/macros.h"
 
 namespace iceberg::hadoop {
@@ -207,11 +210,60 @@ Result<std::vector<TableIdentifier>> HadoopCatalog::ListTables(
 }
 
 Result<std::shared_ptr<Table>> HadoopCatalog::CreateTable(
-    const TableIdentifier& /*identifier*/, const std::shared_ptr<Schema>& /*schema*/,
-    const std::shared_ptr<PartitionSpec>& /*spec*/,
-    const std::shared_ptr<SortOrder>& /*order*/, const std::string& /*location*/,
-    const std::unordered_map<std::string, std::string>& /*properties*/) {
-  return NotSupported("HadoopCatalog::CreateTable: {}", kStubMessage);
+    const TableIdentifier& identifier, const std::shared_ptr<Schema>& schema,
+    const std::shared_ptr<PartitionSpec>& spec, const std::shared_ptr<SortOrder>& order,
+    const std::string& location,
+    const std::unordered_map<std::string, std::string>& properties) {
+  ICEBERG_RETURN_UNEXPECTED(hadoop::ValidateTableIdentifier(identifier));
+  if (schema == nullptr || spec == nullptr || order == nullptr) {
+    return InvalidArgument(
+        "HadoopCatalog::CreateTable requires non-null schema, spec, and order.");
+  }
+  ICEBERG_ASSIGN_OR_RAISE(auto warehouse, config_.Warehouse());
+  ICEBERG_ASSIGN_OR_RAISE(auto table_dir, hadoop::TableDir(warehouse, identifier));
+
+  // Java's HadoopCatalog rejects creation when the table directory already
+  // looks like an Iceberg table. We deliberately do not refuse plain
+  // pre-existing directories so users can drop the metadata layout into a
+  // pre-created folder; an existing table is the foot-gun we guard against.
+  ICEBERG_ASSIGN_OR_RAISE(auto already_table,
+                          hadoop::IsHadoopTableDir(*file_io_, table_dir));
+  if (already_table) {
+    return AlreadyExists("Table '{}' already exists at {}.", identifier.ToString(),
+                         table_dir);
+  }
+
+  const std::string base_location = location.empty() ? table_dir : location;
+
+  ICEBERG_ASSIGN_OR_RAISE(auto metadata, TableMetadata::Make(*schema, *spec, *order,
+                                                             base_location, properties));
+
+  // Ensure the metadata directory exists before writing the version-1 file.
+  const std::string metadata_dir = hadoop::MetadataDir(table_dir);
+  ICEBERG_RETURN_UNEXPECTED(file_io_->CreateDir(metadata_dir));
+
+  const std::string metadata_path =
+      hadoop::MetadataFilePath(table_dir, /*version=*/1, MetadataCompressionCodec::kNone);
+
+  auto write_result = TableMetadataUtil::Write(*file_io_, metadata_path, *metadata);
+  if (!write_result.has_value()) {
+    // Best-effort cleanup of the freshly written file so a retry can succeed.
+    std::ignore = file_io_->DeleteFile(metadata_path);
+    return std::unexpected<Error>(write_result.error());
+  }
+
+  // Write version-hint.text so subsequent Refresh calls find the new file
+  // even on filesystems whose listdir order is non-deterministic.
+  auto hint_result =
+      file_io_->WriteFile(hadoop::VersionHintPath(table_dir), std::string("1\n"));
+  if (!hint_result.has_value()) {
+    std::ignore = file_io_->DeleteFile(metadata_path);
+    return std::unexpected<Error>(hint_result.error());
+  }
+
+  std::shared_ptr<TableMetadata> metadata_ptr = std::move(metadata);
+  return Table::Make(identifier, metadata_ptr, metadata_path, file_io_,
+                     shared_from_this());
 }
 
 Result<std::shared_ptr<Table>> HadoopCatalog::UpdateTable(
@@ -249,8 +301,15 @@ Status HadoopCatalog::RenameTable(const TableIdentifier& /*from*/,
 }
 
 Result<std::shared_ptr<Table>> HadoopCatalog::LoadTable(
-    const TableIdentifier& /*identifier*/) {
-  return NotSupported("HadoopCatalog::LoadTable: {}", kStubMessage);
+    const TableIdentifier& identifier) {
+  ICEBERG_RETURN_UNEXPECTED(hadoop::ValidateTableIdentifier(identifier));
+  ICEBERG_ASSIGN_OR_RAISE(auto warehouse, config_.Warehouse());
+  ICEBERG_ASSIGN_OR_RAISE(auto table_dir, hadoop::TableDir(warehouse, identifier));
+
+  HadoopTableOperations ops(file_io_, table_dir);
+  ICEBERG_ASSIGN_OR_RAISE(auto metadata, ops.Refresh());
+  return Table::Make(identifier, std::move(metadata), ops.current_metadata_location(),
+                     file_io_, shared_from_this());
 }
 
 Result<std::shared_ptr<Table>> HadoopCatalog::RegisterTable(
