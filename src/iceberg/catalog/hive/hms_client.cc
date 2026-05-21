@@ -341,47 +341,59 @@ Result<std::unique_ptr<HmsClient>> HmsClient::Connect(
   ICEBERG_ASSIGN_OR_RAISE(auto endpoints, ParseHmsUris(uri));
   ICEBERG_ASSIGN_OR_RAISE(auto transport_mode, config.ThriftTransport());
 
-  // HA failover beyond the first endpoint is left for a later commit.
-  const HmsEndpoint& endpoint = endpoints.front();
   const int connect_timeout_ms = config.Get(HiveCatalogProperties::kConnectTimeoutMs);
   const int socket_timeout_ms = config.Get(HiveCatalogProperties::kSocketTimeoutMs);
 
-  auto socket =
-      std::make_shared<apache::thrift::transport::TSocket>(endpoint.host, endpoint.port);
-  socket->setConnTimeout(connect_timeout_ms);
-  socket->setRecvTimeout(socket_timeout_ms);
-  socket->setSendTimeout(socket_timeout_ms);
+  // HA failover: try every endpoint parsed from a comma-separated URI
+  // list in order. The first one whose `transport->open()` succeeds
+  // wins. If every endpoint fails, surface the LAST error (with the
+  // attempt count baked into the message) so the operator can tell
+  // both how many endpoints we tried and which one died last. Mirrors
+  // Java HiveMetaStoreClient's `metastoreUris` failover.
+  std::string last_error;
+  for (const HmsEndpoint& endpoint : endpoints) {
+    auto socket = std::make_shared<apache::thrift::transport::TSocket>(endpoint.host,
+                                                                       endpoint.port);
+    socket->setConnTimeout(connect_timeout_ms);
+    socket->setRecvTimeout(socket_timeout_ms);
+    socket->setSendTimeout(socket_timeout_ms);
 
-  std::shared_ptr<apache::thrift::transport::TTransport> transport;
-  switch (transport_mode) {
-    case HiveThriftTransport::kBuffered:
-      transport = std::make_shared<apache::thrift::transport::TBufferedTransport>(socket);
-      break;
-    case HiveThriftTransport::kFramed:
-      transport = std::make_shared<apache::thrift::transport::TFramedTransport>(socket);
-      break;
+    std::shared_ptr<apache::thrift::transport::TTransport> transport;
+    switch (transport_mode) {
+      case HiveThriftTransport::kBuffered:
+        transport =
+            std::make_shared<apache::thrift::transport::TBufferedTransport>(socket);
+        break;
+      case HiveThriftTransport::kFramed:
+        transport = std::make_shared<apache::thrift::transport::TFramedTransport>(socket);
+        break;
+    }
+
+    auto protocol =
+        std::make_shared<apache::thrift::protocol::TBinaryProtocol>(transport);
+    auto client =
+        std::make_unique<Apache::Hadoop::Hive::ThriftHiveMetastoreClient>(protocol);
+
+    try {
+      transport->open();
+    } catch (const apache::thrift::transport::TTransportException& e) {
+      last_error = std::format("{}:{} ({})", endpoint.host, endpoint.port, e.what());
+      continue;
+    } catch (const apache::thrift::TException& e) {
+      last_error =
+          std::format("{}:{} (thrift error: {})", endpoint.host, endpoint.port, e.what());
+      continue;
+    }
+
+    auto impl = std::make_unique<HmsClient::Impl>();
+    impl->socket = std::move(socket);
+    impl->transport = std::move(transport);
+    impl->protocol = std::move(protocol);
+    impl->client = std::move(client);
+    return std::unique_ptr<HmsClient>(new HmsClient(std::move(impl)));
   }
-
-  auto protocol = std::make_shared<apache::thrift::protocol::TBinaryProtocol>(transport);
-  auto client =
-      std::make_unique<Apache::Hadoop::Hive::ThriftHiveMetastoreClient>(protocol);
-
-  try {
-    transport->open();
-  } catch (const apache::thrift::transport::TTransportException& e) {
-    return IOError("Failed to connect to HMS at {}:{} : {}", endpoint.host, endpoint.port,
-                   e.what());
-  } catch (const apache::thrift::TException& e) {
-    return IOError("Thrift error contacting HMS at {}:{} : {}", endpoint.host,
-                   endpoint.port, e.what());
-  }
-
-  auto impl = std::make_unique<HmsClient::Impl>();
-  impl->socket = std::move(socket);
-  impl->transport = std::move(transport);
-  impl->protocol = std::move(protocol);
-  impl->client = std::move(client);
-  return std::unique_ptr<HmsClient>(new HmsClient(std::move(impl)));
+  return IOError("Failed to connect to any of {} HMS endpoint(s); last error: {}",
+                 endpoints.size(), last_error);
 }
 
 // ---------------------------------------------------------------------------

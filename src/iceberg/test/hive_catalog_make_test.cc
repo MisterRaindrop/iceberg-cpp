@@ -17,6 +17,7 @@
  * under the License.
  */
 
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
 #include "iceberg/catalog/hive/hive_catalog.h"
@@ -75,6 +76,20 @@ TEST(HiveCatalogMakeTest, AmbiguousIpv6UriIsInvalidArgument) {
       {{std::string(HiveCatalogProperties::kUri.key()), "::1:9083"}}));
   ASSERT_FALSE(catalog.has_value());
   EXPECT_EQ(catalog.error().kind, ErrorKind::kInvalidArgument);
+}
+
+TEST(HiveCatalogMakeTest, HaUriFailoverTriesAllEndpoints) {
+  // Two privileged-and-unbound ports comma-separated: HiveCatalog::Make
+  // should attempt both before surfacing the failure. Pin the error
+  // shape so a future regression that quietly drops failover (e.g., a
+  // revert to `endpoints.front()`-only) cannot pass this test.
+  auto catalog = HiveCatalog::Make(HiveCatalogProperties::FromMap(
+      {{std::string(HiveCatalogProperties::kUri.key()), "127.0.0.1:1,127.0.0.1:2"},
+       {std::string(HiveCatalogProperties::kConnectTimeoutMs.key()), "200"}}));
+  ASSERT_FALSE(catalog.has_value());
+  EXPECT_EQ(catalog.error().kind, ErrorKind::kIOError);
+  EXPECT_THAT(catalog.error().message, testing::HasSubstr("2 HMS endpoint"));
+  EXPECT_THAT(catalog.error().message, testing::HasSubstr("127.0.0.1:2"));
 }
 
 }  // namespace iceberg::hive
