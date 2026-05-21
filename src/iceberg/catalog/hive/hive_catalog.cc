@@ -110,23 +110,58 @@ Status HiveCatalog::CreateNamespace(
   ICEBERG_ASSIGN_OR_RAISE(auto database, ConvertToHiveDatabase(ns, properties));
   // Replay safety: HmsClientPool::Run retries once on transport failure
   // by re-invoking the same lambda. If our first CreateDatabase landed
-  // server-side but the response was lost, the second attempt would see
-  // AlreadyExists for what is actually our own row. The captured
-  // `create_attempted` flag is preserved across both invocations (the
-  // pool holds the same lambda object), so we can distinguish "we just
-  // replayed our own success" from a genuine foreign-namespace collision.
-  return client_pool_->Run(
-      [&, create_attempted = false](HmsClient* client) mutable -> Status {
-        auto status = client->CreateDatabase(database);
-        if (!status.has_value() && create_attempted &&
-            status.error().kind == ErrorKind::kAlreadyExists) {
-          if (client->GetDatabase(ns.levels[0]).has_value()) {
-            return {};  // our previous attempt landed
+  // server-side but the reply was lost, the retry sees `kAlreadyExists`
+  // for what is actually our own row. Distinguish that from a genuine
+  // foreign-namespace collision (potentially created by a concurrent
+  // third party between our two attempts) by comparing every field we
+  // explicitly populated in our request against the row HMS now holds.
+  // A field we left empty is treated as "don't care" (HMS may inject
+  // defaults like a generated location_uri); a field we populated must
+  // match exactly. All caller-provided parameters must be present in
+  // HMS's row with the same value -- extra HMS-internal parameters are
+  // fine.
+  return client_pool_->Run([&, create_attempted =
+                                   false](HmsClient* client) mutable -> Status {
+    auto status = client->CreateDatabase(database);
+    if (!status.has_value() && create_attempted &&
+        status.error().kind == ErrorKind::kAlreadyExists) {
+      auto existing = client->GetDatabase(ns.levels[0]);
+      if (existing.has_value()) {
+        const HiveDatabase& current = *existing;
+        const auto field_matches = [](const std::string& want, const std::string& got) {
+          return want.empty() || want == got;
+        };
+        const bool fields_match =
+            field_matches(database.description, current.description) &&
+            field_matches(database.location_uri, current.location_uri) &&
+            field_matches(database.owner_name, current.owner_name) &&
+            field_matches(database.owner_type, current.owner_type);
+        bool params_match = fields_match;
+        if (params_match) {
+          for (const auto& [key, value] : database.parameters) {
+            auto it = current.parameters.find(key);
+            if (it == current.parameters.end() || it->second != value) {
+              params_match = false;
+              break;
+            }
           }
         }
-        create_attempted = true;
-        return status;
-      });
+        // Refuse to claim success when the caller supplied nothing
+        // distinguishing -- with all-empty fields we cannot prove
+        // the existing row came from our own replayed call rather
+        // than from a third party.
+        const bool we_set_anything =
+            !database.description.empty() || !database.location_uri.empty() ||
+            !database.owner_name.empty() || !database.owner_type.empty() ||
+            !database.parameters.empty();
+        if (params_match && we_set_anything) {
+          return {};
+        }
+      }
+    }
+    create_attempted = true;
+    return status;
+  });
 }
 
 Result<std::vector<Namespace>> HiveCatalog::ListNamespaces(const Namespace& ns) const {
@@ -172,21 +207,28 @@ Result<std::unordered_map<std::string, std::string>> HiveCatalog::GetNamespacePr
 Status HiveCatalog::DropNamespace(const Namespace& ns) {
   ICEBERG_RETURN_UNEXPECTED(ValidateNamespace(ns));
   // Replay safety: HmsClientPool::Run reconnects once and re-invokes
-  // the same lambda on transport failure. If our first DropDatabase
-  // landed server-side but the reply was lost, the retry would see
-  // NoSuchNamespace for what is actually our own success. Mirror
-  // `DropTable`'s attempted-flag recovery so the caller sees success
-  // for "the namespace is gone because we dropped it" instead of a
-  // spurious NoSuchNamespace.
+  // the same lambda on transport failure. Mirror `DropTable`'s
+  // GetDatabase-first pattern: only set `drop_attempted = true` AFTER
+  // confirming the namespace existed at the start of this lambda
+  // invocation. A retry that then sees `kNoSuchNamespace` must be the
+  // post-drop state from our previously-landed call.
+  //
+  // The earlier "set drop_attempted before any RPC" shape was unsafe:
+  // it converted a genuine "namespace never existed" first call (where
+  // the server's `NoSuchNamespace` reply was lost in transit, the pool
+  // saw `kServiceUnavailable` and retried) into a false-positive
+  // success on the retry.
   return client_pool_->Run(
       [&, drop_attempted = false](HmsClient* client) mutable -> Status {
-        auto status = client->DropDatabase(ns.levels[0], /*cascade=*/false);
-        if (!status.has_value() && drop_attempted &&
-            status.error().kind == ErrorKind::kNoSuchNamespace) {
-          return {};  // our previous attempt landed; HMS confirms the after-state
+        auto database = client->GetDatabase(ns.levels[0]);
+        if (!database.has_value()) {
+          if (drop_attempted && database.error().kind == ErrorKind::kNoSuchNamespace) {
+            return {};  // our previous DropDatabase landed; HMS confirms
+          }
+          return std::unexpected(database.error());
         }
         drop_attempted = true;
-        return status;
+        return client->DropDatabase(ns.levels[0], /*cascade=*/false);
       });
 }
 
