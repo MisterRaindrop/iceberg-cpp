@@ -175,6 +175,52 @@ Result<MetadataCompressionCodec> ResolveCommitCodec(const TableMetadata& metadat
   return ParseMetadataCompressionCodec(codec_name);
 }
 
+// Walk <table>/metadata/ and delete the oldest v{N}.metadata.json[.codec]
+// files, keeping the newest `previous_versions_max` plus the current one.
+// Mirrors the outcome of Java's
+// `CatalogUtil.deleteRemovedMetadataFiles` for the HadoopCatalog layout
+// without requiring metadata_log tracking inside HadoopTableOperations.
+void PruneOldMetadataFiles(FileIO& file_io, std::string_view table_dir,
+                           int64_t current_version, int32_t previous_versions_max) {
+  if (previous_versions_max <= 0) {
+    return;
+  }
+  const std::string metadata_dir = MetadataDir(table_dir);
+  auto entries = file_io.ListDir(metadata_dir);
+  if (!entries.has_value()) {
+    return;
+  }
+  std::vector<std::pair<int64_t, std::string>> versioned;
+  versioned.reserve(entries->size());
+  for (const auto& entry : *entries) {
+    if (entry.is_directory) {
+      continue;
+    }
+    std::string_view name = entry.location;
+    auto slash = name.find_last_of('/');
+    if (slash != std::string_view::npos) {
+      name.remove_prefix(slash + 1);
+    }
+    auto parsed = ParseMetadataFileName(name);
+    if (!parsed.has_value()) {
+      continue;
+    }
+    versioned.emplace_back(parsed->version, entry.location);
+  }
+  // Sort by version ascending; we keep the newest `previous_versions_max`.
+  std::ranges::sort(versioned,
+                    [](const auto& a, const auto& b) { return a.first < b.first; });
+  // Always retain the current version and the previous_versions_max files
+  // immediately below it. Anything older is fair game.
+  const int64_t cutoff_version = current_version - previous_versions_max;
+  for (const auto& [version, path] : versioned) {
+    if (version >= cutoff_version || version == current_version) {
+      continue;
+    }
+    std::ignore = file_io.DeleteFile(path);
+  }
+}
+
 // Serialise + (optionally) compress `metadata` and write it to `location` via
 // FileIO. Mirrors the behaviour the Java HadoopTableOperations achieves via
 // TableMetadataParser.Codec.
@@ -324,6 +370,19 @@ Status HadoopTableOperations::Commit(const TableMetadata& base,
 
   current_location_ = target;
   current_version_ = next_version;
+
+  // (9.5) Commit-time stale metadata cleanup, honouring the Java table
+  // properties `write.metadata.delete-after-commit.enabled` (default false)
+  // and `write.metadata.previous-versions-max` (default 100). Errors are
+  // swallowed because the commit itself already succeeded -- losing a
+  // GC pass is recoverable; failing the commit is not.
+  const bool delete_after_commit =
+      updated.properties.Get(TableProperties::kMetadataDeleteAfterCommitEnabled);
+  if (delete_after_commit) {
+    const int32_t previous_versions_max =
+        updated.properties.Get(TableProperties::kMetadataPreviousVersionsMax);
+    PruneOldMetadataFiles(*file_io_, table_dir_, next_version, previous_versions_max);
+  }
   // (10) Lock is released by `guard` at scope exit.
   return {};
 }

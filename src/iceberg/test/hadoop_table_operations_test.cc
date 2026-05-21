@@ -294,6 +294,43 @@ TEST_F(HadoopCommitTest, CommitHonoursGzipCodec) {
   EXPECT_EQ(fresh.current_version(), 2);
 }
 
+TEST_F(HadoopCommitTest, DeleteAfterCommitPrunesOldMetadata) {
+  const std::string body = SlurpResource("TableMetadataV1Valid.json");
+  SeedMetadataFile(1, MetadataCompressionCodec::kNone, body);
+  SeedVersionHint("1");
+
+  HadoopTableOperations ops(file_io_, table_dir_, lock_manager_, "owner");
+  ICEBERG_UNWRAP_OR_FAIL(auto base, ops.Refresh());
+  TableMetadata updated = *base;
+  // Keep only one previous version on top of the current one.
+  updated.properties.Set(TableProperties::kMetadataPreviousVersionsMax, int32_t{1});
+  updated.properties.Set(TableProperties::kMetadataDeleteAfterCommitEnabled, true);
+
+  // Commit a few times so multiple old files accumulate.
+  for (int i = 0; i < 4; ++i) {
+    ICEBERG_UNWRAP_OR_FAIL(auto reloaded, ops.Refresh());
+    TableMetadata next = *reloaded;
+    next.properties = updated.properties;
+    ASSERT_TRUE(ops.Commit(*reloaded, next).has_value()) << "round " << i;
+  }
+  // After commits, version-hint should point at v5, and only v5 + 1 older
+  // copy (v4) should remain.
+  EXPECT_EQ(ops.current_version(), 5);
+  ICEBERG_UNWRAP_OR_FAIL(auto entries, file_io_->ListDir(MetadataDir(table_dir_)));
+  int versioned = 0;
+  for (const auto& entry : entries) {
+    std::string_view name = entry.location;
+    auto slash = name.find_last_of('/');
+    if (slash != std::string_view::npos) {
+      name.remove_prefix(slash + 1);
+    }
+    if (ParseMetadataFileName(name).has_value()) {
+      ++versioned;
+    }
+  }
+  EXPECT_LE(versioned, 2);
+}
+
 TEST_F(HadoopCommitTest, ConcurrentCommitsConvergeWithRetries) {
   // Seed v1.
   const std::string body = SlurpResource("TableMetadataV1Valid.json");
