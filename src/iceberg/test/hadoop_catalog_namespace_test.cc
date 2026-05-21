@@ -25,6 +25,7 @@
 #include <gtest/gtest.h>
 
 #include "iceberg/arrow/arrow_io_internal.h"
+#include "iceberg/arrow/arrow_io_register.h"
 #include "iceberg/catalog/hadoop/hadoop_catalog.h"
 #include "iceberg/catalog/hadoop/hadoop_catalog_properties.h"
 #include "iceberg/catalog/hadoop/hadoop_file_layout.h"
@@ -176,6 +177,37 @@ TEST_F(HadoopCatalogNamespaceTest, GetNamespacePropertiesRejectsMissing) {
   auto res = catalog_->GetNamespaceProperties(Namespace{.levels = {"missing"}});
   ASSERT_FALSE(res.has_value());
   EXPECT_EQ(ErrorKind::kNoSuchNamespace, res.error().kind);
+}
+
+TEST_F(HadoopCatalogNamespaceTest, MakeWithoutExplicitFileIORoutesByScheme) {
+  // The bundle's static initialiser registers arrow-fs-local / arrow-fs-s3
+  // (and arrow-fs-hdfs when enabled). Call the entry point explicitly so we
+  // don't depend on linker dead-stripping behaviour for the kArrowFileIOs
+  // static init in this test translation unit.
+  iceberg::arrow::EnsureArrowFileIOsRegistered();
+
+  // file:// warehouse must succeed without passing a FileIO.
+  auto props = HadoopCatalogProperties::FromMap({
+      {"warehouse", warehouse_},
+      {"name", "auto"},
+  });
+  auto cat = HadoopCatalog::Make("auto", std::move(props));
+  ASSERT_TRUE(cat.has_value()) << cat.error().message;
+
+  // hdfs:// warehouse should fail cleanly when ICEBERG_HDFS=OFF: the
+  // FileIORegistry has no `arrow-fs-hdfs` entry to load.
+  auto hdfs_props = HadoopCatalogProperties::FromMap({
+      {"warehouse", "hdfs://nn:8020/wh"},
+      {"name", "hdfs-test"},
+  });
+  auto hdfs_cat = HadoopCatalog::Make("hdfs-test", std::move(hdfs_props));
+#if ICEBERG_HDFS_ENABLED
+  // When HDFS is built in, construction succeeds; we don't actually talk to
+  // a namenode here.
+  EXPECT_TRUE(hdfs_cat.has_value() || hdfs_cat.error().kind == ErrorKind::kIOError);
+#else
+  EXPECT_FALSE(hdfs_cat.has_value());
+#endif
 }
 
 TEST_F(HadoopCatalogNamespaceTest, UpdateNamespacePropertiesIsNotSupported) {

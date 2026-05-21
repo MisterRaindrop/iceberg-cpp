@@ -73,6 +73,23 @@ class ICEBERG_HADOOP_EXPORT HadoopCatalog
                                                      std::shared_ptr<FileIO> file_io,
                                                      HadoopCatalogProperties config);
 
+  /// \brief Convenience overload that auto-detects the FileIO from the
+  /// warehouse scheme.
+  ///
+  /// Mapping:
+  /// - `file://` (or no scheme) -> `arrow-fs-local`
+  /// - `s3://` / `s3a://` / `s3n://` -> `arrow-fs-s3` (when ICEBERG_S3=ON)
+  /// - `hdfs://` -> `arrow-fs-hdfs` (when ICEBERG_HDFS=ON); HDFS-specific
+  ///   properties (`fs.defaultFS`, `hadoop.*`, `dfs.*`) are forwarded into
+  ///   the underlying FileIO so Kerberos / HA config configured on the
+  ///   catalog also reaches libhdfs.
+  ///
+  /// Returns `kInvalidArgument` when the requested scheme requires a build
+  /// flag that is currently off (e.g. asking for hdfs:// with
+  /// ICEBERG_HDFS=OFF).
+  static Result<std::shared_ptr<HadoopCatalog>> Make(std::string_view name,
+                                                     HadoopCatalogProperties config);
+
   std::string_view name() const override;
 
   // -- Catalog interface (stubs in H02; implemented in subsequent commits). --

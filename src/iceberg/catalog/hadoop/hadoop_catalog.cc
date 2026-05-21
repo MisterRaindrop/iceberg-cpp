@@ -26,6 +26,7 @@
 #include "iceberg/catalog/hadoop/hadoop_file_layout.h"
 #include "iceberg/catalog/hadoop/hadoop_table_operations.h"
 #include "iceberg/file_io.h"
+#include "iceberg/file_io_registry.h"
 #include "iceberg/table.h"
 #include "iceberg/table_metadata.h"
 #include "iceberg/table_requirements.h"
@@ -73,6 +74,31 @@ Result<std::shared_ptr<HadoopCatalog>> HadoopCatalog::Make(
   return std::shared_ptr<HadoopCatalog>(
       new HadoopCatalog(std::string(name), std::move(file_io), std::move(config),
                         std::shared_ptr<LockManager>(std::move(lock_manager))));
+}
+
+Result<std::shared_ptr<HadoopCatalog>> HadoopCatalog::Make(
+    std::string_view name, HadoopCatalogProperties config) {
+  ICEBERG_ASSIGN_OR_RAISE(auto warehouse, config.Warehouse());
+
+  // Select the FileIO factory keyed by warehouse scheme. The
+  // FileIORegistry has the right entries pre-registered (arrow-fs-local,
+  // arrow-fs-s3, arrow-fs-hdfs); we only need to pick a name.
+  std::string io_name(FileIORegistry::kArrowLocalFileIO);
+  if (warehouse.starts_with("hdfs://")) {
+    io_name = std::string(FileIORegistry::kArrowHdfsFileIO);
+  } else if (warehouse.starts_with("s3://") || warehouse.starts_with("s3a://") ||
+             warehouse.starts_with("s3n://")) {
+    io_name = std::string(FileIORegistry::kArrowS3FileIO);
+  }
+
+  // Allow an explicit override.
+  const auto override_impl = config.Get(HadoopCatalogProperties::kIOImpl);
+  if (!override_impl.empty()) {
+    io_name = override_impl;
+  }
+
+  ICEBERG_ASSIGN_OR_RAISE(auto file_io, FileIORegistry::Load(io_name, config.configs()));
+  return Make(name, std::shared_ptr<FileIO>(std::move(file_io)), std::move(config));
 }
 
 HadoopCatalog::HadoopCatalog(std::string name, std::shared_ptr<FileIO> file_io,
