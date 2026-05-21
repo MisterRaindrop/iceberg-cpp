@@ -92,7 +92,16 @@ class ICEBERG_HIVE_EXPORT HmsClientPool {
       // Drop the broken connection without returning it to the idle queue.
       auto fresh = Reconnect(std::move(client));
       if (!fresh.has_value()) {
-        return std::unexpected(fresh.error());
+        // Preserve the indeterminacy of the first attempt. `Reconnect`'s
+        // own failure surfaces from `HmsClient::Connect` as `kIOError`,
+        // but the *original* RPC was already a transport failure --
+        // the server may have processed the mutation before the socket
+        // died. Re-tag as `kServiceUnavailable` so write-class callers
+        // (CreateTable, AlterTable cleanup, ...) keep treating the
+        // outcome as undefined and do NOT delete the freshly-written
+        // metadata file on top of a possibly-landed commit.
+        return ServiceUnavailable("HMS transport failed and reconnect also failed: {}",
+                                  fresh.error().message);
       }
       client = std::move(*fresh);
       result = fn(client.get());
