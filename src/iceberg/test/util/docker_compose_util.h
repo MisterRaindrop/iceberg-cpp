@@ -48,6 +48,11 @@ class DockerCompose {
 
   /// \brief Executes 'docker-compose up' to start services.
   /// \note May throw an exception if the services fail to start.
+  /// \note Records that an `up` was attempted so that the destructor
+  ///       only invokes `Down()` for stacks that we actually tried to
+  ///       bring up. This lets `SetUpTestSuite` catch a failed `Up()`
+  ///       and `GTEST_SKIP()` without leaking a `docker compose down`
+  ///       exception out of the destructor.
   void Up();
 
   /// \brief Executes 'docker-compose down' to stop and remove services.
@@ -57,6 +62,7 @@ class DockerCompose {
  private:
   std::string project_name_;
   std::filesystem::path docker_compose_dir_;
+  bool up_attempted_ = false;
 
   /// \brief Build a docker compose Command with proper environment.
   /// \param args Additional command line arguments.

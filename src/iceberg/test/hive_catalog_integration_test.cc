@@ -30,6 +30,8 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <exception>
+#include <format>
 #include <memory>
 #include <string>
 #include <thread>
@@ -99,14 +101,36 @@ class HiveCatalogIntegrationTest : public ::testing::Test {
     docker_ = std::make_unique<DockerCompose>(
         std::string(kDockerProjectName),
         std::filesystem::path(GetResourcePath("iceberg-hive-fixture")));
-    docker_->Up();
-    ASSERT_TRUE(WaitForPort(kHmsPort)) << "HMS did not come up on port " << kHmsPort;
+    try {
+      docker_->Up();
+    } catch (const std::exception& e) {
+      // Docker is not available (daemon down, no socket permission,
+      // missing image, ...). The doc-comment at the top of this file
+      // promises the suite will skip rather than fail, so honor that
+      // contract by tearing down the half-initialised state and
+      // skipping every test in the suite.
+      docker_.reset();
+      skip_reason_ = std::format("docker compose up failed: {}", e.what());
+      GTEST_SKIP() << skip_reason_;
+    }
+    if (!WaitForPort(kHmsPort)) {
+      skip_reason_ =
+          std::format("HMS did not come up on port {} within timeout", kHmsPort);
+      GTEST_SKIP() << skip_reason_;
+    }
   }
 
   static void TearDownTestSuite() {
     if (docker_) {
-      docker_->Down();
-      docker_.reset();
+      docker_.reset();  // destructor swallows down-failures
+    }
+  }
+
+  void SetUp() override {
+    // SetUpTestSuite's GTEST_SKIP only stops the suite-setup phase; each
+    // individual test still runs unless we re-skip here.
+    if (!skip_reason_.empty()) {
+      GTEST_SKIP() << skip_reason_;
     }
   }
 
@@ -121,9 +145,11 @@ class HiveCatalogIntegrationTest : public ::testing::Test {
 
  private:
   static std::unique_ptr<DockerCompose> docker_;
+  static std::string skip_reason_;
 };
 
 std::unique_ptr<DockerCompose> HiveCatalogIntegrationTest::docker_;  // definition
+std::string HiveCatalogIntegrationTest::skip_reason_;                // definition
 
 TEST_F(HiveCatalogIntegrationTest, CatalogCanConnect) {
   auto catalog = HiveCatalog::Make(MakeProperties("arrow-fs-local"));

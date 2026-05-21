@@ -28,9 +28,25 @@ DockerCompose::DockerCompose(std::string project_name,
     : project_name_(std::move(project_name)),
       docker_compose_dir_(std::move(docker_compose_dir)) {}
 
-DockerCompose::~DockerCompose() { Down(); }
+DockerCompose::~DockerCompose() {
+  if (!up_attempted_) {
+    // Never attempted to bring the stack up (or `Up()` itself threw
+    // before recording the attempt). Skip `Down()` entirely so the
+    // destructor cannot throw on top of a Docker-unavailable error
+    // that the caller may have already handled via `GTEST_SKIP`.
+    return;
+  }
+  try {
+    Down();
+  } catch (...) {
+    // Swallow: a destructor must not throw. Any teardown failure is
+    // already visible from the `docker compose` stderr printed by
+    // `Command::RunCommand`.
+  }
+}
 
 void DockerCompose::Up() {
+  up_attempted_ = true;
   auto cmd = BuildDockerCommand({"up", "-d", "--wait", "--timeout", "60"});
   return cmd.RunCommand("docker compose up");
 }
