@@ -264,10 +264,47 @@ Result<std::shared_ptr<Table>> HiveCatalog::CreateTable(
   // Only now write the file; if CreateTable in HMS fails we still need
   // to roll back the file we just wrote.
   ICEBERG_RETURN_UNEXPECTED(file_io_->WriteFile(metadata_location, json_str));
-  auto create_status = client_pool_->Run(
-      [&](HmsClient* client) { return client->CreateTable(hive_table); });
+
+  // CheckCommitStatus-style recovery for CreateTable: when HMS reports a
+  // failure we cannot blindly delete `metadata_location`, because the
+  // pool may have retried after a lost Thrift response on a server-side
+  // success. The retry would then observe `AlreadyExistsException`
+  // (`kAlreadyExists`) -- which is indistinguishable at the wire level
+  // from "someone else created a table with this name". Disambiguate by
+  // re-reading HMS and comparing `metadata_location`:
+  //   * `kAlreadyExists` AND HMS row points at our file -> our own row
+  //     recovered after a lost reply; treat as success.
+  //   * `kAlreadyExists` AND HMS row points elsewhere -> genuine name
+  //     collision with a foreign table; cleanup our orphan file.
+  //   * Any other failure with a definitive error kind (e.g. invalid
+  //     args, namespace missing) -> cleanup.
+  //   * `kCommitStateUnknown` / `kServiceUnavailable` -> outcome
+  //     genuinely indeterminate; leave the file in place so we do not
+  //     orphan a possibly-live HMS table.
+  auto create_status =
+      client_pool_->Run([&](HmsClient* client) -> Result<bool /*recovered*/> {
+        auto create = client->CreateTable(hive_table);
+        if (create.has_value()) {
+          return false;
+        }
+        if (create.error().kind == ErrorKind::kAlreadyExists) {
+          auto existing = client->GetTable(identifier.ns.levels[0], identifier.name);
+          if (existing.has_value()) {
+            auto loc = GetMetadataLocation(existing->parameters);
+            if (loc.has_value() && *loc == metadata_location) {
+              return true;  // our row, response was lost on first try
+            }
+          }
+        }
+        return std::unexpected(create.error());
+      });
+
   if (!create_status.has_value()) {
-    (void)file_io_->DeleteFile(metadata_location);
+    const auto kind = create_status.error().kind;
+    if (kind != ErrorKind::kCommitStateUnknown &&
+        kind != ErrorKind::kServiceUnavailable) {
+      (void)file_io_->DeleteFile(metadata_location);
+    }
     return std::unexpected(create_status.error());
   }
 

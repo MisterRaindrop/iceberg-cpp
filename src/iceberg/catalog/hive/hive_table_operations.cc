@@ -25,7 +25,6 @@
 
 #include <nlohmann/json.hpp>
 
-#include "iceberg/catalog/hive/hive_errors.h"
 #include "iceberg/catalog/hive/hive_schema.h"
 #include "iceberg/catalog/hive/hive_utils.h"
 #include "iceberg/catalog/hive/hms_client.h"
