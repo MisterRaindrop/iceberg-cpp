@@ -40,6 +40,11 @@ CMAKE_ARGS=(
     "-DICEBERG_BUILD_STATIC=ON"
     "-DICEBERG_BUILD_SHARED=ON"
     "-DICEBERG_BUILD_REST_INTEGRATION_TESTS=${build_rest_integration_test}"
+    # ICEBERG_BUILD_HADOOP defaults to ON, so the hadoop catalog library and
+    # its tests are exercised by the default CI invocation here. No extra
+    # flag is required. ICEBERG_HDFS stays OFF: enabling it would require a
+    # JVM + libhdfs available on the runner and is reserved for the nightly
+    # HDFS workflow.
 )
 
 if [[ "${build_enable_s3}" == "ON" ]]; then
