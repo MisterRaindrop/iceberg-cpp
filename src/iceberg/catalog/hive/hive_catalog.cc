@@ -108,8 +108,25 @@ std::string_view HiveCatalog::name() const { return name_; }
 Status HiveCatalog::CreateNamespace(
     const Namespace& ns, const std::unordered_map<std::string, std::string>& properties) {
   ICEBERG_ASSIGN_OR_RAISE(auto database, ConvertToHiveDatabase(ns, properties));
+  // Replay safety: HmsClientPool::Run retries once on transport failure
+  // by re-invoking the same lambda. If our first CreateDatabase landed
+  // server-side but the response was lost, the second attempt would see
+  // AlreadyExists for what is actually our own row. The captured
+  // `create_attempted` flag is preserved across both invocations (the
+  // pool holds the same lambda object), so we can distinguish "we just
+  // replayed our own success" from a genuine foreign-namespace collision.
   return client_pool_->Run(
-      [&](HmsClient* client) { return client->CreateDatabase(database); });
+      [&, create_attempted = false](HmsClient* client) mutable -> Status {
+        auto status = client->CreateDatabase(database);
+        if (!status.has_value() && create_attempted &&
+            status.error().kind == ErrorKind::kAlreadyExists) {
+          if (client->GetDatabase(ns.levels[0]).has_value()) {
+            return {};  // our previous attempt landed
+          }
+        }
+        create_attempted = true;
+        return status;
+      });
 }
 
 Result<std::vector<Namespace>> HiveCatalog::ListNamespaces(const Namespace& ns) const {
@@ -427,11 +444,22 @@ Status HiveCatalog::DropTable(const TableIdentifier& identifier, bool purge) {
   // Refuse to drop a row that does not carry the Iceberg marker; the user's
   // identifier may collide with a native Hive table that the catalog should
   // not be allowed to delete. Read-then-delete on the same pooled client to
-  // close the obvious TOCTOU window.
-  return client_pool_->Run([&](HmsClient* client) -> Status {
-    ICEBERG_ASSIGN_OR_RAISE(auto table,
-                            client->GetTable(identifier.ns.levels[0], identifier.name));
-    ICEBERG_RETURN_UNEXPECTED(ValidateIcebergTable(identifier, table.parameters));
+  // close the obvious TOCTOU window. The captured `drop_attempted` flag
+  // survives a pool-level reconnect retry; once we have committed to the
+  // DropTable RPC, a subsequent NoSuchTable means our first attempt
+  // landed despite the lost response -- mirror Java's `checkCommitStatus`
+  // and surface success rather than misleading the user with NoSuchTable.
+  return client_pool_->Run([&,
+                            drop_attempted = false](HmsClient* client) mutable -> Status {
+    auto table = client->GetTable(identifier.ns.levels[0], identifier.name);
+    if (!table.has_value()) {
+      if (drop_attempted && table.error().kind == ErrorKind::kNoSuchTable) {
+        return {};  // previous DropTable landed; HMS confirms the after-state
+      }
+      return std::unexpected(table.error());
+    }
+    ICEBERG_RETURN_UNEXPECTED(ValidateIcebergTable(identifier, table.value().parameters));
+    drop_attempted = true;
     return client->DropTable(identifier.ns.levels[0], identifier.name,
                              /*delete_data=*/false);
   });
@@ -443,13 +471,32 @@ Status HiveCatalog::RenameTable(const TableIdentifier& from, const TableIdentifi
   ICEBERG_RETURN_UNEXPECTED(from.Validate());
   ICEBERG_RETURN_UNEXPECTED(to.Validate());
 
-  return client_pool_->Run([&](HmsClient* client) -> Status {
-    ICEBERG_ASSIGN_OR_RAISE(auto table, client->GetTable(from.ns.levels[0], from.name));
-    ICEBERG_RETURN_UNEXPECTED(ValidateIcebergTable(from, table.parameters));
-    table.db_name = to.ns.levels[0];
-    table.table_name = to.name;
-    return client->AlterTable(from.ns.levels[0], from.name, table);
-  });
+  // Replay safety: a transport failure between the AlterTable RPC and
+  // its reply leaves the rename committed but the pool reconnects and
+  // re-runs the lambda. The replay sees the source row gone and would
+  // otherwise return NoSuchTable. The captured `rename_attempted` flag
+  // lets us recognise that branch, look up the target row, and report
+  // success when HMS confirms the rename landed.
+  return client_pool_->Run(
+      [&, rename_attempted = false](HmsClient* client) mutable -> Status {
+        auto from_or_error = client->GetTable(from.ns.levels[0], from.name);
+        if (!from_or_error.has_value()) {
+          if (rename_attempted && from_or_error.error().kind == ErrorKind::kNoSuchTable) {
+            auto to_or_error = client->GetTable(to.ns.levels[0], to.name);
+            if (to_or_error.has_value() &&
+                ValidateIcebergTable(to, to_or_error->parameters).has_value()) {
+              return {};
+            }
+          }
+          return std::unexpected(from_or_error.error());
+        }
+        ICEBERG_RETURN_UNEXPECTED(ValidateIcebergTable(from, from_or_error->parameters));
+        auto& table = from_or_error.value();
+        table.db_name = to.ns.levels[0];
+        table.table_name = to.name;
+        rename_attempted = true;
+        return client->AlterTable(from.ns.levels[0], from.name, table);
+      });
 }
 
 Result<std::shared_ptr<Table>> HiveCatalog::LoadTable(const TableIdentifier& identifier) {
@@ -498,8 +545,30 @@ Result<std::shared_ptr<Table>> HiveCatalog::RegisterTable(
       auto hive_table,
       ConvertToHiveTable(identifier, columns, metadata_file_location, location,
                          /*table_properties=*/{}));
+  // Replay safety: unlike CreateTable's recovery (which can rely on the
+  // freshly-allocated `metadata_location` being unique to this call),
+  // RegisterTable's `metadata_file_location` is supplied by the caller
+  // and may already exist elsewhere. We therefore gate the recovery on
+  // `create_attempted` so a concurrent third party that registered the
+  // same file first still surfaces as a real `kAlreadyExists` failure
+  // on the first attempt, while a pool-level retry over our own
+  // server-side success is treated idempotently.
   ICEBERG_RETURN_UNEXPECTED(client_pool_->Run(
-      [&](HmsClient* client) { return client->CreateTable(hive_table); }));
+      [&, create_attempted = false](HmsClient* client) mutable -> Status {
+        auto create = client->CreateTable(hive_table);
+        if (!create.has_value() && create_attempted &&
+            create.error().kind == ErrorKind::kAlreadyExists) {
+          auto existing = client->GetTable(identifier.ns.levels[0], identifier.name);
+          if (existing.has_value()) {
+            auto loc = GetMetadataLocation(existing->parameters);
+            if (loc.has_value() && *loc == metadata_file_location) {
+              return {};  // our previous register landed despite the lost reply
+            }
+          }
+        }
+        create_attempted = true;
+        return create;
+      }));
 
   return Table::Make(identifier, std::shared_ptr<TableMetadata>(metadata.release()),
                      metadata_file_location, file_io_, shared_from_this());
