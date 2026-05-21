@@ -289,6 +289,12 @@ class ICEBERG_HIVE_EXPORT HmsLockHeartbeat {
   std::unique_ptr<Impl> impl_;
 
   explicit HmsLockHeartbeat(std::unique_ptr<Impl> impl);
+
+  // Test-only factory in hms_client.cc that bypasses
+  // `HmsClient::Connect`; friended here for access to the private
+  // `Impl` + constructor.
+  friend std::unique_ptr<HmsLockHeartbeat> HmsLockHeartbeatForTesting(
+      std::unique_ptr<HmsClient> client, int64_t lock_id, int32_t interval_ms);
 };
 
 }  // namespace iceberg::hive

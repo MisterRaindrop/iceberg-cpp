@@ -28,6 +28,7 @@ class ThriftHiveMetastoreIf;
 namespace iceberg::hive {
 
 class HmsClient;
+class HmsLockHeartbeat;
 
 /// \brief Test-only seam: build an `HmsClient` whose underlying
 ///        thrift backend is a caller-supplied fake.
@@ -42,5 +43,12 @@ class HmsClient;
 /// the broader iceberg_hive public surface keeps no Thrift includes.
 std::unique_ptr<HmsClient> HmsClientForTesting(
     std::unique_ptr<Apache::Hadoop::Hive::ThriftHiveMetastoreIf> client);
+
+/// \brief Test-only seam: spawn a heartbeat thread against a
+///        caller-supplied `HmsClient` instead of opening a real
+///        Thrift connection via `HmsClient::Connect`. The returned
+///        heartbeat owns its worker thread; the destructor joins it.
+std::unique_ptr<HmsLockHeartbeat> HmsLockHeartbeatForTesting(
+    std::unique_ptr<HmsClient> client, int64_t lock_id, int32_t interval_ms);
 
 }  // namespace iceberg::hive

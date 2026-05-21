@@ -857,6 +857,23 @@ Result<std::unique_ptr<HmsLockHeartbeat>> HmsLockHeartbeat::Start(
   return heartbeat;
 }
 
+// Test-only entry point: build a heartbeat from a caller-supplied
+// HmsClient instead of constructing one via `HmsClient::Connect`.
+// This is what `hms_client_replay_test` calls to substitute a fake
+// ThriftHiveMetastoreIf. Friend-declared in hms_client.h so it can
+// reach the private `Impl` and constructor.
+std::unique_ptr<HmsLockHeartbeat> HmsLockHeartbeatForTesting(
+    std::unique_ptr<HmsClient> client, int64_t lock_id, int32_t interval_ms) {
+  auto impl = std::make_unique<HmsLockHeartbeat::Impl>();
+  impl->client = std::move(client);
+  impl->lock_id = lock_id;
+  impl->interval_ms = interval_ms;
+  std::unique_ptr<HmsLockHeartbeat> heartbeat(new HmsLockHeartbeat(std::move(impl)));
+  auto* impl_ptr = heartbeat->impl_.get();
+  impl_ptr->worker = std::thread([impl_ptr] { impl_ptr->Run(); });
+  return heartbeat;
+}
+
 void HmsLockHeartbeat::Stop() {
   if (!impl_) {
     return;
