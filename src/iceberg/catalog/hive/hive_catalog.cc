@@ -26,6 +26,7 @@
 #include <utility>
 #include <vector>
 
+#include "iceberg/catalog/hive/hive_errors.h"
 #include "iceberg/catalog/hive/hive_table_operations.h"
 #include "iceberg/catalog/hive/hive_utils.h"
 #include "iceberg/catalog/hive/hms_client.h"
@@ -123,20 +124,28 @@ Status HiveCatalog::CreateNamespace(
   // `iceberg::Transaction` (when present) will stop retrying. A first-
   // attempt `kAlreadyExists` (no replay involved) still propagates
   // verbatim because it is unambiguously a foreign-row collision.
-  return client_pool_->Run(
-      [&, create_attempted = false](HmsClient* client) mutable -> Status {
-        auto status = client->CreateDatabase(database);
-        if (!status.has_value() && create_attempted &&
-            status.error().kind == ErrorKind::kAlreadyExists) {
-          return CommitStateUnknown(
-              "HMS CreateDatabase for namespace '{}' hit AlreadyExists on retry "
-              "after a transport failure; cannot prove whether our first "
-              "attempt landed or a concurrent writer created the same name.",
-              ns.levels[0]);
-        }
-        create_attempted = true;
-        return status;
-      });
+  //
+  // Then wrap the whole `Run()` so a `kServiceUnavailable` escaping
+  // the pool (reconnect-failed or second-attempt-also-transport-fail)
+  // does not invite the caller to retry with a fresh lambda whose
+  // `create_attempted` would be reset to false -- that would defeat
+  // the inner recovery and silently double-create.
+  return CommitStateUnknownOnTransportFailure(
+      client_pool_->Run(
+          [&, create_attempted = false](HmsClient* client) mutable -> Status {
+            auto status = client->CreateDatabase(database);
+            if (!status.has_value() && create_attempted &&
+                status.error().kind == ErrorKind::kAlreadyExists) {
+              return CommitStateUnknown(
+                  "HMS CreateDatabase for namespace '{}' hit AlreadyExists on retry "
+                  "after a transport failure; cannot prove whether our first "
+                  "attempt landed or a concurrent writer created the same name.",
+                  ns.levels[0]);
+            }
+            create_attempted = true;
+            return status;
+          }),
+      "HiveCatalog::CreateNamespace");
 }
 
 Result<std::vector<Namespace>> HiveCatalog::ListNamespaces(const Namespace& ns) const {
@@ -193,8 +202,8 @@ Status HiveCatalog::DropNamespace(const Namespace& ns) {
   // the server's `NoSuchNamespace` reply was lost in transit, the pool
   // saw `kServiceUnavailable` and retried) into a false-positive
   // success on the retry.
-  return client_pool_->Run(
-      [&, drop_attempted = false](HmsClient* client) mutable -> Status {
+  return CommitStateUnknownOnTransportFailure(
+      client_pool_->Run([&, drop_attempted = false](HmsClient* client) mutable -> Status {
         auto database = client->GetDatabase(ns.levels[0]);
         if (!database.has_value()) {
           if (drop_attempted && database.error().kind == ErrorKind::kNoSuchNamespace) {
@@ -204,7 +213,8 @@ Status HiveCatalog::DropNamespace(const Namespace& ns) {
         }
         drop_attempted = true;
         return client->DropDatabase(ns.levels[0], /*cascade=*/false);
-      });
+      }),
+      "HiveCatalog::DropNamespace");
 }
 
 Result<bool> HiveCatalog::NamespaceExists(const Namespace& ns) const {
@@ -228,19 +238,21 @@ Status HiveCatalog::UpdateNamespaceProperties(
   // Read-modify-write on the same pooled client so a concurrent writer
   // cannot squeeze in between the GetDatabase and AlterDatabase calls
   // observed via different sockets.
-  return client_pool_->Run([&](HmsClient* client) -> Status {
-    ICEBERG_ASSIGN_OR_RAISE(auto database, client->GetDatabase(ns.levels[0]));
-    auto namespace_view = ConvertFromHiveDatabase(database);
-    auto& properties = namespace_view.properties;
-    for (const auto& key : removals) {
-      properties.erase(key);
-    }
-    for (const auto& [key, value] : updates) {
-      properties[key] = value;
-    }
-    ICEBERG_ASSIGN_OR_RAISE(auto altered, ConvertToHiveDatabase(ns, properties));
-    return client->AlterDatabase(ns.levels[0], altered);
-  });
+  return CommitStateUnknownOnTransportFailure(
+      client_pool_->Run([&](HmsClient* client) -> Status {
+        ICEBERG_ASSIGN_OR_RAISE(auto database, client->GetDatabase(ns.levels[0]));
+        auto namespace_view = ConvertFromHiveDatabase(database);
+        auto& properties = namespace_view.properties;
+        for (const auto& key : removals) {
+          properties.erase(key);
+        }
+        for (const auto& [key, value] : updates) {
+          properties[key] = value;
+        }
+        ICEBERG_ASSIGN_OR_RAISE(auto altered, ConvertToHiveDatabase(ns, properties));
+        return client->AlterDatabase(ns.levels[0], altered);
+      }),
+      "HiveCatalog::UpdateNamespaceProperties");
 }
 
 Result<std::vector<TableIdentifier>> HiveCatalog::ListTables(const Namespace& ns) const {
@@ -359,10 +371,21 @@ Result<std::shared_ptr<Table>> HiveCatalog::CreateTable(
         return std::unexpected(create.error());
       });
 
+  // Re-tag a `kServiceUnavailable` escape from the pool as
+  // `kCommitStateUnknown` so the caller does not retry CreateTable
+  // with a fresh metadata.json (new UUID) on top of a first attempt
+  // that may have already landed. The retry would fail to recognise
+  // the existing HMS row as ours -- its `metadata_location` parameter
+  // would still point at the first attempt's file, not the second's.
+  create_status = CommitStateUnknownOnTransportFailure(std::move(create_status),
+                                                       "HiveCatalog::CreateTable");
+
   if (!create_status.has_value()) {
     const auto kind = create_status.error().kind;
-    if (kind != ErrorKind::kCommitStateUnknown &&
-        kind != ErrorKind::kServiceUnavailable) {
+    // Only clean up the orphan metadata.json when we are CERTAIN the
+    // commit did not land. `kCommitStateUnknown` means HMS may still
+    // reference the file.
+    if (kind != ErrorKind::kCommitStateUnknown) {
       (void)file_io_->DeleteFile(metadata_location);
     }
     return std::unexpected(create_status.error());
@@ -391,39 +414,47 @@ Result<std::shared_ptr<Table>> HiveCatalog::UpdateTable(
       .heartbeat_interval_ms =
           config_.Get(HiveCatalogProperties::kLockHeartbeatIntervalMs),
   };
-  return client_pool_->Run([&](HmsClient* client) -> Result<std::shared_ptr<Table>> {
-    HiveTableOperations ops(
-        client, file_io_, identifier, lock_enabled, lock_options,
-        lock_enabled ? std::optional<HiveCatalogProperties>{config_} : std::nullopt);
-    ICEBERG_ASSIGN_OR_RAISE(auto base, ops.Refresh());
+  // Wrap the whole pool call so a `kServiceUnavailable` escape (whose
+  // first attempt may have already landed the AlterTable) does not
+  // trigger an `iceberg::Transaction` retry on top of a committed
+  // base. `kCommitStateUnknown` instructs Transaction to stop.
+  return CommitStateUnknownOnTransportFailure(
+      client_pool_->Run([&](HmsClient* client) -> Result<std::shared_ptr<Table>> {
+        HiveTableOperations ops(
+            client, file_io_, identifier, lock_enabled, lock_options,
+            lock_enabled ? std::optional<HiveCatalogProperties>{config_} : std::nullopt);
+        ICEBERG_ASSIGN_OR_RAISE(auto base, ops.Refresh());
 
-    // Validate requirements against the current metadata before mutating.
-    for (const auto& requirement : requirements) {
-      if (!requirement) continue;
-      ICEBERG_RETURN_UNEXPECTED(requirement->Validate(base.metadata.get()));
-    }
+        // Validate requirements against the current metadata before mutating.
+        for (const auto& requirement : requirements) {
+          if (!requirement) continue;
+          ICEBERG_RETURN_UNEXPECTED(requirement->Validate(base.metadata.get()));
+        }
 
-    // Apply updates via TableMetadataBuilder and build the new metadata.
-    // Wire the base's metadata_location into the builder so the new
-    // metadata's `previous-metadata-location` field is set and the
-    // metadata_log lineage grows correctly. Without this the log stays
-    // empty and `TableMetadataUtil::Write` would derive the new version
-    // from a truncated log size instead of the base file's name.
-    auto builder = TableMetadataBuilder::BuildFrom(base.metadata.get());
-    builder->SetPreviousMetadataLocation(base.metadata_location);
-    for (const auto& update : updates) {
-      if (!update) continue;
-      update->ApplyTo(*builder);
-    }
-    ICEBERG_ASSIGN_OR_RAISE(auto new_metadata, builder->Build());
+        // Apply updates via TableMetadataBuilder and build the new metadata.
+        // Wire the base's metadata_location into the builder so the new
+        // metadata's `previous-metadata-location` field is set and the
+        // metadata_log lineage grows correctly. Without this the log stays
+        // empty and `TableMetadataUtil::Write` would derive the new version
+        // from a truncated log size instead of the base file's name.
+        auto builder = TableMetadataBuilder::BuildFrom(base.metadata.get());
+        builder->SetPreviousMetadataLocation(base.metadata_location);
+        for (const auto& update : updates) {
+          if (!update) continue;
+          update->ApplyTo(*builder);
+        }
+        ICEBERG_ASSIGN_OR_RAISE(auto new_metadata, builder->Build());
 
-    ICEBERG_ASSIGN_OR_RAISE(auto new_metadata_location, ops.Commit(base, *new_metadata));
-    // Java BaseMetastoreCatalog returns the in-memory metadata directly
-    // here instead of re-reading from HMS. Mirror that to avoid a second
-    // GetTable + ReadFile per successful UpdateTable.
-    return Table::Make(identifier, std::shared_ptr<TableMetadata>(new_metadata.release()),
-                       std::move(new_metadata_location), file_io_, shared_from_this());
-  });
+        ICEBERG_ASSIGN_OR_RAISE(auto new_metadata_location,
+                                ops.Commit(base, *new_metadata));
+        // Java BaseMetastoreCatalog returns the in-memory metadata directly
+        // here instead of re-reading from HMS. Mirror that to avoid a second
+        // GetTable + ReadFile per successful UpdateTable.
+        return Table::Make(
+            identifier, std::shared_ptr<TableMetadata>(new_metadata.release()),
+            std::move(new_metadata_location), file_io_, shared_from_this());
+      }),
+      "HiveCatalog::UpdateTable");
 }
 
 Result<std::shared_ptr<Transaction>> HiveCatalog::StageCreateTable(
@@ -480,20 +511,22 @@ Status HiveCatalog::DropTable(const TableIdentifier& identifier, bool purge) {
   // DropTable RPC, a subsequent NoSuchTable means our first attempt
   // landed despite the lost response -- mirror Java's `checkCommitStatus`
   // and surface success rather than misleading the user with NoSuchTable.
-  return client_pool_->Run([&,
-                            drop_attempted = false](HmsClient* client) mutable -> Status {
-    auto table = client->GetTable(identifier.ns.levels[0], identifier.name);
-    if (!table.has_value()) {
-      if (drop_attempted && table.error().kind == ErrorKind::kNoSuchTable) {
-        return {};  // previous DropTable landed; HMS confirms the after-state
-      }
-      return std::unexpected(table.error());
-    }
-    ICEBERG_RETURN_UNEXPECTED(ValidateIcebergTable(identifier, table.value().parameters));
-    drop_attempted = true;
-    return client->DropTable(identifier.ns.levels[0], identifier.name,
-                             /*delete_data=*/false);
-  });
+  return CommitStateUnknownOnTransportFailure(
+      client_pool_->Run([&, drop_attempted = false](HmsClient* client) mutable -> Status {
+        auto table = client->GetTable(identifier.ns.levels[0], identifier.name);
+        if (!table.has_value()) {
+          if (drop_attempted && table.error().kind == ErrorKind::kNoSuchTable) {
+            return {};  // previous DropTable landed; HMS confirms the after-state
+          }
+          return std::unexpected(table.error());
+        }
+        ICEBERG_RETURN_UNEXPECTED(
+            ValidateIcebergTable(identifier, table.value().parameters));
+        drop_attempted = true;
+        return client->DropTable(identifier.ns.levels[0], identifier.name,
+                                 /*delete_data=*/false);
+      }),
+      "HiveCatalog::DropTable");
 }
 
 Status HiveCatalog::RenameTable(const TableIdentifier& from, const TableIdentifier& to) {
@@ -511,9 +544,10 @@ Status HiveCatalog::RenameTable(const TableIdentifier& from, const TableIdentifi
   // "any Iceberg table happens to live at the destination now". Without
   // that identity check a concurrent third-party rename or pre-existing
   // foreign Iceberg row at `to` could be mistaken for our own success.
-  return client_pool_->Run(
-      [&, rename_attempted = false,
-       source_metadata_location = std::string{}](HmsClient* client) mutable -> Status {
+  return CommitStateUnknownOnTransportFailure(
+      client_pool_->Run([&, rename_attempted = false,
+                         source_metadata_location =
+                             std::string{}](HmsClient* client) mutable -> Status {
         auto from_or_error = client->GetTable(from.ns.levels[0], from.name);
         if (!from_or_error.has_value()) {
           if (rename_attempted && from_or_error.error().kind == ErrorKind::kNoSuchTable) {
@@ -537,7 +571,8 @@ Status HiveCatalog::RenameTable(const TableIdentifier& from, const TableIdentifi
         table.table_name = to.name;
         rename_attempted = true;
         return client->AlterTable(from.ns.levels[0], from.name, table);
-      });
+      }),
+      "HiveCatalog::RenameTable");
 }
 
 Result<std::shared_ptr<Table>> HiveCatalog::LoadTable(const TableIdentifier& identifier) {
@@ -594,22 +629,24 @@ Result<std::shared_ptr<Table>> HiveCatalog::RegisterTable(
   // same file first still surfaces as a real `kAlreadyExists` failure
   // on the first attempt, while a pool-level retry over our own
   // server-side success is treated idempotently.
-  ICEBERG_RETURN_UNEXPECTED(client_pool_->Run(
-      [&, create_attempted = false](HmsClient* client) mutable -> Status {
-        auto create = client->CreateTable(hive_table);
-        if (!create.has_value() && create_attempted &&
-            create.error().kind == ErrorKind::kAlreadyExists) {
-          auto existing = client->GetTable(identifier.ns.levels[0], identifier.name);
-          if (existing.has_value()) {
-            auto loc = GetMetadataLocation(existing->parameters);
-            if (loc.has_value() && *loc == metadata_file_location) {
-              return {};  // our previous register landed despite the lost reply
+  ICEBERG_RETURN_UNEXPECTED(CommitStateUnknownOnTransportFailure(
+      client_pool_->Run(
+          [&, create_attempted = false](HmsClient* client) mutable -> Status {
+            auto create = client->CreateTable(hive_table);
+            if (!create.has_value() && create_attempted &&
+                create.error().kind == ErrorKind::kAlreadyExists) {
+              auto existing = client->GetTable(identifier.ns.levels[0], identifier.name);
+              if (existing.has_value()) {
+                auto loc = GetMetadataLocation(existing->parameters);
+                if (loc.has_value() && *loc == metadata_file_location) {
+                  return {};  // our previous register landed despite the lost reply
+                }
+              }
             }
-          }
-        }
-        create_attempted = true;
-        return create;
-      }));
+            create_attempted = true;
+            return create;
+          }),
+      "HiveCatalog::RegisterTable"));
 
   return Table::Make(identifier, std::shared_ptr<TableMetadata>(metadata.release()),
                      metadata_file_location, file_io_, shared_from_this());

@@ -96,4 +96,43 @@ ICEBERG_HIVE_EXPORT std::unexpected<Error> TransportError(std::string_view conte
 ICEBERG_HIVE_EXPORT std::unexpected<Error> GenericThriftError(std::string_view context,
                                                               std::string_view what);
 
+/// \brief Re-tag any `kServiceUnavailable` escaping from a mutating
+///        catalog op as `kCommitStateUnknown`.
+///
+/// `HmsClientPool::Run`'s reconnect-once contract surfaces
+/// `kServiceUnavailable` in two cases that *both* mean "the first
+/// mutating RPC was issued but its outcome is undefined":
+///   * the initial RPC's transport failed AND the pool's subsequent
+///     reconnect attempt also failed (`hms_client_pool.h:Run`'s
+///     reconnect-failure branch); or
+///   * the initial RPC's transport failed, the reconnect succeeded,
+///     and the retry's transport also failed.
+///
+/// Letting either of those surface verbatim invites the caller to
+/// retry the operation, which restarts the lambda with the
+/// `*_attempted` flag reset to `false` -- masking a server-side
+/// success as a "fresh AlreadyExists / NoSuchTable / etc." that the
+/// per-op replay recovery in this file can no longer recognise.
+/// Surfacing `kCommitStateUnknown` tells `iceberg::Transaction` (and
+/// the user) to stop retrying and inspect HMS to find out what
+/// actually happened.
+///
+/// `op_context` should describe the catalog op for diagnostic output
+/// (e.g. "HiveCatalog::CreateNamespace(\"warehouse\")"). Read-only
+/// ops (`LoadTable`, `ListNamespaces`, ...) should NOT funnel through
+/// this helper -- read-only RPCs are idempotent, and turning a
+/// retriable transport blip into `kCommitStateUnknown` would only
+/// confuse the caller.
+template <typename T>
+inline Result<T> CommitStateUnknownOnTransportFailure(Result<T> result,
+                                                      std::string_view op_context) {
+  if (!result.has_value() && result.error().kind == ErrorKind::kServiceUnavailable) {
+    return CommitStateUnknown(
+        "{} encountered HMS transport failure with no usable replay signal; "
+        "the operation may or may not have landed (msg={}).",
+        op_context, result.error().message);
+  }
+  return result;
+}
+
 }  // namespace iceberg::hive

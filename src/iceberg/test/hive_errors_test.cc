@@ -84,4 +84,62 @@ TEST(HiveErrorsTest, ContextAndMessageBothAppearInOutput) {
   EXPECT_NE(err.error().message.find("something_unique_xyz"), std::string::npos);
 }
 
+// Pin the contract of `CommitStateUnknownOnTransportFailure`: every
+// mutating HiveCatalog op funnels Pool::Run's result through this
+// helper so a `kServiceUnavailable` escape (pool reconnect-failure or
+// post-reconnect retry-also-transport-failure) cannot invite the
+// caller to retry on top of a possibly-landed first attempt.
+
+TEST(CommitStateUnknownHelperTest, TranslatesServiceUnavailable) {
+  Result<int> svc =
+      ServiceUnavailable("HMS transport failed and reconnect also failed: nope");
+  auto translated =
+      CommitStateUnknownOnTransportFailure(std::move(svc), "TestOp::DoMutation");
+  ASSERT_FALSE(translated.has_value());
+  EXPECT_EQ(translated.error().kind, ErrorKind::kCommitStateUnknown);
+  EXPECT_NE(translated.error().message.find("TestOp::DoMutation"), std::string::npos);
+  EXPECT_NE(translated.error().message.find("nope"), std::string::npos);
+}
+
+TEST(CommitStateUnknownHelperTest, PreservesOtherErrors) {
+  Result<int> al = AlreadyExists("warehouse already exists");
+  auto translated = CommitStateUnknownOnTransportFailure(std::move(al), "TestOp::Create");
+  ASSERT_FALSE(translated.has_value());
+  EXPECT_EQ(translated.error().kind, ErrorKind::kAlreadyExists)
+      << "non-transport errors must pass through verbatim, otherwise we would "
+         "blur a genuine first-attempt conflict into kCommitStateUnknown";
+  EXPECT_EQ(translated.error().message, "warehouse already exists");
+}
+
+TEST(CommitStateUnknownHelperTest, PreservesAlreadyCommitStateUnknown) {
+  Result<int> usk = CommitStateUnknown("inner recovery decided indeterminate");
+  auto translated =
+      CommitStateUnknownOnTransportFailure(std::move(usk), "TestOp::Commit");
+  ASSERT_FALSE(translated.has_value());
+  EXPECT_EQ(translated.error().kind, ErrorKind::kCommitStateUnknown);
+  EXPECT_EQ(translated.error().message, "inner recovery decided indeterminate")
+      << "an inner-recovery CommitStateUnknown should not be re-wrapped";
+}
+
+TEST(CommitStateUnknownHelperTest, PreservesSuccess) {
+  Result<int> ok = 42;
+  auto translated = CommitStateUnknownOnTransportFailure(std::move(ok), "TestOp::Probe");
+  ASSERT_TRUE(translated.has_value());
+  EXPECT_EQ(*translated, 42);
+}
+
+TEST(CommitStateUnknownHelperTest, WorksWithStatus) {
+  Status svc = ServiceUnavailable("reconnect doubly-broken");
+  auto translated =
+      CommitStateUnknownOnTransportFailure(std::move(svc), "TestOp::DropThing");
+  ASSERT_FALSE(translated.has_value());
+  EXPECT_EQ(translated.error().kind, ErrorKind::kCommitStateUnknown);
+  EXPECT_NE(translated.error().message.find("TestOp::DropThing"), std::string::npos);
+
+  Status ok;  // success
+  auto pass_through =
+      CommitStateUnknownOnTransportFailure(std::move(ok), "TestOp::DropThing");
+  EXPECT_TRUE(pass_through.has_value());
+}
+
 }  // namespace iceberg::hive

@@ -102,8 +102,13 @@ class ICEBERG_HIVE_EXPORT HmsClient {
 
   /// \brief Connect to the Hive Metastore described by `config`.
   ///
-  /// The first endpoint listed in `config.Uri()` is used; HA failover
-  /// to subsequent endpoints is left to a future commit.
+  /// `config.Uri()` may contain a single endpoint or a comma-separated
+  /// HA list (`thrift://hms1:9083,thrift://hms2:9083`). Connect tries
+  /// each parsed endpoint in declaration order and returns the first
+  /// one whose Thrift transport opens successfully. If every endpoint
+  /// fails the surface is a single `kIOError` whose message reports
+  /// the attempt count and the last endpoint's failure (mirrors Java
+  /// HiveMetaStoreClient's `metastoreUris` failover).
   static Result<std::unique_ptr<HmsClient>> Connect(const HiveCatalogProperties& config);
 
   /// \name Database (namespace) operations
