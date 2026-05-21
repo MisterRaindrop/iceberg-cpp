@@ -104,6 +104,13 @@ Result<std::shared_ptr<HiveCatalog>> HiveCatalog::Make(
       new HiveCatalog(config, std::move(client_pool), std::move(file_io)));
 }
 
+std::shared_ptr<HiveCatalog> HiveCatalog::MakeForTesting(
+    HiveCatalogProperties config, std::unique_ptr<HmsClientPool> client_pool,
+    std::shared_ptr<FileIO> file_io) {
+  return std::shared_ptr<HiveCatalog>(
+      new HiveCatalog(std::move(config), std::move(client_pool), std::move(file_io)));
+}
+
 std::string_view HiveCatalog::name() const { return name_; }
 
 Status HiveCatalog::CreateNamespace(

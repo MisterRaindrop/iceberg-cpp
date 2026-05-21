@@ -323,6 +323,7 @@ HiveDatabase FromThriftDatabase(const Database& thrift_db) {
 
 }  // namespace
 
+HmsClient::HmsClient() = default;
 HmsClient::HmsClient(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 
 HmsClient::~HmsClient() {

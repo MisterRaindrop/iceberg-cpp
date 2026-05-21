@@ -22,6 +22,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <utility>
@@ -51,11 +52,28 @@ namespace iceberg::hive {
 /// surface as `kIOError`.
 class ICEBERG_HIVE_EXPORT HmsClientPool {
  public:
+  /// \brief Factory the pool calls to lazily fill open slots and to
+  ///        replace a connection after a transport failure. Production
+  ///        code wires this to `HmsClient::Connect(config)`; tests can
+  ///        substitute scripted fakes via `MakeForTesting`.
+  using ClientFactory = std::function<Result<std::unique_ptr<HmsClient>>()>;
+
   /// \brief Build a pool sized by `hive.client-pool-size`. Validates the
   ///        HiveCatalogProperties (URI, transport) by opening one client
   ///        eagerly so configuration errors surface from `Make` rather
   ///        than the first checkout.
   static Result<std::unique_ptr<HmsClientPool>> Make(const HiveCatalogProperties& config);
+
+  /// \brief Test-only factory that pre-seeds the pool with `seed` and
+  ///        plugs in a custom `factory` for any subsequent client the
+  ///        pool needs (lazy fill of an empty slot, post-transport
+  ///        Reconnect). The factory is invoked under no mutex, exactly
+  ///        like the production `HmsClient::Connect(config)` call it
+  ///        replaces, so tests can return scripted fakes per
+  ///        invocation. `pool_size` clamps to at least 1.
+  static std::unique_ptr<HmsClientPool> MakeForTesting(std::size_t pool_size,
+                                                       ClientFactory factory,
+                                                       std::unique_ptr<HmsClient> seed);
 
   ~HmsClientPool();
 
@@ -119,7 +137,7 @@ class ICEBERG_HIVE_EXPORT HmsClientPool {
   }
 
  private:
-  HmsClientPool(HiveCatalogProperties config, std::size_t pool_size,
+  HmsClientPool(std::size_t pool_size, ClientFactory factory,
                 std::unique_ptr<HmsClient> seed);
 
   /// \brief Block until a client is available, or build a fresh one if
@@ -137,7 +155,7 @@ class ICEBERG_HIVE_EXPORT HmsClientPool {
   ///        it directly.
   Result<std::unique_ptr<HmsClient>> Reconnect(std::unique_ptr<HmsClient> stale);
 
-  HiveCatalogProperties config_;
+  ClientFactory factory_;
   std::size_t pool_size_;
 
   std::mutex mu_;

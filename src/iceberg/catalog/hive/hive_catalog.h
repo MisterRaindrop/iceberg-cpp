@@ -76,6 +76,16 @@ class ICEBERG_HIVE_EXPORT HiveCatalog : public Catalog,
   /// requested FileIO scheme is unknown.
   static Result<std::shared_ptr<HiveCatalog>> Make(const HiveCatalogProperties& config);
 
+  /// \brief Test-only factory that builds a HiveCatalog from a
+  ///        pre-constructed `HmsClientPool` + `FileIO`, bypassing the
+  ///        URI parsing, Thrift handshake, and FileIORegistry lookup
+  ///        that production `Make` performs. Tests can pair this with
+  ///        `HmsClientPool::MakeForTesting` to drive HiveCatalog ops
+  ///        against scripted `FakeHmsClient` instances.
+  static std::shared_ptr<HiveCatalog> MakeForTesting(
+      HiveCatalogProperties config, std::unique_ptr<HmsClientPool> client_pool,
+      std::shared_ptr<FileIO> file_io);
+
   std::string_view name() const override;
 
   Status CreateNamespace(

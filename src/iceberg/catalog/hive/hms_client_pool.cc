@@ -29,9 +29,9 @@ namespace {
 constexpr std::size_t kMinPoolSize = 1;
 }  // namespace
 
-HmsClientPool::HmsClientPool(HiveCatalogProperties config, std::size_t pool_size,
+HmsClientPool::HmsClientPool(std::size_t pool_size, ClientFactory factory,
                              std::unique_ptr<HmsClient> seed)
-    : config_(std::move(config)), pool_size_(pool_size) {
+    : factory_(std::move(factory)), pool_size_(pool_size) {
   if (seed) {
     idle_.push_back(std::move(seed));
   }
@@ -50,10 +50,22 @@ Result<std::unique_ptr<HmsClientPool>> HmsClientPool::Make(
                                     : static_cast<std::size_t>(configured);
   // Open one client eagerly so configuration mistakes (bad URI, bad
   // transport, unreachable HMS) surface from `HiveCatalog::Make` rather
-  // than the first catalog method call.
+  // than the first catalog method call. Capture `config` by value into
+  // the factory so subsequent lazy fill / reconnect calls don't depend
+  // on the caller's `config` object outliving the pool.
   ICEBERG_ASSIGN_OR_RAISE(auto seed, HmsClient::Connect(config));
+  ClientFactory factory = [config]() -> Result<std::unique_ptr<HmsClient>> {
+    return HmsClient::Connect(config);
+  };
   return std::unique_ptr<HmsClientPool>(
-      new HmsClientPool(config, pool_size, std::move(seed)));
+      new HmsClientPool(pool_size, std::move(factory), std::move(seed)));
+}
+
+std::unique_ptr<HmsClientPool> HmsClientPool::MakeForTesting(
+    std::size_t pool_size, ClientFactory factory, std::unique_ptr<HmsClient> seed) {
+  const std::size_t clamped = pool_size < kMinPoolSize ? kMinPoolSize : pool_size;
+  return std::unique_ptr<HmsClientPool>(
+      new HmsClientPool(clamped, std::move(factory), std::move(seed)));
 }
 
 Result<std::unique_ptr<HmsClient>> HmsClientPool::Checkout() {
@@ -71,7 +83,7 @@ Result<std::unique_ptr<HmsClient>> HmsClientPool::Checkout() {
       // then connect outside the lock to avoid serialising HMS handshakes.
       ++outstanding_;
       lock.unlock();
-      auto fresh = HmsClient::Connect(config_);
+      auto fresh = factory_();
       if (!fresh.has_value()) {
         lock.lock();
         --outstanding_;
@@ -99,7 +111,7 @@ Result<std::unique_ptr<HmsClient>> HmsClientPool::Reconnect(
   // close runs while we still hold the outstanding slot. Connect outside
   // the pool's mutex to avoid serialising the reconnect handshake.
   stale.reset();
-  auto fresh = HmsClient::Connect(config_);
+  auto fresh = factory_();
   if (!fresh.has_value()) {
     // Replenishment failed: free the slot we were holding so another
     // caller can either pick up an idle client or attempt its own
