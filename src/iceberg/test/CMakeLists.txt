@@ -284,5 +284,6 @@ if(ICEBERG_BUILD_HADOOP)
     add_test(NAME ${test_name} COMMAND ${test_name})
   endfunction()
 
-  add_hadoop_iceberg_test(hadoop_catalog_test SOURCES hadoop_catalog_properties_test.cc)
+  add_hadoop_iceberg_test(hadoop_catalog_test SOURCES hadoop_catalog_properties_test.cc
+                          hadoop_file_layout_test.cc)
 endif()

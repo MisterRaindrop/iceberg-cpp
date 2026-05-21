@@ -18,6 +18,7 @@
 iceberg_hadoop_sources = files(
     'hadoop_catalog.cc',
     'hadoop_catalog_properties.cc',
+    'hadoop_file_layout.cc',
 )
 
 iceberg_hadoop_build_deps = [iceberg_dep]
@@ -46,6 +47,7 @@ install_headers(
     [
         'hadoop_catalog.h',
         'hadoop_catalog_properties.h',
+        'hadoop_file_layout.h',
         'iceberg_hadoop_export.h',
     ],
     subdir: 'iceberg/catalog/hadoop',

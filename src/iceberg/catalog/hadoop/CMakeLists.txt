@@ -15,7 +15,8 @@
 # specific language governing permissions and limitations
 # under the License.
 
-set(ICEBERG_HADOOP_SOURCES hadoop_catalog.cc hadoop_catalog_properties.cc)
+set(ICEBERG_HADOOP_SOURCES hadoop_catalog.cc hadoop_catalog_properties.cc
+                           hadoop_file_layout.cc)
 
 set(ICEBERG_HADOOP_STATIC_BUILD_INTERFACE_LIBS)
 set(ICEBERG_HADOOP_SHARED_BUILD_INTERFACE_LIBS)
