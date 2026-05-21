@@ -186,6 +186,80 @@ TEST_F(HadoopCatalogNamespaceTest, UpdateNamespacePropertiesIsNotSupported) {
   EXPECT_EQ(ErrorKind::kNotSupported, res.error().kind);
 }
 
+TEST_F(HadoopCatalogNamespaceTest, ListTablesFiltersToTableShapedDirs) {
+  ASSERT_TRUE(catalog_->CreateNamespace(Namespace{.levels = {"db"}}, {}).has_value());
+  TableIdentifier table{.ns = Namespace{.levels = {"db"}}, .name = "events"};
+  auto schema = std::make_shared<Schema>(
+      std::vector<SchemaField>{SchemaField::MakeRequired(1, "id", int64())});
+  ASSERT_TRUE(catalog_
+                  ->CreateTable(table, schema, PartitionSpec::Unpartitioned(),
+                                SortOrder::Unsorted(), "", {})
+                  .has_value());
+  // Add a plain subdirectory under db/ that is NOT a table.
+  ICEBERG_UNWRAP_OR_FAIL(auto db_dir,
+                         hadoop::NamespaceDir(warehouse_, Namespace{.levels = {"db"}}));
+  ASSERT_TRUE(file_io_->CreateDir(db_dir + "/team_a").has_value());
+
+  auto tables = catalog_->ListTables(Namespace{.levels = {"db"}});
+  ASSERT_TRUE(tables.has_value());
+  ASSERT_EQ(tables->size(), 1);
+  EXPECT_EQ(tables->front(), table);
+
+  auto exists = catalog_->TableExists(table);
+  ASSERT_TRUE(exists.has_value());
+  EXPECT_TRUE(*exists);
+
+  auto missing = catalog_->TableExists(
+      TableIdentifier{.ns = Namespace{.levels = {"db"}}, .name = "absent"});
+  ASSERT_TRUE(missing.has_value());
+  EXPECT_FALSE(*missing);
+}
+
+TEST_F(HadoopCatalogNamespaceTest,
+       DropTableRemovesEverythingAndReturnsNoSuchOnSecondTry) {
+  ASSERT_TRUE(catalog_->CreateNamespace(Namespace{.levels = {"db"}}, {}).has_value());
+  TableIdentifier table{.ns = Namespace{.levels = {"db"}}, .name = "events"};
+  auto schema = std::make_shared<Schema>(
+      std::vector<SchemaField>{SchemaField::MakeRequired(1, "id", int64())});
+  ASSERT_TRUE(catalog_
+                  ->CreateTable(table, schema, PartitionSpec::Unpartitioned(),
+                                SortOrder::Unsorted(), "", {})
+                  .has_value());
+
+  EXPECT_TRUE(catalog_->DropTable(table, /*purge=*/false).has_value());
+  auto exists_after = catalog_->TableExists(table);
+  ASSERT_TRUE(exists_after.has_value());
+  EXPECT_FALSE(*exists_after);
+
+  auto again = catalog_->DropTable(table, false);
+  ASSERT_FALSE(again.has_value());
+  EXPECT_EQ(ErrorKind::kNoSuchTable, again.error().kind);
+}
+
+TEST_F(HadoopCatalogNamespaceTest, RegisterExistingMetadataBecomesTable) {
+  ASSERT_TRUE(catalog_->CreateNamespace(Namespace{.levels = {"db"}}, {}).has_value());
+  TableIdentifier source_id{.ns = Namespace{.levels = {"db"}}, .name = "source"};
+  auto schema = std::make_shared<Schema>(
+      std::vector<SchemaField>{SchemaField::MakeRequired(1, "id", int64())});
+  ICEBERG_UNWRAP_OR_FAIL(
+      auto source,
+      catalog_->CreateTable(source_id, schema, PartitionSpec::Unpartitioned(),
+                            SortOrder::Unsorted(), "", {}));
+
+  // Register a fresh table pointing at the same metadata file.
+  TableIdentifier registered_id{.ns = Namespace{.levels = {"db"}}, .name = "registered"};
+  auto registered = catalog_->RegisterTable(
+      registered_id, std::string(source->metadata_file_location()));
+  ASSERT_TRUE(registered.has_value()) << registered.error().message;
+  EXPECT_EQ((*registered)->name(), registered_id);
+
+  // Re-registering must fail with kAlreadyExists.
+  auto again = catalog_->RegisterTable(registered_id,
+                                       std::string(source->metadata_file_location()));
+  ASSERT_FALSE(again.has_value());
+  EXPECT_EQ(ErrorKind::kAlreadyExists, again.error().kind);
+}
+
 TEST_F(HadoopCatalogNamespaceTest, CreateThenLoadTableRoundTrip) {
   ASSERT_TRUE(catalog_->CreateNamespace(Namespace{.levels = {"db"}}, {}).has_value());
   TableIdentifier id{.ns = Namespace{.levels = {"db"}}, .name = "events"};

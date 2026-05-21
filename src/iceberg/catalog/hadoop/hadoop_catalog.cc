@@ -214,8 +214,35 @@ Status HadoopCatalog::UpdateNamespaceProperties(
 }
 
 Result<std::vector<TableIdentifier>> HadoopCatalog::ListTables(
-    const Namespace& /*ns*/) const {
-  return NotSupported("HadoopCatalog::ListTables: {}", kStubMessage);
+    const Namespace& ns) const {
+  ICEBERG_ASSIGN_OR_RAISE(auto warehouse, config_.Warehouse());
+  ICEBERG_ASSIGN_OR_RAISE(auto ns_dir, hadoop::NamespaceDir(warehouse, ns));
+  ICEBERG_ASSIGN_OR_RAISE(auto ns_exists, file_io_->Exists(ns_dir));
+  if (!ns_exists) {
+    if (ns.levels.empty()) {
+      return std::vector<TableIdentifier>{};
+    }
+    return NoSuchNamespace("Namespace '{}' does not exist.", ns.ToString());
+  }
+
+  ICEBERG_ASSIGN_OR_RAISE(auto entries, file_io_->ListDir(ns_dir));
+  std::vector<TableIdentifier> tables;
+  for (const auto& entry : entries) {
+    if (!entry.is_directory) {
+      continue;
+    }
+    ICEBERG_ASSIGN_OR_RAISE(auto is_table,
+                            hadoop::IsHadoopTableDir(*file_io_, entry.location));
+    if (!is_table) {
+      continue;
+    }
+    std::string_view path = entry.location;
+    auto slash = path.find_last_of('/');
+    std::string_view name =
+        slash == std::string_view::npos ? path : path.substr(slash + 1);
+    tables.push_back(TableIdentifier{.ns = ns, .name = std::string(name)});
+  }
+  return tables;
 }
 
 Result<std::shared_ptr<Table>> HadoopCatalog::CreateTable(
@@ -352,12 +379,33 @@ Result<std::shared_ptr<Transaction>> HadoopCatalog::StageCreateTable(
   return NotSupported("HadoopCatalog::StageCreateTable: {}", kStubMessage);
 }
 
-Result<bool> HadoopCatalog::TableExists(const TableIdentifier& /*identifier*/) const {
-  return NotSupported("HadoopCatalog::TableExists: {}", kStubMessage);
+Result<bool> HadoopCatalog::TableExists(const TableIdentifier& identifier) const {
+  ICEBERG_RETURN_UNEXPECTED(hadoop::ValidateTableIdentifier(identifier));
+  ICEBERG_ASSIGN_OR_RAISE(auto warehouse, config_.Warehouse());
+  ICEBERG_ASSIGN_OR_RAISE(auto table_dir, hadoop::TableDir(warehouse, identifier));
+  return hadoop::IsHadoopTableDir(*file_io_, table_dir);
 }
 
-Status HadoopCatalog::DropTable(const TableIdentifier& /*identifier*/, bool /*purge*/) {
-  return NotSupported("HadoopCatalog::DropTable: {}", kStubMessage);
+Status HadoopCatalog::DropTable(const TableIdentifier& identifier, bool purge) {
+  ICEBERG_RETURN_UNEXPECTED(hadoop::ValidateTableIdentifier(identifier));
+  ICEBERG_ASSIGN_OR_RAISE(auto warehouse, config_.Warehouse());
+  ICEBERG_ASSIGN_OR_RAISE(auto table_dir, hadoop::TableDir(warehouse, identifier));
+
+  ICEBERG_ASSIGN_OR_RAISE(auto is_table, hadoop::IsHadoopTableDir(*file_io_, table_dir));
+  if (!is_table) {
+    return NoSuchTable("Table '{}' does not exist at {}.", identifier.ToString(),
+                       table_dir);
+  }
+  if (purge) {
+    // Java's DropTable(purge=true) goes through CatalogUtil.dropTableData first
+    // to remove snapshot data files. The cpp helper for that is introduced in
+    // H17 alongside the suppress-permission-error path; for now we recursively
+    // delete the entire table directory which matches the purge=true outcome
+    // for tables whose data lives under <table>/data/ (the default LocationProvider).
+    return file_io_->DeleteDir(table_dir, /*recursive=*/true);
+  }
+  // Java treats both purge values as a recursive delete; cpp follows suit.
+  return file_io_->DeleteDir(table_dir, /*recursive=*/true);
 }
 
 Status HadoopCatalog::RenameTable(const TableIdentifier& /*from*/,
@@ -384,9 +432,55 @@ Result<std::shared_ptr<Table>> HadoopCatalog::LoadTable(
 }
 
 Result<std::shared_ptr<Table>> HadoopCatalog::RegisterTable(
-    const TableIdentifier& /*identifier*/,
-    const std::string& /*metadata_file_location*/) {
-  return NotSupported("HadoopCatalog::RegisterTable: {}", kStubMessage);
+    const TableIdentifier& identifier, const std::string& metadata_file_location) {
+  ICEBERG_RETURN_UNEXPECTED(hadoop::ValidateTableIdentifier(identifier));
+  if (metadata_file_location.empty()) {
+    return InvalidArgument(
+        "HadoopCatalog::RegisterTable requires a non-empty metadata_file_location.");
+  }
+  ICEBERG_ASSIGN_OR_RAISE(auto warehouse, config_.Warehouse());
+  ICEBERG_ASSIGN_OR_RAISE(auto table_dir, hadoop::TableDir(warehouse, identifier));
+
+  ICEBERG_ASSIGN_OR_RAISE(auto already_table,
+                          hadoop::IsHadoopTableDir(*file_io_, table_dir));
+  if (already_table) {
+    return AlreadyExists("Table '{}' already exists at {}.", identifier.ToString(),
+                         table_dir);
+  }
+
+  // Read the external metadata and copy it to v1.metadata.json (with codec
+  // detected from the source filename so registering a gzipped metadata file
+  // produces a gzipped local copy too).
+  ICEBERG_ASSIGN_OR_RAISE(auto metadata,
+                          TableMetadataUtil::Read(*file_io_, metadata_file_location));
+
+  std::string_view source = metadata_file_location;
+  auto slash = source.find_last_of('/');
+  std::string_view file_name =
+      slash == std::string_view::npos ? source : source.substr(slash + 1);
+  hadoop::MetadataCompressionCodec codec = hadoop::MetadataCompressionCodec::kNone;
+  if (file_name.ends_with(".metadata.json.gz")) {
+    codec = hadoop::MetadataCompressionCodec::kGzip;
+  } else if (file_name.ends_with(".metadata.json.zstd")) {
+    codec = hadoop::MetadataCompressionCodec::kZstd;
+  }
+
+  const std::string metadata_dir = hadoop::MetadataDir(table_dir);
+  ICEBERG_RETURN_UNEXPECTED(file_io_->CreateDir(metadata_dir));
+
+  const std::string target = hadoop::MetadataFilePath(table_dir, /*version=*/1, codec);
+  // Read the raw bytes again (preserving codec encoding) and write them to
+  // the target. TableMetadataUtil::Read would decode for us; using the raw
+  // file contents keeps the file bytes byte-for-byte identical so external
+  // readers see the same content they wrote.
+  ICEBERG_ASSIGN_OR_RAISE(auto raw,
+                          file_io_->ReadFile(metadata_file_location, std::nullopt));
+  ICEBERG_RETURN_UNEXPECTED(file_io_->WriteFile(target, raw));
+  ICEBERG_RETURN_UNEXPECTED(
+      file_io_->WriteFile(hadoop::VersionHintPath(table_dir), std::string("1\n")));
+
+  std::shared_ptr<TableMetadata> metadata_ptr = std::move(metadata);
+  return Table::Make(identifier, metadata_ptr, target, file_io_, shared_from_this());
 }
 
 }  // namespace iceberg::hadoop
