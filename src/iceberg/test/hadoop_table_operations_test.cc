@@ -234,6 +234,39 @@ TEST_F(HadoopCommitTest, CommitRejectsStaleBase) {
   EXPECT_EQ(ErrorKind::kCommitFailed, res.error().kind);
 }
 
+TEST_F(HadoopCommitTest, FileLockManagerAcquiresAndDetectsStale) {
+  const std::string body = SlurpResource("TableMetadataV1Valid.json");
+  SeedMetadataFile(1, MetadataCompressionCodec::kNone, body);
+  SeedVersionHint("1");
+
+  auto props = HadoopCatalogProperties::FromMap({
+      {"warehouse", warehouse_},
+      {"lock-impl", "file"},
+      {"lock.acquire-timeout-ms", "300"},
+      {"lock.acquire-interval-ms", "20"},
+      // Keep the heartbeat window large enough that the first lock is not
+      // accidentally marked stale during the 300ms acquire test below.
+      {"lock.heartbeat-timeout-ms", "10000"},
+  });
+  ICEBERG_UNWRAP_OR_FAIL(auto raw, MakeLockManagerWithIO(props, file_io_));
+  auto file_lock = std::shared_ptr<LockManager>(std::move(raw));
+
+  ICEBERG_UNWRAP_OR_FAIL(auto first, file_lock->Acquire(table_dir_, "first"));
+  EXPECT_TRUE(first);
+
+  // Holding -> second acquire times out within ~500ms.
+  ICEBERG_UNWRAP_OR_FAIL(auto second, file_lock->Acquire(table_dir_, "second"));
+  EXPECT_FALSE(second);
+
+  // Stale path: write a lock file by hand with an old timestamp, then verify
+  // a fresh acquire steals it.
+  ASSERT_TRUE(file_lock->Release(table_dir_, "first").has_value());
+  ASSERT_TRUE(file_io_->WriteFile(LockFilePath(table_dir_), "ghost|0\n").has_value());
+  ICEBERG_UNWRAP_OR_FAIL(auto stolen, file_lock->Acquire(table_dir_, "newcomer"));
+  EXPECT_TRUE(stolen);
+  EXPECT_TRUE(file_lock->Release(table_dir_, "newcomer").has_value());
+}
+
 TEST_F(HadoopCommitTest, ConcurrentCommitsConvergeWithRetries) {
   // Seed v1.
   const std::string body = SlurpResource("TableMetadataV1Valid.json");

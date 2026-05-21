@@ -67,7 +67,8 @@ Result<std::shared_ptr<HadoopCatalog>> HadoopCatalog::Make(
   }
   ICEBERG_ASSIGN_OR_RAISE(auto warehouse, config.Warehouse());
   MaybeWarnS3Warehouse(warehouse);
-  ICEBERG_ASSIGN_OR_RAISE(auto lock_manager, hadoop::MakeLockManager(config));
+  ICEBERG_ASSIGN_OR_RAISE(auto lock_manager,
+                          hadoop::MakeLockManagerWithIO(config, file_io));
 
   return std::shared_ptr<HadoopCatalog>(
       new HadoopCatalog(std::string(name), std::move(file_io), std::move(config),

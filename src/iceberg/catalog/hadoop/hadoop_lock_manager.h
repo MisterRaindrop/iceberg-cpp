@@ -25,6 +25,7 @@
 
 #include "iceberg/catalog/hadoop/hadoop_catalog_properties.h"
 #include "iceberg/catalog/hadoop/iceberg_hadoop_export.h"
+#include "iceberg/file_io.h"
 #include "iceberg/result.h"
 
 /// \file iceberg/catalog/hadoop/hadoop_lock_manager.h
@@ -86,14 +87,47 @@ class ICEBERG_HADOOP_EXPORT InMemoryLockManager : public LockManager {
   std::chrono::milliseconds acquire_interval_;
 };
 
+/// \brief Filesystem-backed lock manager.
+///
+/// `FileLockManager` writes a `_lock` file under
+/// `<entity_id>/metadata/_lock` using fail-if-exists semantics. The file
+/// contents are `<owner_id>|<acquire_ts_ms>` so that another process can
+/// detect when the holder died -- the lock is considered stale when its
+/// recorded timestamp is older than `lock.heartbeat-timeout-ms`. Stale
+/// locks are deleted and re-acquired by the next caller.
+///
+/// MVP scope (matches the H14 plan note): there is no background heartbeat
+/// thread yet. Commits are expected to complete within
+/// `lock.heartbeat-timeout-ms` (15 s by default) which is comfortable for
+/// typical metadata writes; the heartbeat refresh is a follow-up.
+class ICEBERG_HADOOP_EXPORT FileLockManager : public LockManager {
+ public:
+  FileLockManager(std::shared_ptr<FileIO> file_io, const HadoopCatalogProperties& config);
+  ~FileLockManager() override;
+
+  Result<bool> Acquire(const std::string& entity_id,
+                       const std::string& owner_id) override;
+  Status Release(const std::string& entity_id, const std::string& owner_id) override;
+
+ private:
+  std::shared_ptr<FileIO> file_io_;
+  std::chrono::milliseconds acquire_timeout_;
+  std::chrono::milliseconds acquire_interval_;
+  std::chrono::milliseconds heartbeat_timeout_;
+};
+
 /// \brief Resolve and construct a `LockManager` from the catalog properties.
 ///
 /// Recognised `lock-impl` values:
 /// - "in-memory" (default): `InMemoryLockManager`
-/// - "file": `FileLockManager` (introduced in H14)
-/// Other values are rejected with `kInvalidArgument` for now; H14 will add a
-/// pluggable registry so callers can wire custom implementations.
+/// - "file": `FileLockManager` (requires a FileIO -- pass it explicitly
+///   via `MakeLockManagerWithIO`).
 ICEBERG_HADOOP_EXPORT Result<std::unique_ptr<LockManager>> MakeLockManager(
     const HadoopCatalogProperties& config);
+
+/// \brief Variant of `MakeLockManager` that can return a FileLockManager.
+/// HadoopCatalog passes its FileIO through this entry point.
+ICEBERG_HADOOP_EXPORT Result<std::unique_ptr<LockManager>> MakeLockManagerWithIO(
+    const HadoopCatalogProperties& config, std::shared_ptr<FileIO> file_io);
 
 }  // namespace iceberg::hadoop

@@ -21,9 +21,15 @@
 
 #include <chrono>
 #include <condition_variable>
+#include <format>
 #include <mutex>
 #include <string>
+#include <string_view>
+#include <thread>
 #include <unordered_map>
+
+#include "iceberg/catalog/hadoop/hadoop_file_layout.h"
+#include "iceberg/util/macros.h"
 
 namespace iceberg::hadoop {
 
@@ -103,19 +109,150 @@ Status InMemoryLockManager::Release(const std::string& entity_id,
 }
 
 // ---------------------------------------------------------------------------
+// FileLockManager
+// ---------------------------------------------------------------------------
+
+namespace {
+
+int64_t MillisSinceEpoch() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::system_clock::now().time_since_epoch())
+      .count();
+}
+
+std::string EncodeLockBody(std::string_view owner_id, int64_t ts_ms) {
+  return std::format("{}|{}\n", owner_id, ts_ms);
+}
+
+struct LockBody {
+  std::string owner;
+  int64_t ts_ms = 0;
+};
+Result<LockBody> DecodeLockBody(std::string_view body) {
+  while (!body.empty() && (body.back() == '\n' || body.back() == '\r' ||
+                           body.back() == ' ' || body.back() == '\t')) {
+    body.remove_suffix(1);
+  }
+  auto pipe = body.find('|');
+  if (pipe == std::string_view::npos || pipe + 1 == body.size()) {
+    return Invalid("Malformed lock body: '{}'", body);
+  }
+  LockBody parsed;
+  parsed.owner = std::string(body.substr(0, pipe));
+  std::string_view ts_text = body.substr(pipe + 1);
+  if (ts_text.empty()) {
+    return Invalid("Empty timestamp in lock body");
+  }
+  int64_t ts = 0;
+  for (char c : ts_text) {
+    if (c < '0' || c > '9') {
+      return Invalid("Non-numeric character '{}' in lock timestamp", c);
+    }
+    ts = (ts * 10) + (c - '0');
+  }
+  parsed.ts_ms = ts;
+  return parsed;
+}
+
+}  // namespace
+
+FileLockManager::FileLockManager(std::shared_ptr<FileIO> file_io,
+                                 const HadoopCatalogProperties& config)
+    : file_io_(std::move(file_io)),
+      acquire_timeout_(std::chrono::milliseconds(
+          config.Get(HadoopCatalogProperties::kLockAcquireTimeoutMs))),
+      acquire_interval_(std::chrono::milliseconds(
+          config.Get(HadoopCatalogProperties::kLockAcquireIntervalMs))),
+      heartbeat_timeout_(std::chrono::milliseconds(
+          config.Get(HadoopCatalogProperties::kLockHeartbeatTimeoutMs))) {}
+
+FileLockManager::~FileLockManager() = default;
+
+Result<bool> FileLockManager::Acquire(const std::string& entity_id,
+                                      const std::string& owner_id) {
+  if (file_io_ == nullptr) {
+    return InvalidArgument("FileLockManager: FileIO is null.");
+  }
+  const std::string lock_path = LockFilePath(entity_id);
+  std::ignore = file_io_->CreateDir(MetadataDir(entity_id));
+
+  const auto deadline = std::chrono::steady_clock::now() + acquire_timeout_;
+  while (true) {
+    auto out_file = file_io_->NewOutputFile(lock_path);
+    if (out_file.has_value()) {
+      auto stream = (*out_file)->Create();
+      if (stream.has_value()) {
+        const std::string body = EncodeLockBody(owner_id, MillisSinceEpoch());
+        auto bytes = std::as_bytes(std::span(body.data(), body.size()));
+        auto write = (*stream)->Write(bytes);
+        auto flush = write.has_value() ? (*stream)->Flush() : Status{};
+        auto close_status = (*stream)->Close();
+        if (write.has_value() && flush.has_value() && close_status.has_value()) {
+          return true;
+        }
+        std::ignore = file_io_->DeleteFile(lock_path);
+      }
+    }
+
+    auto existing = file_io_->ReadFile(lock_path, /*length=*/std::nullopt);
+    if (existing.has_value()) {
+      auto decoded = DecodeLockBody(*existing);
+      if (decoded.has_value()) {
+        const int64_t age_ms = MillisSinceEpoch() - decoded->ts_ms;
+        if (age_ms > heartbeat_timeout_.count()) {
+          std::ignore = file_io_->DeleteFile(lock_path);
+          continue;
+        }
+      }
+    }
+    auto remaining = deadline - std::chrono::steady_clock::now();
+    if (remaining <= std::chrono::milliseconds(0)) {
+      return false;
+    }
+    auto wait = std::min<std::chrono::steady_clock::duration>(
+        remaining, std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                       acquire_interval_));
+    std::this_thread::sleep_for(wait);
+  }
+}
+
+Status FileLockManager::Release(const std::string& entity_id,
+                                const std::string& owner_id) {
+  if (file_io_ == nullptr) {
+    return InvalidArgument("FileLockManager: FileIO is null.");
+  }
+  const std::string lock_path = LockFilePath(entity_id);
+  ICEBERG_ASSIGN_OR_RAISE(auto body, file_io_->ReadFile(lock_path, std::nullopt));
+  ICEBERG_ASSIGN_OR_RAISE(auto decoded, DecodeLockBody(body));
+  if (decoded.owner != owner_id) {
+    return NotAllowed("FileLockManager: '{}' is held by '{}', not by '{}'.", lock_path,
+                      decoded.owner, owner_id);
+  }
+  return file_io_->DeleteFile(lock_path);
+}
+
+// ---------------------------------------------------------------------------
 // Factory
 // ---------------------------------------------------------------------------
 
 Result<std::unique_ptr<LockManager>> MakeLockManager(
     const HadoopCatalogProperties& config) {
+  return MakeLockManagerWithIO(config, /*file_io=*/nullptr);
+}
+
+Result<std::unique_ptr<LockManager>> MakeLockManagerWithIO(
+    const HadoopCatalogProperties& config, std::shared_ptr<FileIO> file_io) {
   const auto impl = config.Get(HadoopCatalogProperties::kLockImpl);
   if (impl.empty() || impl == "in-memory") {
     return std::make_unique<InMemoryLockManager>(config);
   }
   if (impl == "file") {
-    return NotSupported(
-        "commit.lock-impl=file requires FileLockManager which is introduced in a "
-        "subsequent commit (H14).");
+    if (file_io == nullptr) {
+      return InvalidArgument(
+          "commit.lock-impl=file requires a FileIO; use MakeLockManagerWithIO from "
+          "HadoopCatalog::Make.");
+    }
+    return std::make_unique<FileLockManager>(std::move(file_io), config);
   }
   return InvalidArgument("Unknown commit.lock-impl '{}'; expected 'in-memory' or 'file'.",
                          impl);
