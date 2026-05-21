@@ -230,19 +230,15 @@ Result<std::string> HiveTableOperations::Commit(const HiveTableMetadataSnapshot&
             "retry the transaction (msg={}).",
             alter_status.error().message);
       }
-      // If the verify GetTable failed because the transport itself broke,
-      // surface that to the caller (and `HmsClientPool::Run`) as
-      // `kServiceUnavailable` so the pool drops the dead client and
-      // reconnects rather than recycling it. The new metadata file is left
-      // in place because we still cannot prove whether AlterTable landed.
-      if (verify.error().kind == ErrorKind::kServiceUnavailable) {
-        return TransportError(
-            "AlterTable + check_commit_status",
-            std::format("alter={}, verify={}", alter_status.error().message,
-                        verify.error().message));
-      }
       // Don't cleanup -- we don't know whether AlterTable actually landed,
       // so deleting new_metadata_location could orphan a committed table.
+      // Don't surface this as `kServiceUnavailable` either: that would
+      // trigger `HmsClientPool::Run`'s reconnect-once contract, which
+      // re-executes the enclosing UpdateTable lambda and could re-apply
+      // mutations a second time on top of a committed-but-unverifiable
+      // first attempt. The pool's broken socket self-heals on the next
+      // caller's first RPC; surfacing `kCommitStateUnknown` here tells
+      // `iceberg::Transaction` to stop retrying instead.
       return CommitStateUnknown(
           "HMS AlterTable failed and verification GetTable also failed; "
           "the commit may or may not have landed (alter={}, verify={}).",
