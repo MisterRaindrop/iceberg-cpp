@@ -23,6 +23,7 @@
 #include <memory>
 #include <string>
 
+#include "iceberg/catalog/hadoop/hadoop_lock_manager.h"
 #include "iceberg/catalog/hadoop/iceberg_hadoop_export.h"
 #include "iceberg/file_io.h"
 #include "iceberg/result.h"
@@ -70,7 +71,14 @@ ICEBERG_HADOOP_EXPORT Result<ResolvedMetadataPointer> ResolveCurrentMetadata(
 /// in subsequent commits.
 class ICEBERG_HADOOP_EXPORT HadoopTableOperations {
  public:
+  /// \brief Construct without a lock manager. Refresh() works; Commit() will
+  /// return kInvalidArgument until a lock manager is wired in via the
+  /// catalog-provided constructor.
   HadoopTableOperations(std::shared_ptr<FileIO> file_io, std::string table_dir);
+
+  /// \brief Construct with a lock manager so Commit() can serialize writers.
+  HadoopTableOperations(std::shared_ptr<FileIO> file_io, std::string table_dir,
+                        std::shared_ptr<LockManager> lock_manager, std::string owner_id);
 
   /// \brief Reload the current metadata for the table.
   ///
@@ -80,12 +88,35 @@ class ICEBERG_HADOOP_EXPORT HadoopTableOperations {
   /// `vN.metadata.json[.codec]` file is present.
   Result<std::shared_ptr<TableMetadata>> Refresh();
 
+  /// \brief Commit `updated` if and only if `base`'s metadata pointer is
+  /// still the current one.
+  ///
+  /// Implements the 10-step Java HadoopTableOperations protocol:
+  ///   1. Reject any change to `metadata.location` (Java requires
+  ///      filesystem tables to stay at their original path).
+  ///   2. Reject metadata that overrides `write.metadata.location`.
+  ///   3. Acquire the LockManager. Acquire timeout -> kCommitFailed.
+  ///   4. Re-resolve the current pointer; if it has drifted from `base`,
+  ///      return kCommitFailed so `iceberg::Transaction` can retry.
+  ///   5. Pick a target filename. The MVP always writes
+  ///      `v{N}.metadata.json` (codec support comes in H15).
+  ///   6. Refuse to overwrite an existing v{N}.metadata.json[.codec]
+  ///      (kCommitFailed) -- belt-and-braces alongside the rename CAS.
+  ///   7. Write the new metadata.
+  ///   8. 3-step `version-hint.text` update: write `.tmp`, delete old,
+  ///      rename `.tmp` -> `version-hint.text` (overwrite=false).
+  ///   9. On rename failure, re-read the hint: if it already points at the
+  ///      new version somebody beat us to but we are consistent;
+  ///      otherwise clean up and return kCommitFailed.
+  ///   10. Release the lock in a `finally`-like cleanup.
+  Status Commit(const TableMetadata& base, const TableMetadata& updated);
+
   /// \brief Location of the metadata file most recently returned by
-  /// `Refresh()`. Empty before the first call.
+  /// `Refresh()` or written by `Commit()`. Empty before either call.
   const std::string& current_metadata_location() const { return current_location_; }
 
   /// \brief Version number associated with `current_metadata_location`.
-  /// Returns 0 before the first refresh.
+  /// Returns 0 before any refresh/commit succeeds.
   int64_t current_version() const { return current_version_; }
 
   /// \brief Table directory this operations object was constructed against.
@@ -94,6 +125,8 @@ class ICEBERG_HADOOP_EXPORT HadoopTableOperations {
  private:
   std::shared_ptr<FileIO> file_io_;
   std::string table_dir_;
+  std::shared_ptr<LockManager> lock_manager_;
+  std::string owner_id_;
   std::string current_location_;
   int64_t current_version_ = 0;
 };

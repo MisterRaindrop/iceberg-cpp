@@ -26,6 +26,7 @@
 
 #include "iceberg/catalog.h"
 #include "iceberg/catalog/hadoop/hadoop_catalog_properties.h"
+#include "iceberg/catalog/hadoop/hadoop_lock_manager.h"
 #include "iceberg/catalog/hadoop/iceberg_hadoop_export.h"
 #include "iceberg/result.h"
 
@@ -129,11 +130,13 @@ class ICEBERG_HADOOP_EXPORT HadoopCatalog
 
  private:
   HadoopCatalog(std::string name, std::shared_ptr<FileIO> file_io,
-                HadoopCatalogProperties config);
+                HadoopCatalogProperties config,
+                std::shared_ptr<LockManager> lock_manager);
 
   std::string name_;
   std::shared_ptr<FileIO> file_io_;
   HadoopCatalogProperties config_;
+  std::shared_ptr<LockManager> lock_manager_;
 };
 
 }  // namespace iceberg::hadoop

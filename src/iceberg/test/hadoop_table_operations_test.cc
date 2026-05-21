@@ -28,7 +28,9 @@
 #include <gtest/gtest.h>
 
 #include "iceberg/arrow/arrow_io_internal.h"
+#include "iceberg/catalog/hadoop/hadoop_catalog_properties.h"
 #include "iceberg/catalog/hadoop/hadoop_file_layout.h"
+#include "iceberg/catalog/hadoop/hadoop_lock_manager.h"
 #include "iceberg/test/matchers.h"
 #include "iceberg/test/temp_file_test_base.h"
 #include "iceberg/test/test_resource.h"
@@ -156,6 +158,76 @@ TEST_F(HadoopTableOperationsTest, RefreshFailsWhenNoMetadata) {
   auto res = ops.Refresh();
   ASSERT_FALSE(res.has_value());
   EXPECT_EQ(ErrorKind::kNoSuchTable, res.error().kind);
+}
+
+class HadoopCommitTest : public HadoopTableOperationsTest {
+ protected:
+  void SetUp() override {
+    HadoopTableOperationsTest::SetUp();
+    auto props = HadoopCatalogProperties::FromMap({
+        {"warehouse", warehouse_},
+        {"lock.acquire-timeout-ms", "1000"},
+        {"lock.acquire-interval-ms", "20"},
+    });
+    ICEBERG_UNWRAP_OR_FAIL(auto manager, MakeLockManager(props));
+    lock_manager_ = std::shared_ptr<LockManager>(std::move(manager));
+  }
+
+  std::shared_ptr<LockManager> lock_manager_;
+};
+
+TEST_F(HadoopCommitTest, CommitWritesNextVersionAndUpdatesHint) {
+  const std::string body = SlurpResource("TableMetadataV1Valid.json");
+  SeedMetadataFile(1, MetadataCompressionCodec::kNone, body);
+  SeedVersionHint("1");
+
+  HadoopTableOperations ops(file_io_, table_dir_, lock_manager_, "test-owner");
+  ICEBERG_UNWRAP_OR_FAIL(auto base, ops.Refresh());
+  // For this commit test we simply commit the same metadata back as v2.
+  // (UpdateTable does the real builder dance; here we just exercise the
+  // commit primitives.)
+  ASSERT_TRUE(ops.Commit(*base, *base).has_value());
+  EXPECT_EQ(ops.current_version(), 2);
+  EXPECT_TRUE(ops.current_metadata_location().ends_with("v2.metadata.json"));
+
+  // Refresh from a fresh ops sees the new pointer.
+  HadoopTableOperations fresh(file_io_, table_dir_);
+  ICEBERG_UNWRAP_OR_FAIL(auto reloaded, fresh.Refresh());
+  EXPECT_EQ(fresh.current_version(), 2);
+  EXPECT_NE(reloaded, nullptr);
+}
+
+TEST_F(HadoopCommitTest, CommitRejectsRelocation) {
+  const std::string body = SlurpResource("TableMetadataV1Valid.json");
+  SeedMetadataFile(1, MetadataCompressionCodec::kNone, body);
+  SeedVersionHint("1");
+
+  HadoopTableOperations ops(file_io_, table_dir_, lock_manager_, "test-owner");
+  ICEBERG_UNWRAP_OR_FAIL(auto base, ops.Refresh());
+  TableMetadata updated = *base;
+  updated.location = updated.location + "/relocated";
+  auto res = ops.Commit(*base, updated);
+  ASSERT_FALSE(res.has_value());
+  EXPECT_EQ(ErrorKind::kInvalidArgument, res.error().kind);
+}
+
+TEST_F(HadoopCommitTest, CommitRejectsStaleBase) {
+  const std::string body = SlurpResource("TableMetadataV1Valid.json");
+  SeedMetadataFile(1, MetadataCompressionCodec::kNone, body);
+  SeedVersionHint("1");
+
+  HadoopTableOperations a(file_io_, table_dir_, lock_manager_, "owner-a");
+  HadoopTableOperations b(file_io_, table_dir_, lock_manager_, "owner-b");
+  ICEBERG_UNWRAP_OR_FAIL(auto base_a, a.Refresh());
+  ICEBERG_UNWRAP_OR_FAIL(auto base_b, b.Refresh());
+
+  // a wins.
+  ASSERT_TRUE(a.Commit(*base_a, *base_a).has_value());
+
+  // b's view is now stale.
+  auto res = b.Commit(*base_b, *base_b);
+  ASSERT_FALSE(res.has_value());
+  EXPECT_EQ(ErrorKind::kCommitFailed, res.error().kind);
 }
 
 }  // namespace iceberg::hadoop

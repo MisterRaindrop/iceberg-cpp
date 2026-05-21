@@ -19,6 +19,7 @@
 
 #include "iceberg/catalog/hadoop/hadoop_table_operations.h"
 
+#include <format>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -133,6 +134,15 @@ HadoopTableOperations::HadoopTableOperations(std::shared_ptr<FileIO> file_io,
                                              std::string table_dir)
     : file_io_(std::move(file_io)), table_dir_(std::move(table_dir)) {}
 
+HadoopTableOperations::HadoopTableOperations(std::shared_ptr<FileIO> file_io,
+                                             std::string table_dir,
+                                             std::shared_ptr<LockManager> lock_manager,
+                                             std::string owner_id)
+    : file_io_(std::move(file_io)),
+      table_dir_(std::move(table_dir)),
+      lock_manager_(std::move(lock_manager)),
+      owner_id_(std::move(owner_id)) {}
+
 Result<std::shared_ptr<TableMetadata>> HadoopTableOperations::Refresh() {
   if (file_io_ == nullptr) {
     return InvalidArgument("HadoopTableOperations: FileIO is null.");
@@ -143,6 +153,136 @@ Result<std::shared_ptr<TableMetadata>> HadoopTableOperations::Refresh() {
   current_location_ = pointer.location;
   current_version_ = pointer.version;
   return std::shared_ptr<TableMetadata>(std::move(metadata));
+}
+
+namespace {
+
+constexpr std::string_view kWriteMetadataLocation = "write.metadata.location";
+
+// RAII guard that releases a held lock when leaving the Commit scope. The
+// guard is no-op when no lock manager is wired in (e.g. during unit tests
+// that exercise the algorithm without acquiring) which keeps the body of
+// Commit() linear and easy to reason about.
+struct LockReleaseGuard {
+  LockManager* manager = nullptr;
+  std::string entity_id;
+  std::string owner_id;
+  bool active = false;
+
+  ~LockReleaseGuard() {
+    if (active && manager != nullptr) {
+      std::ignore = manager->Release(entity_id, owner_id);
+    }
+  }
+};
+
+}  // namespace
+
+Status HadoopTableOperations::Commit(const TableMetadata& base,
+                                     const TableMetadata& updated) {
+  if (file_io_ == nullptr) {
+    return InvalidArgument("HadoopTableOperations: FileIO is null.");
+  }
+  if (lock_manager_ == nullptr) {
+    return InvalidArgument(
+        "HadoopTableOperations::Commit requires a LockManager. Construct with the "
+        "4-arg constructor or use HadoopCatalog::UpdateTable.");
+  }
+
+  // (1) Path-based tables cannot relocate. This is a Java hard constraint and
+  // protects callers from accidentally orphaning their data directory.
+  if (base.location != updated.location) {
+    return InvalidArgument("Hadoop path-based tables cannot be relocated ('{}' != '{}').",
+                           base.location, updated.location);
+  }
+  // (2) Path-based tables cannot redirect metadata to an external location;
+  // doing so would break version-hint.text resolution.
+  if (updated.properties.configs().contains(std::string(kWriteMetadataLocation))) {
+    return InvalidArgument(
+        "Hadoop path-based tables cannot set '{}'; the metadata directory is fixed "
+        "under the table location.",
+        kWriteMetadataLocation);
+  }
+
+  // (3) Acquire the lock.
+  ICEBERG_ASSIGN_OR_RAISE(auto acquired, lock_manager_->Acquire(table_dir_, owner_id_));
+  if (!acquired) {
+    return CommitFailed(
+        "HadoopTableOperations::Commit: failed to acquire lock for '{}' within the "
+        "configured timeout.",
+        table_dir_);
+  }
+  LockReleaseGuard guard{.manager = lock_manager_.get(),
+                         .entity_id = table_dir_,
+                         .owner_id = owner_id_,
+                         .active = true};
+
+  // (4) CAS check: ensure no concurrent writer has advanced the pointer.
+  ICEBERG_ASSIGN_OR_RAISE(auto current, ResolveCurrentMetadata(*file_io_, table_dir_));
+  if (current.version != current_version_) {
+    return CommitFailed(
+        "HadoopTableOperations::Commit: stale base. current version {} != cached {}.",
+        current.version, current_version_);
+  }
+
+  // (5) MVP: write `vN.metadata.json` without codec. Codec support is added
+  // in H15 once the gzip writer is wired in.
+  const int64_t next_version = current.version + 1;
+  const auto codec = MetadataCompressionCodec::kNone;
+  const std::string target = MetadataFilePath(table_dir_, next_version, codec);
+
+  // (6) Fail-if-exists belt: even if the lock manager raced, refuse to clobber
+  // an existing v{N} file.
+  ICEBERG_ASSIGN_OR_RAISE(auto target_exists, file_io_->Exists(target));
+  if (target_exists) {
+    return CommitFailed(
+        "HadoopTableOperations::Commit: target metadata file '{}' already exists.",
+        target);
+  }
+
+  // (7) Write the new metadata file.
+  ICEBERG_RETURN_UNEXPECTED(TableMetadataUtil::Write(*file_io_, target, updated));
+
+  // (8) Update version-hint.text atomically: write tmp -> delete old -> rename.
+  const std::string hint = VersionHintPath(table_dir_);
+  const std::string hint_tmp = hint + ".tmp";
+  const std::string payload = std::format("{}\n", next_version);
+  if (auto write_status = file_io_->WriteFile(hint_tmp, payload);
+      !write_status.has_value()) {
+    std::ignore = file_io_->DeleteFile(target);
+    return write_status;
+  }
+  // Delete the old hint best-effort; an explicit DeleteFile failure is ok
+  // because the subsequent Rename(overwrite=false) below would also fail and
+  // we handle that.
+  std::ignore = file_io_->DeleteFile(hint);
+
+  auto rename_status = file_io_->Rename(hint_tmp, hint, /*overwrite=*/false);
+  if (!rename_status.has_value()) {
+    // (9) Recovery: the rename failed. Check whether some other writer (or
+    // an earlier crashed run) already advanced the hint to our new version
+    // -- if so, we landed despite the error.
+    auto recheck = ResolveCurrentMetadata(*file_io_, table_dir_);
+    if (recheck.has_value() && recheck->version == next_version) {
+      std::ignore = file_io_->DeleteFile(hint_tmp);
+      current_location_ = target;
+      current_version_ = next_version;
+      return {};
+    }
+    // Otherwise treat as a true failure: clean up our v{N+1} file and the
+    // tmp hint, return kCommitFailed so the Transaction can retry.
+    std::ignore = file_io_->DeleteFile(target);
+    std::ignore = file_io_->DeleteFile(hint_tmp);
+    return CommitFailed(
+        "HadoopTableOperations::Commit: rename of version-hint.text failed and the "
+        "hint did not advance: {}.",
+        rename_status.error().message);
+  }
+
+  current_location_ = target;
+  current_version_ = next_version;
+  // (10) Lock is released by `guard` at scope exit.
+  return {};
 }
 
 }  // namespace iceberg::hadoop

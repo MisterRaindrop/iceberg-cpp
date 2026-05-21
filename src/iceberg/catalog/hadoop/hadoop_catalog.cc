@@ -28,6 +28,9 @@
 #include "iceberg/file_io.h"
 #include "iceberg/table.h"
 #include "iceberg/table_metadata.h"
+#include "iceberg/table_requirements.h"
+#include "iceberg/table_update.h"
+#include "iceberg/util/checked_cast.h"
 #include "iceberg/util/macros.h"
 
 namespace iceberg::hadoop {
@@ -64,14 +67,20 @@ Result<std::shared_ptr<HadoopCatalog>> HadoopCatalog::Make(
   }
   ICEBERG_ASSIGN_OR_RAISE(auto warehouse, config.Warehouse());
   MaybeWarnS3Warehouse(warehouse);
+  ICEBERG_ASSIGN_OR_RAISE(auto lock_manager, hadoop::MakeLockManager(config));
 
   return std::shared_ptr<HadoopCatalog>(
-      new HadoopCatalog(std::string(name), std::move(file_io), std::move(config)));
+      new HadoopCatalog(std::string(name), std::move(file_io), std::move(config),
+                        std::shared_ptr<LockManager>(std::move(lock_manager))));
 }
 
 HadoopCatalog::HadoopCatalog(std::string name, std::shared_ptr<FileIO> file_io,
-                             HadoopCatalogProperties config)
-    : name_(std::move(name)), file_io_(std::move(file_io)), config_(std::move(config)) {}
+                             HadoopCatalogProperties config,
+                             std::shared_ptr<LockManager> lock_manager)
+    : name_(std::move(name)),
+      file_io_(std::move(file_io)),
+      config_(std::move(config)),
+      lock_manager_(std::move(lock_manager)) {}
 
 std::string_view HadoopCatalog::name() const { return name_; }
 
@@ -267,10 +276,72 @@ Result<std::shared_ptr<Table>> HadoopCatalog::CreateTable(
 }
 
 Result<std::shared_ptr<Table>> HadoopCatalog::UpdateTable(
-    const TableIdentifier& /*identifier*/,
-    const std::vector<std::unique_ptr<TableRequirement>>& /*requirements*/,
-    const std::vector<std::unique_ptr<TableUpdate>>& /*updates*/) {
-  return NotSupported("HadoopCatalog::UpdateTable: {}", kStubMessage);
+    const TableIdentifier& identifier,
+    const std::vector<std::unique_ptr<TableRequirement>>& requirements,
+    const std::vector<std::unique_ptr<TableUpdate>>& updates) {
+  ICEBERG_RETURN_UNEXPECTED(hadoop::ValidateTableIdentifier(identifier));
+  ICEBERG_ASSIGN_OR_RAISE(auto warehouse, config_.Warehouse());
+  ICEBERG_ASSIGN_OR_RAISE(auto table_dir, hadoop::TableDir(warehouse, identifier));
+
+  // Build the per-call owner id so concurrent calls from the same catalog
+  // can be told apart in the lock manager logs.
+  std::string owner_id = name_ + ":" + identifier.ToString();
+  HadoopTableOperations ops(file_io_, table_dir, lock_manager_, std::move(owner_id));
+
+  ICEBERG_ASSIGN_OR_RAISE(auto is_create, TableRequirements::IsCreate(requirements));
+  std::shared_ptr<TableMetadata> base;
+  std::unique_ptr<TableMetadataBuilder> builder;
+  if (is_create) {
+    // Reject if a table already exists at this location.
+    ICEBERG_ASSIGN_OR_RAISE(auto already_table,
+                            hadoop::IsHadoopTableDir(*file_io_, table_dir));
+    if (already_table) {
+      return AlreadyExists("Table '{}' already exists at {}.", identifier.ToString(),
+                           table_dir);
+    }
+    int8_t format_version = TableMetadata::kDefaultTableFormatVersion;
+    for (const auto& update : updates) {
+      if (update->kind() == TableUpdate::Kind::kUpgradeFormatVersion) {
+        format_version =
+            internal::checked_cast<const table::UpgradeFormatVersion&>(*update)
+                .format_version();
+      }
+    }
+    builder = TableMetadataBuilder::BuildFromEmpty(format_version);
+  } else {
+    ICEBERG_ASSIGN_OR_RAISE(base, ops.Refresh());
+    builder = TableMetadataBuilder::BuildFrom(base.get());
+  }
+
+  for (const auto& requirement : requirements) {
+    ICEBERG_RETURN_UNEXPECTED(requirement->Validate(base.get()));
+  }
+  for (const auto& update : updates) {
+    update->ApplyTo(*builder);
+  }
+  ICEBERG_ASSIGN_OR_RAISE(auto updated, builder->Build());
+
+  if (is_create) {
+    // For create transactions, write v1 + version-hint via the same path as
+    // CreateTable so the on-disk layout is consistent.
+    const std::string metadata_dir = hadoop::MetadataDir(table_dir);
+    ICEBERG_RETURN_UNEXPECTED(file_io_->CreateDir(metadata_dir));
+    const std::string metadata_path = hadoop::MetadataFilePath(
+        table_dir, /*version=*/1, MetadataCompressionCodec::kNone);
+    ICEBERG_RETURN_UNEXPECTED(
+        TableMetadataUtil::Write(*file_io_, metadata_path, *updated));
+    ICEBERG_RETURN_UNEXPECTED(
+        file_io_->WriteFile(hadoop::VersionHintPath(table_dir), std::string("1\n")));
+    std::shared_ptr<TableMetadata> updated_ptr = std::move(updated);
+    return Table::Make(identifier, updated_ptr, metadata_path, file_io_,
+                       shared_from_this());
+  }
+
+  // Otherwise delegate to HadoopTableOperations::Commit for the CAS path.
+  ICEBERG_RETURN_UNEXPECTED(ops.Commit(*base, *updated));
+  std::shared_ptr<TableMetadata> updated_ptr = std::move(updated);
+  return Table::Make(identifier, updated_ptr, ops.current_metadata_location(), file_io_,
+                     shared_from_this());
 }
 
 Result<std::shared_ptr<Transaction>> HadoopCatalog::StageCreateTable(

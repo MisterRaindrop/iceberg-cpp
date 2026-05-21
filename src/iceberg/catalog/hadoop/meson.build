@@ -19,6 +19,7 @@ iceberg_hadoop_sources = files(
     'hadoop_catalog.cc',
     'hadoop_catalog_properties.cc',
     'hadoop_file_layout.cc',
+    'hadoop_lock_manager.cc',
     'hadoop_table_operations.cc',
 )
 
@@ -49,6 +50,7 @@ install_headers(
         'hadoop_catalog.h',
         'hadoop_catalog_properties.h',
         'hadoop_file_layout.h',
+        'hadoop_lock_manager.h',
         'hadoop_table_operations.h',
         'iceberg_hadoop_export.h',
     ],
