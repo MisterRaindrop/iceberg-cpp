@@ -29,6 +29,10 @@
 #include "iceberg/catalog/hive/iceberg_hive_export.h"
 #include "iceberg/result.h"
 
+namespace Apache::Hadoop::Hive {
+class ThriftHiveMetastoreIf;
+}  // namespace Apache::Hadoop::Hive
+
 /// \file iceberg/catalog/hive/hms_client.h
 /// \brief Thin wrapper around the generated Hive Metastore Thrift client.
 ///
@@ -235,6 +239,12 @@ class ICEBERG_HIVE_EXPORT HmsClient {
   std::unique_ptr<Impl> impl_;
 
   explicit HmsClient(std::unique_ptr<Impl> impl);
+
+  // Grants the test-only factory in hms_client.cc access to the
+  // private `Impl` and the `Impl`-bearing constructor without
+  // widening either surface for production code.
+  friend std::unique_ptr<HmsClient> HmsClientForTesting(
+      std::unique_ptr<Apache::Hadoop::Hive::ThriftHiveMetastoreIf> client);
 };
 
 /// \brief RAII background thread that keeps an HMS lock alive while it

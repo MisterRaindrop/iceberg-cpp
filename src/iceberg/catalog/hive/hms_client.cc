@@ -175,7 +175,12 @@ class HmsClient::Impl {
   std::shared_ptr<apache::thrift::transport::TSocket> socket;
   std::shared_ptr<apache::thrift::transport::TTransport> transport;
   std::shared_ptr<apache::thrift::protocol::TProtocol> protocol;
-  std::unique_ptr<Apache::Hadoop::Hive::ThriftHiveMetastoreClient> client;
+  // Holds the generated ThriftHiveMetastoreClient in production; tests
+  // (via the `HmsClientForTesting` factory at the bottom of this file)
+  // substitute a `ThriftHiveMetastoreNull` subclass that scripts each
+  // RPC's response or throws specific HMS exception types so the
+  // catch-block plumbing in this file is unit-testable.
+  std::unique_ptr<Apache::Hadoop::Hive::ThriftHiveMetastoreIf> client;
 };
 
 namespace {
@@ -623,7 +628,7 @@ struct CheckLockOutcome {
   bool transport_failed = false;
 };
 
-CheckLockOutcome PollCheckLock(Apache::Hadoop::Hive::ThriftHiveMetastoreClient* client,
+CheckLockOutcome PollCheckLock(Apache::Hadoop::Hive::ThriftHiveMetastoreIf* client,
                                int64_t lockid, const HmsLockOptions& options) {
   using clock = std::chrono::steady_clock;
   const auto deadline =
@@ -867,6 +872,18 @@ void HmsLockHeartbeat::Stop() {
   if (impl_->worker.joinable()) {
     impl_->worker.join();
   }
+}
+
+// Test-only factory. Lets `hms_client_replay_test` substitute a fake
+// ThriftHiveMetastoreIf so the catch-block plumbing in this file's
+// RPC wrappers is unit-testable without a live HMS. The
+// `Apache::Hadoop::Hive::*` types stay confined to this translation
+// unit -- tests reach this entry point via `hms_client_test_seam.h`.
+std::unique_ptr<HmsClient> HmsClientForTesting(
+    std::unique_ptr<Apache::Hadoop::Hive::ThriftHiveMetastoreIf> client) {
+  auto impl = std::make_unique<HmsClient::Impl>();
+  impl->client = std::move(client);
+  return std::unique_ptr<HmsClient>(new HmsClient(std::move(impl)));
 }
 
 }  // namespace iceberg::hive
