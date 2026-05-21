@@ -109,59 +109,34 @@ Status HiveCatalog::CreateNamespace(
     const Namespace& ns, const std::unordered_map<std::string, std::string>& properties) {
   ICEBERG_ASSIGN_OR_RAISE(auto database, ConvertToHiveDatabase(ns, properties));
   // Replay safety: HmsClientPool::Run retries once on transport failure
-  // by re-invoking the same lambda. If our first CreateDatabase landed
-  // server-side but the reply was lost, the retry sees `kAlreadyExists`
-  // for what is actually our own row. Distinguish that from a genuine
-  // foreign-namespace collision (potentially created by a concurrent
-  // third party between our two attempts) by comparing every field we
-  // explicitly populated in our request against the row HMS now holds.
-  // A field we left empty is treated as "don't care" (HMS may inject
-  // defaults like a generated location_uri); a field we populated must
-  // match exactly. All caller-provided parameters must be present in
-  // HMS's row with the same value -- extra HMS-internal parameters are
-  // fine.
-  return client_pool_->Run([&, create_attempted =
-                                   false](HmsClient* client) mutable -> Status {
-    auto status = client->CreateDatabase(database);
-    if (!status.has_value() && create_attempted &&
-        status.error().kind == ErrorKind::kAlreadyExists) {
-      auto existing = client->GetDatabase(ns.levels[0]);
-      if (existing.has_value()) {
-        const HiveDatabase& current = *existing;
-        const auto field_matches = [](const std::string& want, const std::string& got) {
-          return want.empty() || want == got;
-        };
-        const bool fields_match =
-            field_matches(database.description, current.description) &&
-            field_matches(database.location_uri, current.location_uri) &&
-            field_matches(database.owner_name, current.owner_name) &&
-            field_matches(database.owner_type, current.owner_type);
-        bool params_match = fields_match;
-        if (params_match) {
-          for (const auto& [key, value] : database.parameters) {
-            auto it = current.parameters.find(key);
-            if (it == current.parameters.end() || it->second != value) {
-              params_match = false;
-              break;
-            }
-          }
+  // by re-invoking the same lambda. If our first CreateDatabase's reply
+  // was lost, the retry sees `kAlreadyExists` -- but there is NO unique
+  // identity token attached to a namespace creation (no analogue of a
+  // table's `metadata_location`), so we cannot prove the existing row
+  // came from our own first attempt rather than a concurrent writer
+  // that landed between our two attempts. Field/parameter equality is
+  // insufficient evidence: a third party creating the same name with
+  // identical properties would match the same way.
+  //
+  // Surface `kCommitStateUnknown` instead. The caller can call
+  // `GetNamespaceProperties` to inspect the row if they care, and
+  // `iceberg::Transaction` (when present) will stop retrying. A first-
+  // attempt `kAlreadyExists` (no replay involved) still propagates
+  // verbatim because it is unambiguously a foreign-row collision.
+  return client_pool_->Run(
+      [&, create_attempted = false](HmsClient* client) mutable -> Status {
+        auto status = client->CreateDatabase(database);
+        if (!status.has_value() && create_attempted &&
+            status.error().kind == ErrorKind::kAlreadyExists) {
+          return CommitStateUnknown(
+              "HMS CreateDatabase for namespace '{}' hit AlreadyExists on retry "
+              "after a transport failure; cannot prove whether our first "
+              "attempt landed or a concurrent writer created the same name.",
+              ns.levels[0]);
         }
-        // Refuse to claim success when the caller supplied nothing
-        // distinguishing -- with all-empty fields we cannot prove
-        // the existing row came from our own replayed call rather
-        // than from a third party.
-        const bool we_set_anything =
-            !database.description.empty() || !database.location_uri.empty() ||
-            !database.owner_name.empty() || !database.owner_type.empty() ||
-            !database.parameters.empty();
-        if (params_match && we_set_anything) {
-          return {};
-        }
-      }
-    }
-    create_attempted = true;
-    return status;
-  });
+        create_attempted = true;
+        return status;
+      });
 }
 
 Result<std::vector<Namespace>> HiveCatalog::ListNamespaces(const Namespace& ns) const {
