@@ -26,6 +26,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "iceberg/iceberg_export.h"
 #include "iceberg/result.h"
@@ -153,6 +154,62 @@ class ICEBERG_EXPORT FileIO {
   /// \return void if the delete succeeded, an error code if the delete failed.
   virtual Status DeleteFile(const std::string& file_location) {
     return NotImplemented("DeleteFile not implemented");
+  }
+
+  // Directory operations.
+  //
+  // These are required by catalog implementations that map their namespace /
+  // table layout onto the filesystem (e.g. HadoopCatalog). They default to
+  // NotImplemented so existing FileIO impls (e.g. REST file IO that only
+  // talks through HTTP) keep compiling.
+
+  /// \brief Recursively create a directory at `dir_location`. Creating an
+  /// existing directory is a no-op (mkdir -p semantics).
+  virtual Status CreateDir(const std::string& dir_location) {
+    return NotImplemented("CreateDir not implemented");
+  }
+
+  /// \brief Return true if a file or directory exists at the given location.
+  virtual Result<bool> Exists(const std::string& location) {
+    return NotImplemented("Exists not implemented");
+  }
+
+  /// \brief Return true iff `location` resolves to a directory.
+  virtual Result<bool> IsDirectory(const std::string& location) {
+    return NotImplemented("IsDirectory not implemented");
+  }
+
+  /// \brief Result entry returned by ListDir.
+  struct ListEntry {
+    std::string location;
+    bool is_directory = false;
+  };
+
+  /// \brief List the immediate children of `dir_location` (non-recursive).
+  ///
+  /// Returns absolute locations (formatted the same way the caller would pass
+  /// in to `NewInputFile` etc.). Returning an error for a missing or
+  /// not-a-directory `dir_location` is implementation-defined; callers should
+  /// check `IsDirectory` first when that distinction matters.
+  virtual Result<std::vector<ListEntry>> ListDir(const std::string& dir_location) {
+    return NotImplemented("ListDir not implemented");
+  }
+
+  /// \brief Delete a directory.
+  ///
+  /// When `recursive` is false the call should fail if the directory is
+  /// non-empty (rmdir semantics). When `recursive` is true the entire tree
+  /// is removed.
+  virtual Status DeleteDir(const std::string& dir_location, bool recursive) {
+    return NotImplemented("DeleteDir not implemented");
+  }
+
+  /// \brief Atomically rename a file or directory.
+  ///
+  /// `overwrite=false` should fail if the destination already exists. This is
+  /// the primitive HadoopCatalog uses to perform CAS on `version-hint.text`.
+  virtual Status Rename(const std::string& from, const std::string& to, bool overwrite) {
+    return NotImplemented("Rename not implemented");
   }
 };
 

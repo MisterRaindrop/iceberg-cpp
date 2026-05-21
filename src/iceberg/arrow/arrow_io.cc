@@ -24,6 +24,7 @@
 #include <optional>
 
 #include <arrow/buffer.h>
+#include <arrow/filesystem/filesystem.h>
 #include <arrow/filesystem/localfs.h>
 #include <arrow/filesystem/mockfs.h>
 #include <arrow/io/interfaces.h>
@@ -565,6 +566,98 @@ Result<std::unique_ptr<OutputFile>> ArrowFileSystemFileIO::NewOutputFile(
 Status ArrowFileSystemFileIO::DeleteFile(const std::string& file_location) {
   ICEBERG_ASSIGN_OR_RAISE(auto path, ResolvePath(file_location));
   ICEBERG_ARROW_RETURN_NOT_OK(arrow_fs_->DeleteFile(path));
+  return {};
+}
+
+Status ArrowFileSystemFileIO::CreateDir(const std::string& dir_location) {
+  ICEBERG_ASSIGN_OR_RAISE(auto path, ResolvePath(dir_location));
+  ICEBERG_ARROW_RETURN_NOT_OK(arrow_fs_->CreateDir(path, /*recursive=*/true));
+  return {};
+}
+
+Result<bool> ArrowFileSystemFileIO::Exists(const std::string& location) {
+  ICEBERG_ASSIGN_OR_RAISE(auto path, ResolvePath(location));
+  auto info_result = arrow_fs_->GetFileInfo(path);
+  if (!info_result.ok()) {
+    return IOError("GetFileInfo failed for '{}': {}", location,
+                   info_result.status().ToString());
+  }
+  return info_result->type() != ::arrow::fs::FileType::NotFound;
+}
+
+Result<bool> ArrowFileSystemFileIO::IsDirectory(const std::string& location) {
+  ICEBERG_ASSIGN_OR_RAISE(auto path, ResolvePath(location));
+  auto info_result = arrow_fs_->GetFileInfo(path);
+  if (!info_result.ok()) {
+    return IOError("GetFileInfo failed for '{}': {}", location,
+                   info_result.status().ToString());
+  }
+  return info_result->type() == ::arrow::fs::FileType::Directory;
+}
+
+Result<std::vector<FileIO::ListEntry>> ArrowFileSystemFileIO::ListDir(
+    const std::string& dir_location) {
+  ICEBERG_ASSIGN_OR_RAISE(auto path, ResolvePath(dir_location));
+  ::arrow::fs::FileSelector selector;
+  selector.base_dir = path;
+  selector.recursive = false;
+  selector.allow_not_found = false;
+  auto infos_result = arrow_fs_->GetFileInfo(selector);
+  if (!infos_result.ok()) {
+    return IOError("ListDir failed for '{}': {}", dir_location,
+                   infos_result.status().ToString());
+  }
+  std::vector<FileIO::ListEntry> entries;
+  entries.reserve(infos_result->size());
+  for (const auto& info : *infos_result) {
+    entries.push_back(FileIO::ListEntry{
+        .location = info.path(),
+        .is_directory = info.type() == ::arrow::fs::FileType::Directory,
+    });
+  }
+  return entries;
+}
+
+Status ArrowFileSystemFileIO::DeleteDir(const std::string& dir_location, bool recursive) {
+  ICEBERG_ASSIGN_OR_RAISE(auto path, ResolvePath(dir_location));
+  if (recursive) {
+    ICEBERG_ARROW_RETURN_NOT_OK(arrow_fs_->DeleteDir(path));
+    return {};
+  }
+  // Non-recursive: refuse if any children exist. arrow has no rmdir-like
+  // primitive that rejects non-empty dirs, so list first and bail out.
+  ::arrow::fs::FileSelector selector;
+  selector.base_dir = path;
+  selector.recursive = false;
+  selector.allow_not_found = false;
+  auto infos_result = arrow_fs_->GetFileInfo(selector);
+  if (!infos_result.ok()) {
+    return IOError("DeleteDir(non-recursive) GetFileInfo failed for '{}': {}",
+                   dir_location, infos_result.status().ToString());
+  }
+  if (!infos_result->empty()) {
+    return NotAllowed("DeleteDir(non-recursive) refused: '{}' is not empty.",
+                      dir_location);
+  }
+  ICEBERG_ARROW_RETURN_NOT_OK(arrow_fs_->DeleteDir(path));
+  return {};
+}
+
+Status ArrowFileSystemFileIO::Rename(const std::string& from, const std::string& to,
+                                     bool overwrite) {
+  ICEBERG_ASSIGN_OR_RAISE(auto from_path, ResolvePath(from));
+  ICEBERG_ASSIGN_OR_RAISE(auto to_path, ResolvePath(to));
+  if (!overwrite) {
+    auto info_result = arrow_fs_->GetFileInfo(to_path);
+    if (!info_result.ok()) {
+      return IOError("Rename pre-check failed for '{}': {}", to,
+                     info_result.status().ToString());
+    }
+    if (info_result->type() != ::arrow::fs::FileType::NotFound) {
+      return AlreadyExists("Rename destination '{}' already exists.", to);
+    }
+  }
+  ICEBERG_ARROW_RETURN_NOT_OK(arrow_fs_->Move(from_path, to_path));
   return {};
 }
 

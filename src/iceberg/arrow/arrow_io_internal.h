@@ -77,6 +77,15 @@ class ICEBERG_BUNDLE_EXPORT ArrowFileSystemFileIO : public FileIO {
   /// \brief Delete a file at the given location.
   Status DeleteFile(const std::string& file_location) override;
 
+  // Directory ops (override the base class defaults).
+  Status CreateDir(const std::string& dir_location) override;
+  Result<bool> Exists(const std::string& location) override;
+  Result<bool> IsDirectory(const std::string& location) override;
+  Result<std::vector<FileIO::ListEntry>> ListDir(
+      const std::string& dir_location) override;
+  Status DeleteDir(const std::string& dir_location, bool recursive) override;
+  Status Rename(const std::string& from, const std::string& to, bool overwrite) override;
+
   /// \brief Get the Arrow file system.
   const std::shared_ptr<::arrow::fs::FileSystem>& fs() const { return arrow_fs_; }
 

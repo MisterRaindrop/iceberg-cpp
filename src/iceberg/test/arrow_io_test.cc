@@ -341,6 +341,95 @@ TEST_F(LocalFileIOTest, DeleteFile) {
   EXPECT_THAT(del_res, HasErrorMessage("Cannot delete file"));
 }
 
+TEST_F(LocalFileIOTest, CreateDirAndExists) {
+  const std::string root = CreateTempDirectory();
+  const std::string nested = root + "/a/b/c";
+
+  ICEBERG_UNWRAP_OR_FAIL(auto exists_before, file_io_->Exists(nested));
+  EXPECT_FALSE(exists_before);
+
+  EXPECT_THAT(file_io_->CreateDir(nested), IsOk());
+
+  ICEBERG_UNWRAP_OR_FAIL(auto exists_after, file_io_->Exists(nested));
+  EXPECT_TRUE(exists_after);
+  ICEBERG_UNWRAP_OR_FAIL(auto is_dir, file_io_->IsDirectory(nested));
+  EXPECT_TRUE(is_dir);
+
+  // Re-creating an existing directory is a no-op (mkdir -p semantics).
+  EXPECT_THAT(file_io_->CreateDir(nested), IsOk());
+}
+
+TEST_F(LocalFileIOTest, ListDirReturnsEntriesAndFlagsDirectories) {
+  const std::string root = CreateTempDirectory();
+  EXPECT_THAT(file_io_->CreateDir(root + "/sub"), IsOk());
+  EXPECT_THAT(file_io_->WriteFile(root + "/note.txt", "x"), IsOk());
+
+  ICEBERG_UNWRAP_OR_FAIL(auto entries, file_io_->ListDir(root));
+  ASSERT_EQ(entries.size(), 2);
+
+  bool saw_dir = false;
+  bool saw_file = false;
+  for (const auto& entry : entries) {
+    if (entry.is_directory && entry.location.ends_with("sub")) {
+      saw_dir = true;
+    }
+    if (!entry.is_directory && entry.location.ends_with("note.txt")) {
+      saw_file = true;
+    }
+  }
+  EXPECT_TRUE(saw_dir);
+  EXPECT_TRUE(saw_file);
+}
+
+TEST_F(LocalFileIOTest, DeleteDirRespectsRecursiveFlag) {
+  const std::string root = CreateTempDirectory();
+  const std::string non_empty = root + "/has_child";
+  EXPECT_THAT(file_io_->CreateDir(non_empty), IsOk());
+  EXPECT_THAT(file_io_->WriteFile(non_empty + "/child.txt", "y"), IsOk());
+
+  // Non-recursive must refuse to delete a non-empty directory.
+  EXPECT_THAT(file_io_->DeleteDir(non_empty, /*recursive=*/false),
+              IsError(ErrorKind::kNotAllowed));
+
+  // Recursive removes the tree.
+  EXPECT_THAT(file_io_->DeleteDir(non_empty, /*recursive=*/true), IsOk());
+  ICEBERG_UNWRAP_OR_FAIL(auto exists, file_io_->Exists(non_empty));
+  EXPECT_FALSE(exists);
+
+  // Non-recursive deleting an empty directory succeeds.
+  const std::string empty_dir = root + "/empty";
+  EXPECT_THAT(file_io_->CreateDir(empty_dir), IsOk());
+  EXPECT_THAT(file_io_->DeleteDir(empty_dir, /*recursive=*/false), IsOk());
+}
+
+TEST_F(LocalFileIOTest, RenameHonoursOverwriteFlag) {
+  const std::string root = CreateTempDirectory();
+  const std::string src = root + "/src.txt";
+  const std::string dst = root + "/dst.txt";
+  EXPECT_THAT(file_io_->WriteFile(src, "hello"), IsOk());
+
+  EXPECT_THAT(file_io_->Rename(src, dst, /*overwrite=*/false), IsOk());
+
+  // Source no longer exists; destination has the content.
+  ICEBERG_UNWRAP_OR_FAIL(auto src_exists, file_io_->Exists(src));
+  EXPECT_FALSE(src_exists);
+  ICEBERG_UNWRAP_OR_FAIL(auto dst_exists, file_io_->Exists(dst));
+  EXPECT_TRUE(dst_exists);
+  ICEBERG_UNWRAP_OR_FAIL(auto content, file_io_->ReadFile(dst, std::nullopt));
+  EXPECT_EQ(content, "hello");
+
+  // Renaming over an existing destination without overwrite must fail.
+  const std::string other = root + "/other.txt";
+  EXPECT_THAT(file_io_->WriteFile(other, "world"), IsOk());
+  EXPECT_THAT(file_io_->Rename(other, dst, /*overwrite=*/false),
+              IsError(ErrorKind::kAlreadyExists));
+
+  // Same rename succeeds with overwrite=true.
+  EXPECT_THAT(file_io_->Rename(other, dst, /*overwrite=*/true), IsOk());
+  ICEBERG_UNWRAP_OR_FAIL(auto content_after, file_io_->ReadFile(dst, std::nullopt));
+  EXPECT_EQ(content_after, "world");
+}
+
 void VerifyReadFullyReadsFromAbsolutePosition(const std::shared_ptr<FileIO>& file_io,
                                               const std::string& path) {
   ASSERT_THAT(file_io->WriteFile(path, "abcdef"), IsOk());
