@@ -26,8 +26,6 @@
 #include <utility>
 #include <vector>
 
-#include <nlohmann/json.hpp>
-
 #include "iceberg/catalog/hive/hive_table_operations.h"
 #include "iceberg/catalog/hive/hive_utils.h"
 #include "iceberg/catalog/hive/hms_client.h"
@@ -445,17 +443,10 @@ Result<std::shared_ptr<Table>> HiveCatalog::LoadTable(const TableIdentifier& ide
   ICEBERG_ASSIGN_OR_RAISE(auto metadata_location,
                           GetMetadataLocation(hive_table.parameters));
 
-  ICEBERG_ASSIGN_OR_RAISE(auto metadata_json,
-                          file_io_->ReadFile(metadata_location, /*length=*/std::nullopt));
-
-  nlohmann::json metadata_obj;
-  try {
-    metadata_obj = nlohmann::json::parse(metadata_json);
-  } catch (const nlohmann::json::parse_error& e) {
-    return JsonParseError("Failed to parse metadata at '{}': {}", metadata_location,
-                          e.what());
-  }
-  ICEBERG_ASSIGN_OR_RAISE(auto metadata, TableMetadataFromJson(metadata_obj));
+  // Use TableMetadataUtil::Read so codec-encoded metadata files are
+  // transparently decompressed.
+  ICEBERG_ASSIGN_OR_RAISE(auto metadata,
+                          TableMetadataUtil::Read(*file_io_, metadata_location));
 
   return Table::Make(identifier, std::shared_ptr<TableMetadata>(metadata.release()),
                      std::move(metadata_location), file_io_, shared_from_this());
@@ -468,18 +459,10 @@ Result<std::shared_ptr<Table>> HiveCatalog::RegisterTable(
 
   // RegisterTable assumes a pre-existing metadata.json. Read the columns
   // from it so the HMS Table record exposes a faithful column list to
-  // Hive/Spark/Trino clients.
-  ICEBERG_ASSIGN_OR_RAISE(
-      auto metadata_json,
-      file_io_->ReadFile(metadata_file_location, /*length=*/std::nullopt));
-  nlohmann::json metadata_obj;
-  try {
-    metadata_obj = nlohmann::json::parse(metadata_json);
-  } catch (const nlohmann::json::parse_error& e) {
-    return JsonParseError("Failed to parse metadata at '{}': {}", metadata_file_location,
-                          e.what());
-  }
-  ICEBERG_ASSIGN_OR_RAISE(auto metadata, TableMetadataFromJson(metadata_obj));
+  // Hive/Spark/Trino clients. `TableMetadataUtil::Read` handles codec
+  // detection so `.gz.metadata.json` files round-trip correctly.
+  ICEBERG_ASSIGN_OR_RAISE(auto metadata,
+                          TableMetadataUtil::Read(*file_io_, metadata_file_location));
 
   std::vector<HiveColumn> columns;
   auto schema = metadata->Schema();
