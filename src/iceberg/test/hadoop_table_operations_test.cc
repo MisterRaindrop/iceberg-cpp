@@ -331,6 +331,42 @@ TEST_F(HadoopCommitTest, DeleteAfterCommitPrunesOldMetadata) {
   EXPECT_LE(versioned, 2);
 }
 
+TEST_F(HadoopCommitTest, OrphanMetadataFileDoesNotBlockFutureCommits) {
+  // Simulate the scenario where a previous commit crashed between writing
+  // v2.metadata.json and updating version-hint.text. With the temp-file +
+  // rename CAS protocol, subsequent commits must NOT be blocked by the
+  // dangling final-name file.
+  const std::string body = SlurpResource("TableMetadataV1Valid.json");
+  SeedMetadataFile(1, MetadataCompressionCodec::kNone, body);
+  SeedVersionHint("1");
+  // Plant an orphan v2.metadata.json (as if a crashed writer left it).
+  SeedMetadataFile(2, MetadataCompressionCodec::kNone, body);
+
+  HadoopTableOperations ops(file_io_, table_dir_, lock_manager_, "owner");
+  ICEBERG_UNWRAP_OR_FAIL(auto base, ops.Refresh());
+  // base.version is 1 (from version-hint); orphan v2 is invisible to Refresh.
+  EXPECT_EQ(ops.current_version(), 1);
+
+  // Without the temp-file + rename fix, this Commit would hit the
+  // "target already exists" guard and return kCommitFailed in a loop.
+  // With the fix, the rename(overwrite=false) of our UUID temp file to
+  // v2.metadata.json is what fails -- but only because target exists --
+  // and that surfaces as kCommitFailed (same outcome as a real CAS race).
+  // The orphan v2 stays put; we should be able to make progress by
+  // removing it and retrying.
+  auto first = ops.Commit(*base, *base);
+  ASSERT_FALSE(first.has_value());
+  EXPECT_EQ(ErrorKind::kCommitFailed, first.error().kind);
+
+  // After the operator deletes the orphan, commit must succeed.
+  ASSERT_TRUE(file_io_
+                  ->DeleteFile(MetadataDir(table_dir_) + "/" +
+                               MetadataFileName(2, MetadataCompressionCodec::kNone))
+                  .has_value());
+  ASSERT_TRUE(ops.Commit(*base, *base).has_value());
+  EXPECT_EQ(ops.current_version(), 2);
+}
+
 TEST_F(HadoopCommitTest, ConcurrentCommitsConvergeWithRetries) {
   // Seed v1.
   const std::string body = SlurpResource("TableMetadataV1Valid.json");

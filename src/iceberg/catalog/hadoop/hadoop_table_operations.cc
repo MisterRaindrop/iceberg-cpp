@@ -34,6 +34,7 @@
 #include "iceberg/table_properties.h"
 #include "iceberg/util/gzip_internal.h"
 #include "iceberg/util/macros.h"
+#include "iceberg/util/uuid.h"
 
 namespace iceberg::hadoop {
 
@@ -320,17 +321,27 @@ Status HadoopTableOperations::Commit(const TableMetadata& base,
   ICEBERG_ASSIGN_OR_RAISE(auto codec, ResolveCommitCodec(updated));
   const std::string target = MetadataFilePath(table_dir_, next_version, codec);
 
-  // (6) Fail-if-exists belt: even if the lock manager raced, refuse to clobber
-  // an existing v{N} file.
-  ICEBERG_ASSIGN_OR_RAISE(auto target_exists, file_io_->Exists(target));
-  if (target_exists) {
-    return CommitFailed(
-        "HadoopTableOperations::Commit: target metadata file '{}' already exists.",
-        target);
-  }
+  // (6/7) Write to a UUID-named temp file first, then atomically rename to
+  // the canonical `v{N}.metadata.json[.codec]`. This is the same trick that
+  // Java's HadoopTableOperations.renameToFinal uses; without it, a crashed
+  // commit could leave an orphan v{N+1} file that permanently blocks the
+  // next writer's fail-if-exists check. Orphan UUID-named files do NOT
+  // match the ParseMetadataFileName pattern (which requires `v{N}` prefix),
+  // so listdir-based recovery ignores them. The rename(overwrite=false) is
+  // our CAS primitive -- if another writer raced us to v{N+1}, the rename
+  // fails and we surface kCommitFailed without clobbering their commit.
+  const std::string metadata_dir = MetadataDir(table_dir_);
+  const std::string temp_path = std::format("{}/{}-v{}.metadata.json.tmp", metadata_dir,
+                                            Uuid::GenerateV7().ToString(), next_version);
+  ICEBERG_RETURN_UNEXPECTED(WriteMetadataWithCodec(*file_io_, temp_path, updated, codec));
 
-  // (7) Write the new metadata file using the resolved codec.
-  ICEBERG_RETURN_UNEXPECTED(WriteMetadataWithCodec(*file_io_, target, updated, codec));
+  auto rename_to_target = file_io_->Rename(temp_path, target, /*overwrite=*/false);
+  if (!rename_to_target.has_value()) {
+    std::ignore = file_io_->DeleteFile(temp_path);
+    return CommitFailed(
+        "HadoopTableOperations::Commit: rename to '{}' failed (lost CAS race): {}",
+        target, rename_to_target.error().message);
+  }
 
   // (8) Update version-hint.text atomically: write tmp -> delete old -> rename.
   const std::string hint = VersionHintPath(table_dir_);
