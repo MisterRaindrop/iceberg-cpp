@@ -128,6 +128,13 @@ class ICEBERG_HADOOP_EXPORT HadoopCatalogProperties
   /// \return The warehouse if configured, or InvalidArgument if unset/empty.
   Result<std::string_view> Warehouse() const;
 
+  /// \brief Sanity-check the configured timeouts and lock impl. Returns
+  /// `kInvalidArgument` when any value is outside its acceptable range
+  /// (e.g. a negative timeout). HadoopCatalog::Make runs this before
+  /// constructing the LockManager so a misconfigured catalog fails at
+  /// construction rather than mid-commit.
+  Status Validate() const;
+
   /// \brief Convenience: collect every property whose key starts with
   /// `hadoop.`, `dfs.`, or `fs.`. Used to forward Hadoop configuration to the
   /// underlying HDFS FileIO. Keys are returned in their original form (no

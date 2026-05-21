@@ -88,6 +88,46 @@ TEST(HadoopCatalogPropertiesTest, WarehouseRequired) {
   EXPECT_EQ("file:///tmp/wh", *set_result);
 }
 
+TEST(HadoopCatalogPropertiesTest, ValidateAcceptsDefaults) {
+  auto props = HadoopCatalogProperties::default_properties();
+  EXPECT_TRUE(props.Validate().has_value());
+}
+
+TEST(HadoopCatalogPropertiesTest, ValidateRejectsNonPositiveTimeouts) {
+  auto bad_acquire = HadoopCatalogProperties::FromMap({
+      {"lock.acquire-timeout-ms", "0"},
+  });
+  auto res = bad_acquire.Validate();
+  ASSERT_FALSE(res.has_value());
+  EXPECT_EQ(ErrorKind::kInvalidArgument, res.error().kind);
+
+  auto bad_interval = HadoopCatalogProperties::FromMap({
+      {"lock.acquire-interval-ms", "-5"},
+  });
+  res = bad_interval.Validate();
+  ASSERT_FALSE(res.has_value());
+  EXPECT_EQ(ErrorKind::kInvalidArgument, res.error().kind);
+}
+
+TEST(HadoopCatalogPropertiesTest, ValidateRejectsHeartbeatIntervalNotBelowTimeout) {
+  auto bad = HadoopCatalogProperties::FromMap({
+      {"lock.heartbeat-interval-ms", "5000"},
+      {"lock.heartbeat-timeout-ms", "5000"},
+  });
+  auto res = bad.Validate();
+  ASSERT_FALSE(res.has_value());
+  EXPECT_EQ(ErrorKind::kInvalidArgument, res.error().kind);
+}
+
+TEST(HadoopCatalogPropertiesTest, ValidateRejectsUnknownLockImpl) {
+  auto bad = HadoopCatalogProperties::FromMap({
+      {"lock-impl", "dynamodb"},
+  });
+  auto res = bad.Validate();
+  ASSERT_FALSE(res.has_value());
+  EXPECT_EQ(ErrorKind::kInvalidArgument, res.error().kind);
+}
+
 TEST(HadoopCatalogPropertiesTest, ExtractHadoopConfReturnsPrefixedKeysOnly) {
   auto props = HadoopCatalogProperties::FromMap({
       {"warehouse", "hdfs://nn:8020/wh"},

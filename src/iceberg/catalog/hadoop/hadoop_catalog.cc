@@ -68,6 +68,7 @@ Result<std::shared_ptr<HadoopCatalog>> HadoopCatalog::Make(
     return InvalidArgument("HadoopCatalog::Make requires a non-null FileIO.");
   }
   ICEBERG_ASSIGN_OR_RAISE(auto warehouse, config.Warehouse());
+  ICEBERG_RETURN_UNEXPECTED(config.Validate());
   MaybeWarnS3Warehouse(warehouse);
   ICEBERG_ASSIGN_OR_RAISE(auto lock_manager,
                           hadoop::MakeLockManagerWithIO(config, file_io));
