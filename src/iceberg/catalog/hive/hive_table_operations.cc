@@ -245,8 +245,12 @@ Result<std::string> HiveTableOperations::Commit(const HiveTableMetadataSnapshot&
     }
     auto verify_location = GetMetadataLocation(verify.value().parameters);
     if (verify_location.has_value() && *verify_location == new_metadata_location) {
-      // Commit landed despite the exception; keep the metadata file.
+      // Commit landed despite the exception; keep the metadata file
+      // and prune dropped log entries on a best-effort basis, mirroring
+      // the success path below.
       release_lock();
+      TableMetadataUtil::DeleteRemovedMetadataFiles(*file_io_, base.metadata.get(),
+                                                    new_metadata);
       return new_metadata_location;
     }
     release_lock();
@@ -268,6 +272,13 @@ Result<std::string> HiveTableOperations::Commit(const HiveTableMetadataSnapshot&
         verify_location.has_value() ? *verify_location : std::string("<missing>"));
   }
   release_lock();
+  // Best-effort cleanup of the metadata files dropped from the log when
+  // `write.metadata.delete-after-commit.enabled=true`. Mirrors
+  // `InMemoryCatalog::UpdateTable`. Failures are swallowed inside
+  // `DeleteRemovedMetadataFiles`, so they cannot mask the successful
+  // commit we just landed.
+  TableMetadataUtil::DeleteRemovedMetadataFiles(*file_io_, base.metadata.get(),
+                                                new_metadata);
   return new_metadata_location;
 }
 
