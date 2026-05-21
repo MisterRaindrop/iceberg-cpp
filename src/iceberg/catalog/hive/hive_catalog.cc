@@ -289,6 +289,23 @@ Result<std::shared_ptr<Table>> HiveCatalog::CreateTable(
             if (loc.has_value() && *loc == metadata_location) {
               return true;  // our row, response was lost on first try
             }
+            // Foreign table genuinely occupies this name; let the outer
+            // cleanup guard delete our orphan metadata file.
+            return std::unexpected(create.error());
+          }
+          // We could not confirm whether HMS holds OUR row because the
+          // recovery GetTable failed too. If the table was actually
+          // dropped concurrently (kNoSuchTable from GetTable), the
+          // AlreadyExists was a transient race -- the outer cleanup is
+          // safe. For any other failure (transport / meta / etc.) the
+          // outcome is indeterminate; surface `kCommitStateUnknown` so
+          // the outer guard skips DeleteFile and preserves the metadata
+          // file in case HMS still references it.
+          if (existing.error().kind != ErrorKind::kNoSuchTable) {
+            return CommitStateUnknown(
+                "CreateTable race: HMS reported AlreadyExists but recovery "
+                "GetTable failed ({}); leaving metadata file in place.",
+                existing.error().message);
           }
         }
         return std::unexpected(create.error());
