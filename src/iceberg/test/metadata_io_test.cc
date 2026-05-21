@@ -159,9 +159,42 @@ TEST_F(MetadataIOTest, WriteCompressedMetadataRoundTrip) {
                          TableMetadataUtil::Write(*io_, &base, base_loc, next));
   EXPECT_THAT(next_loc, testing::EndsWith(".gz.metadata.json"));
 
+  // Defence against a "both sides miss the codec" regression like the
+  // one this test originally shipped with -- a symmetric round-trip
+  // alone would still pass if Write and Read both mis-detected the
+  // file as uncompressed. Verify the actual on-disk bytes start with
+  // the gzip magic (0x1f 0x8b) so we cannot silently fall back to
+  // plain JSON again.
+  ICEBERG_UNWRAP_OR_FAIL(auto on_disk, io_->ReadFile(next_loc, std::nullopt));
+  ASSERT_GE(on_disk.size(), 2u);
+  EXPECT_EQ(static_cast<unsigned char>(on_disk[0]), 0x1f);
+  EXPECT_EQ(static_cast<unsigned char>(on_disk[1]), 0x8b);
+  EXPECT_NE(on_disk.find('{'), 0u)
+      << "metadata file should not start with a JSON brace when gzip is selected";
+
   auto reread = TableMetadataUtil::Read(*io_, next_loc);
   ASSERT_THAT(reread, IsOk());
   EXPECT_EQ(*reread.value(), next);
+}
+
+TEST_F(MetadataIOTest, CodecFromFileNameMatchesCanonicalAndLegacy) {
+  // Pin the contract that previously broke under
+  // `find_last_of(".metadata.json")` -- a charset match that returned
+  // the position of the final 'n' and made the subsequent `.gz` test
+  // skip over canonical `.gz.metadata.json`.
+  using Codec = TableMetadataUtil::Codec;
+  ICEBERG_UNWRAP_OR_FAIL(auto canonical_gz,
+                         Codec::FromFileName("foo/00001-uuid.gz.metadata.json"));
+  EXPECT_EQ(canonical_gz, MetadataFileCodecType::kGzip);
+
+  ICEBERG_UNWRAP_OR_FAIL(auto legacy_gz,
+                         Codec::FromFileName("foo/00001-uuid.metadata.json.gz"));
+  EXPECT_EQ(legacy_gz, MetadataFileCodecType::kGzip);
+
+  ICEBERG_UNWRAP_OR_FAIL(auto plain, Codec::FromFileName("foo/00001-uuid.metadata.json"));
+  EXPECT_EQ(plain, MetadataFileCodecType::kNone);
+
+  EXPECT_FALSE(Codec::FromFileName("foo/weird.txt").has_value());
 }
 
 TEST_F(MetadataIOTest, WriteMetadataWithBase) {

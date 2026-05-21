@@ -420,18 +420,26 @@ Result<MetadataFileCodecType> TableMetadataUtil::Codec::FromString(
 
 Result<MetadataFileCodecType> TableMetadataUtil::Codec::FromFileName(
     std::string_view file_name) {
-  auto pos = file_name.find_last_of(kTableMetadataFileSuffix);
-  if (pos == std::string::npos) {
-    return InvalidArgument("{} is not a valid metadata file", file_name);
-  }
-
-  // We have to be backward-compatible with .metadata.json.gz files
+  // Backward-compatibility: older Iceberg engines emitted the file as
+  // `<n>.metadata.json.gz` (codec suffix appended). Match it first so
+  // we don't try to strip the canonical `.metadata.json` suffix below.
   if (file_name.ends_with(kCompGzipTableMetadataFileSuffix)) {
     return MetadataFileCodecType::kGzip;
   }
-
-  std::string_view file_name_without_suffix = file_name.substr(0, pos);
-  if (file_name_without_suffix.ends_with(kGzipTableMetadataFileExtension)) {
+  // Canonical Iceberg metadata names end with `.metadata.json`. The
+  // codec is encoded into the basename immediately before this suffix
+  // (e.g. `00001-x.gz.metadata.json`). NOTE: do not use
+  // `find_last_of(kTableMetadataFileSuffix)` here -- that takes a
+  // character set, not a substring, and would happily match any of
+  // {'.', 'm', 'e', 't', 'a', 'd', 'j', 's', 'o', 'n'} anywhere in
+  // the path, mis-detecting canonical `.gz.metadata.json` as
+  // uncompressed (the trailing 'n' satisfies the charset match).
+  if (!file_name.ends_with(kTableMetadataFileSuffix)) {
+    return InvalidArgument("{} is not a valid metadata file", file_name);
+  }
+  std::string_view stem =
+      file_name.substr(0, file_name.size() - kTableMetadataFileSuffix.size());
+  if (stem.ends_with(kGzipTableMetadataFileExtension)) {
     return MetadataFileCodecType::kGzip;
   }
   return MetadataFileCodecType::kNone;
