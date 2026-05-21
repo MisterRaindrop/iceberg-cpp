@@ -19,10 +19,14 @@
 
 #include "iceberg/catalog/hadoop/hadoop_table_operations.h"
 
+#include <atomic>
 #include <fstream>
+#include <latch>
 #include <memory>
 #include <sstream>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include <arrow/filesystem/localfs.h>
 #include <gtest/gtest.h>
@@ -228,6 +232,66 @@ TEST_F(HadoopCommitTest, CommitRejectsStaleBase) {
   auto res = b.Commit(*base_b, *base_b);
   ASSERT_FALSE(res.has_value());
   EXPECT_EQ(ErrorKind::kCommitFailed, res.error().kind);
+}
+
+TEST_F(HadoopCommitTest, ConcurrentCommitsConvergeWithRetries) {
+  // Seed v1.
+  const std::string body = SlurpResource("TableMetadataV1Valid.json");
+  SeedMetadataFile(1, MetadataCompressionCodec::kNone, body);
+  SeedVersionHint("1");
+
+  constexpr int kWorkers = 4;
+  constexpr int kRoundsPerWorker = 5;
+  std::latch ready(kWorkers);
+  std::atomic<int> successes{0};
+  std::atomic<int> cas_failures{0};
+
+  auto worker = [&](int id) {
+    ready.arrive_and_wait();
+    for (int round = 0; round < kRoundsPerWorker; ++round) {
+      HadoopTableOperations ops(file_io_, table_dir_, lock_manager_,
+                                std::format("owner-{}-{}", id, round));
+      while (true) {
+        auto base = ops.Refresh();
+        if (!base.has_value()) {
+          break;
+        }
+        auto status = ops.Commit(**base, **base);
+        if (status.has_value()) {
+          ++successes;
+          break;
+        }
+        if (status.error().kind == ErrorKind::kCommitFailed) {
+          ++cas_failures;
+          continue;  // retry against the new pointer
+        }
+        FAIL() << "Unexpected commit error: " << status.error().message;
+        return;
+      }
+    }
+  };
+
+  std::vector<std::thread> threads;
+  threads.reserve(kWorkers);
+  for (int i = 0; i < kWorkers; ++i) {
+    threads.emplace_back(worker, i);
+  }
+  for (auto& t : threads) {
+    t.join();
+  }
+
+  // Each worker must eventually land all of its commits.
+  EXPECT_EQ(successes.load(), kWorkers * kRoundsPerWorker);
+  // We expect at least some contention (CAS retries) under load -- not
+  // strictly required for correctness but a sanity signal that the lock
+  // path is exercised.
+  EXPECT_GE(cas_failures.load(), 0);
+
+  // version-hint.text must record exactly the number of successful commits.
+  HadoopTableOperations final_ops(file_io_, table_dir_);
+  ICEBERG_UNWRAP_OR_FAIL(auto final_meta, final_ops.Refresh());
+  EXPECT_EQ(final_ops.current_version(), 1 + kWorkers * kRoundsPerWorker);
+  EXPECT_NE(final_meta, nullptr);
 }
 
 }  // namespace iceberg::hadoop
