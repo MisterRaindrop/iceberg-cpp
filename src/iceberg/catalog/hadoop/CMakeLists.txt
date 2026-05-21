@@ -15,8 +15,36 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# Hadoop catalog library skeleton.
-# Sources are introduced incrementally starting in H02 (HadoopCatalogProperties).
-# The export header is installed here so downstream consumers can pin against
-# iceberg::iceberg_hadoop once the library target is registered.
+set(ICEBERG_HADOOP_SOURCES hadoop_catalog.cc hadoop_catalog_properties.cc)
+
+set(ICEBERG_HADOOP_STATIC_BUILD_INTERFACE_LIBS)
+set(ICEBERG_HADOOP_SHARED_BUILD_INTERFACE_LIBS)
+set(ICEBERG_HADOOP_STATIC_INSTALL_INTERFACE_LIBS)
+set(ICEBERG_HADOOP_SHARED_INSTALL_INTERFACE_LIBS)
+
+list(APPEND ICEBERG_HADOOP_STATIC_BUILD_INTERFACE_LIBS
+     "$<IF:$<TARGET_EXISTS:iceberg_static>,iceberg_static,iceberg_shared>")
+list(APPEND ICEBERG_HADOOP_SHARED_BUILD_INTERFACE_LIBS
+     "$<IF:$<TARGET_EXISTS:iceberg_shared>,iceberg_shared,iceberg_static>")
+list(APPEND
+     ICEBERG_HADOOP_STATIC_INSTALL_INTERFACE_LIBS
+     "$<IF:$<TARGET_EXISTS:iceberg::iceberg_static>,iceberg::iceberg_static,iceberg::iceberg_shared>"
+)
+list(APPEND
+     ICEBERG_HADOOP_SHARED_INSTALL_INTERFACE_LIBS
+     "$<IF:$<TARGET_EXISTS:iceberg::iceberg_shared>,iceberg::iceberg_shared,iceberg::iceberg_static>"
+)
+
+add_iceberg_lib(iceberg_hadoop
+                SOURCES
+                ${ICEBERG_HADOOP_SOURCES}
+                SHARED_LINK_LIBS
+                ${ICEBERG_HADOOP_SHARED_BUILD_INTERFACE_LIBS}
+                STATIC_LINK_LIBS
+                ${ICEBERG_HADOOP_STATIC_BUILD_INTERFACE_LIBS}
+                STATIC_INSTALL_INTERFACE_LIBS
+                ${ICEBERG_HADOOP_STATIC_INSTALL_INTERFACE_LIBS}
+                SHARED_INSTALL_INTERFACE_LIBS
+                ${ICEBERG_HADOOP_SHARED_INSTALL_INTERFACE_LIBS})
+
 iceberg_install_all_headers(iceberg/catalog/hadoop)

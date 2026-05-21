@@ -15,6 +15,38 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# Hadoop catalog library skeleton.
-# Sources are introduced incrementally starting in H02 (HadoopCatalogProperties).
-install_headers(['iceberg_hadoop_export.h'], subdir: 'iceberg/catalog/hadoop')
+iceberg_hadoop_sources = files(
+    'hadoop_catalog.cc',
+    'hadoop_catalog_properties.cc',
+)
+
+iceberg_hadoop_build_deps = [iceberg_dep]
+iceberg_hadoop_lib = library(
+    'iceberg_hadoop',
+    sources: iceberg_hadoop_sources,
+    dependencies: iceberg_hadoop_build_deps,
+    gnu_symbol_visibility: 'hidden',
+    cpp_shared_args: ['-DICEBERG_HADOOP_EXPORTING'],
+    cpp_static_args: ['-DICEBERG_HADOOP_STATIC'],
+)
+
+iceberg_hadoop_compile_args = []
+if get_option('default_library') == 'static'
+    iceberg_hadoop_compile_args += ['-DICEBERG_HADOOP_STATIC']
+endif
+iceberg_hadoop_dep = declare_dependency(
+    link_with: [iceberg_hadoop_lib],
+    dependencies: iceberg_hadoop_build_deps,
+    compile_args: iceberg_hadoop_compile_args,
+)
+meson.override_dependency('iceberg-hadoop', iceberg_hadoop_dep)
+pkg.generate(iceberg_hadoop_lib)
+
+install_headers(
+    [
+        'hadoop_catalog.h',
+        'hadoop_catalog_properties.h',
+        'iceberg_hadoop_export.h',
+    ],
+    subdir: 'iceberg/catalog/hadoop',
+)
