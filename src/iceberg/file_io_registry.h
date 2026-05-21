@@ -40,6 +40,7 @@ class ICEBERG_EXPORT FileIORegistry {
  public:
   static constexpr std::string_view kArrowLocalFileIO = "arrow-fs-local";
   static constexpr std::string_view kArrowS3FileIO = "arrow-fs-s3";
+  static constexpr std::string_view kArrowHdfsFileIO = "arrow-fs-hdfs";
 
   /// Factory function type for creating FileIO instances.
   using Factory = std::function<Result<std::unique_ptr<FileIO>>(

@@ -23,6 +23,12 @@
 #include "iceberg/arrow/arrow_io_util.h"
 #include "iceberg/file_io_registry.h"
 
+#if ICEBERG_HDFS_ENABLED
+#  include <arrow/filesystem/hdfs.h>
+
+#  include "iceberg/arrow/arrow_io_internal.h"
+#endif
+
 namespace iceberg::arrow {
 
 namespace {
@@ -43,6 +49,39 @@ void RegisterS3FileIO() {
 #endif
 }
 
+void RegisterHdfsFileIO() {
+#if ICEBERG_HDFS_ENABLED
+  FileIORegistry::Register(
+      std::string(FileIORegistry::kArrowHdfsFileIO),
+      [](const std::unordered_map<std::string, std::string>& properties)
+          -> Result<std::unique_ptr<FileIO>> {
+        ::arrow::fs::HdfsOptions options;
+        // Pass through Hadoop config keys verbatim so users can set
+        // dfs.nameservices, dfs.client.failover.proxy.provider.*, etc. as
+        // they would on the JVM. fs.defaultFS is recognised explicitly.
+        auto fs_default = properties.find("fs.defaultFS");
+        if (fs_default != properties.end() && !fs_default->second.empty()) {
+          auto parsed = ::arrow::fs::HdfsOptions::FromUri(fs_default->second);
+          if (parsed.ok()) {
+            options = *parsed;
+          }
+        }
+        for (const auto& [key, value] : properties) {
+          if (key.starts_with("hadoop.") || key.starts_with("dfs.") ||
+              key.starts_with("fs.")) {
+            options.extra_conf.emplace(key, value);
+          }
+        }
+        auto fs_result = ::arrow::fs::HadoopFileSystem::Make(options);
+        if (!fs_result.ok()) {
+          return IOError("HadoopFileSystem::Make failed: {}",
+                         fs_result.status().ToString());
+        }
+        return std::make_unique<ArrowFileSystemFileIO>(*fs_result);
+      });
+#endif
+}
+
 }  // namespace
 
 void EnsureArrowFileIOsRegistered() {
@@ -50,6 +89,7 @@ void EnsureArrowFileIOsRegistered() {
   std::call_once(flag, []() {
     RegisterLocalFileIO();
     RegisterS3FileIO();
+    RegisterHdfsFileIO();
   });
 }
 

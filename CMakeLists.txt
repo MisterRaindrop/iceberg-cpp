@@ -47,6 +47,9 @@ option(ICEBERG_BUILD_REST "Build rest catalog client" ON)
 option(ICEBERG_BUILD_REST_INTEGRATION_TESTS "Build rest catalog integration tests" OFF)
 option(ICEBERG_BUILD_HADOOP "Build hadoop catalog client" ON)
 option(ICEBERG_S3 "Build with S3 support" OFF)
+option(ICEBERG_HDFS
+       "Build with HDFS support via arrow::fs::HadoopFileSystem (requires JVM + libhdfs at runtime)"
+       OFF)
 option(ICEBERG_ENABLE_ASAN "Enable Address Sanitizer" OFF)
 option(ICEBERG_ENABLE_UBSAN "Enable Undefined Behavior Sanitizer" OFF)
 
@@ -74,6 +77,13 @@ endif()
 if(NOT ICEBERG_BUILD_BUNDLE AND ICEBERG_S3)
   set(ICEBERG_S3 OFF)
   message(STATUS "ICEBERG_S3 is disabled because ICEBERG_BUILD_BUNDLE is OFF")
+endif()
+
+# ICEBERG_HDFS requires ICEBERG_BUILD_BUNDLE because arrow's HadoopFileSystem
+# lives in the bundled arrow build.
+if(NOT ICEBERG_BUILD_BUNDLE AND ICEBERG_HDFS)
+  set(ICEBERG_HDFS OFF)
+  message(STATUS "ICEBERG_HDFS is disabled because ICEBERG_BUILD_BUNDLE is OFF")
 endif()
 
 include(CMakeParseArguments)

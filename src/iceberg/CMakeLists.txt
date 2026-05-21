@@ -298,6 +298,13 @@ if(ICEBERG_BUILD_BUNDLE)
         target_compile_definitions(${target}
                                    PUBLIC "$<BUILD_INTERFACE:ICEBERG_S3_ENABLED=0>")
       endif()
+      if(ICEBERG_HDFS)
+        target_compile_definitions(${target}
+                                   PUBLIC "$<BUILD_INTERFACE:ICEBERG_HDFS_ENABLED=1>")
+      else()
+        target_compile_definitions(${target}
+                                   PUBLIC "$<BUILD_INTERFACE:ICEBERG_HDFS_ENABLED=0>")
+      endif()
     endif()
   endforeach()
 
