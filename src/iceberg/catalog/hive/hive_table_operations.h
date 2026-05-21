@@ -108,8 +108,18 @@ class ICEBERG_HIVE_EXPORT HiveTableOperations {
   ///
   /// Returns the location of the newly-written metadata file on
   /// success so the caller can fold it into a refreshed snapshot.
+  ///
+  /// `mutation_attempted` (optional out-parameter) is set to `true` as
+  /// soon as the AlterTable RPC is issued, regardless of outcome. The
+  /// `HiveCatalog::UpdateTable` caller funnels this through
+  /// `CommitStateUnknownOnTransportFailure` so a `kServiceUnavailable`
+  /// that escapes after AlterTable was attempted is re-tagged
+  /// `kCommitStateUnknown`, while a pre-AlterTable transport blip
+  /// (Refresh / GetTable / pre-write) remains retriable. Leaving the
+  /// pointer null preserves the original signal.
   Result<std::string> Commit(const HiveTableMetadataSnapshot& base,
-                             TableMetadata& new_metadata);
+                             TableMetadata& new_metadata,
+                             bool* mutation_attempted = nullptr);
 
   const TableIdentifier& identifier() const { return identifier_; }
 

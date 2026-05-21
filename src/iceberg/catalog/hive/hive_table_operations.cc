@@ -65,7 +65,8 @@ Result<HiveTableMetadataSnapshot> HiveTableOperations::Refresh() {
 }
 
 Result<std::string> HiveTableOperations::Commit(const HiveTableMetadataSnapshot& base,
-                                                TableMetadata& new_metadata) {
+                                                TableMetadata& new_metadata,
+                                                bool* mutation_attempted) {
   ICEBERG_RETURN_UNEXPECTED(ValidateNamespace(identifier_.ns));
   ICEBERG_RETURN_UNEXPECTED(identifier_.Validate());
   if (!base.metadata) {
@@ -200,6 +201,13 @@ Result<std::string> HiveTableOperations::Commit(const HiveTableMetadataSnapshot&
       }
       current.columns = std::move(*columns);
     }
+  }
+  // Flip the out-flag immediately before AlterTable so the
+  // `HiveCatalog::UpdateTable` caller can distinguish "we never reached
+  // the mutating RPC" (safely retriable) from "the mutating RPC was
+  // issued, outcome may or may not have landed" (kCommitStateUnknown).
+  if (mutation_attempted != nullptr) {
+    *mutation_attempted = true;
   }
   auto alter_status =
       client_->AlterTable(identifier_.ns.levels[0], identifier_.name, current);

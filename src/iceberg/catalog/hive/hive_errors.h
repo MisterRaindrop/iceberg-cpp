@@ -97,7 +97,8 @@ ICEBERG_HIVE_EXPORT std::unexpected<Error> GenericThriftError(std::string_view c
                                                               std::string_view what);
 
 /// \brief Re-tag any `kServiceUnavailable` escaping from a mutating
-///        catalog op as `kCommitStateUnknown`.
+///        catalog op as `kCommitStateUnknown`, **only when the mutating
+///        RPC was actually issued**.
 ///
 /// `HmsClientPool::Run`'s reconnect-once contract surfaces
 /// `kServiceUnavailable` in two cases that *both* mean "the first
@@ -117,6 +118,22 @@ ICEBERG_HIVE_EXPORT std::unexpected<Error> GenericThriftError(std::string_view c
 /// the user) to stop retrying and inspect HMS to find out what
 /// actually happened.
 ///
+/// BUT: some mutating ops do a `GetTable` / `GetDatabase` *before* the
+/// mutation as a read-then-write guard. A transport failure inside
+/// that pre-read leaves HMS state untouched -- the caller can safely
+/// retry. Converting *those* to `kCommitStateUnknown` blocks legitimate
+/// retries. The `mutation_attempted` parameter gates the conversion:
+/// callers capture a stack-local bool by reference, flip it to `true`
+/// immediately before the mutating RPC inside the lambda, and pass it
+/// in here. The flag persists across `HmsClientPool::Run`'s reconnect
+/// retry, so a first invocation that reached the mutation and a second
+/// invocation that bailed out in the pre-read still report
+/// `mutation_attempted=true` and correctly funnel through.
+///
+/// For ops whose lambda's first RPC *is* the mutation
+/// (`CreateNamespace`, `CreateTable`, `RegisterTable`), callers pass
+/// `true` directly.
+///
 /// `op_context` should describe the catalog op for diagnostic output
 /// (e.g. "HiveCatalog::CreateNamespace(\"warehouse\")"). Read-only
 /// ops (`LoadTable`, `ListNamespaces`, ...) should NOT funnel through
@@ -125,11 +142,13 @@ ICEBERG_HIVE_EXPORT std::unexpected<Error> GenericThriftError(std::string_view c
 /// confuse the caller.
 template <typename T>
 inline Result<T> CommitStateUnknownOnTransportFailure(Result<T> result,
-                                                      std::string_view op_context) {
-  if (!result.has_value() && result.error().kind == ErrorKind::kServiceUnavailable) {
+                                                      std::string_view op_context,
+                                                      bool mutation_attempted) {
+  if (mutation_attempted && !result.has_value() &&
+      result.error().kind == ErrorKind::kServiceUnavailable) {
     return CommitStateUnknown(
-        "{} encountered HMS transport failure with no usable replay signal; "
-        "the operation may or may not have landed (msg={}).",
+        "{} encountered HMS transport failure after the mutating RPC was "
+        "issued; the operation may or may not have landed (msg={}).",
         op_context, result.error().message);
   }
   return result;

@@ -88,22 +88,39 @@ TEST(HiveErrorsTest, ContextAndMessageBothAppearInOutput) {
 // mutating HiveCatalog op funnels Pool::Run's result through this
 // helper so a `kServiceUnavailable` escape (pool reconnect-failure or
 // post-reconnect retry-also-transport-failure) cannot invite the
-// caller to retry on top of a possibly-landed first attempt.
+// caller to retry on top of a possibly-landed first attempt. But the
+// translation is gated on `mutation_attempted` -- a transport failure
+// during a pre-read (GetTable / GetDatabase) leaves HMS state
+// unchanged and must remain a retriable kServiceUnavailable.
 
-TEST(CommitStateUnknownHelperTest, TranslatesServiceUnavailable) {
+TEST(CommitStateUnknownHelperTest, TranslatesServiceUnavailableAfterMutation) {
   Result<int> svc =
       ServiceUnavailable("HMS transport failed and reconnect also failed: nope");
-  auto translated =
-      CommitStateUnknownOnTransportFailure(std::move(svc), "TestOp::DoMutation");
+  auto translated = CommitStateUnknownOnTransportFailure(
+      std::move(svc), "TestOp::DoMutation", /*mutation_attempted=*/true);
   ASSERT_FALSE(translated.has_value());
   EXPECT_EQ(translated.error().kind, ErrorKind::kCommitStateUnknown);
   EXPECT_NE(translated.error().message.find("TestOp::DoMutation"), std::string::npos);
   EXPECT_NE(translated.error().message.find("nope"), std::string::npos);
 }
 
+TEST(CommitStateUnknownHelperTest, PreservesServiceUnavailableBeforeMutation) {
+  // Pre-read transport failure: HMS state unmodified, caller can retry.
+  // The helper must NOT convert this -- otherwise legitimate retries would
+  // be turned into kCommitStateUnknown and stop iceberg::Transaction.
+  Result<int> svc = ServiceUnavailable("GetTable transport failed");
+  auto translated = CommitStateUnknownOnTransportFailure(
+      std::move(svc), "TestOp::DropTable", /*mutation_attempted=*/false);
+  ASSERT_FALSE(translated.has_value());
+  EXPECT_EQ(translated.error().kind, ErrorKind::kServiceUnavailable)
+      << "transport blips before the mutating RPC must remain retriable";
+  EXPECT_EQ(translated.error().message, "GetTable transport failed");
+}
+
 TEST(CommitStateUnknownHelperTest, PreservesOtherErrors) {
   Result<int> al = AlreadyExists("warehouse already exists");
-  auto translated = CommitStateUnknownOnTransportFailure(std::move(al), "TestOp::Create");
+  auto translated = CommitStateUnknownOnTransportFailure(std::move(al), "TestOp::Create",
+                                                         /*mutation_attempted=*/true);
   ASSERT_FALSE(translated.has_value());
   EXPECT_EQ(translated.error().kind, ErrorKind::kAlreadyExists)
       << "non-transport errors must pass through verbatim, otherwise we would "
@@ -113,8 +130,8 @@ TEST(CommitStateUnknownHelperTest, PreservesOtherErrors) {
 
 TEST(CommitStateUnknownHelperTest, PreservesAlreadyCommitStateUnknown) {
   Result<int> usk = CommitStateUnknown("inner recovery decided indeterminate");
-  auto translated =
-      CommitStateUnknownOnTransportFailure(std::move(usk), "TestOp::Commit");
+  auto translated = CommitStateUnknownOnTransportFailure(std::move(usk), "TestOp::Commit",
+                                                         /*mutation_attempted=*/true);
   ASSERT_FALSE(translated.has_value());
   EXPECT_EQ(translated.error().kind, ErrorKind::kCommitStateUnknown);
   EXPECT_EQ(translated.error().message, "inner recovery decided indeterminate")
@@ -123,23 +140,31 @@ TEST(CommitStateUnknownHelperTest, PreservesAlreadyCommitStateUnknown) {
 
 TEST(CommitStateUnknownHelperTest, PreservesSuccess) {
   Result<int> ok = 42;
-  auto translated = CommitStateUnknownOnTransportFailure(std::move(ok), "TestOp::Probe");
+  auto translated = CommitStateUnknownOnTransportFailure(std::move(ok), "TestOp::Probe",
+                                                         /*mutation_attempted=*/true);
   ASSERT_TRUE(translated.has_value());
   EXPECT_EQ(*translated, 42);
 }
 
 TEST(CommitStateUnknownHelperTest, WorksWithStatus) {
   Status svc = ServiceUnavailable("reconnect doubly-broken");
-  auto translated =
-      CommitStateUnknownOnTransportFailure(std::move(svc), "TestOp::DropThing");
+  auto translated = CommitStateUnknownOnTransportFailure(
+      std::move(svc), "TestOp::DropThing", /*mutation_attempted=*/true);
   ASSERT_FALSE(translated.has_value());
   EXPECT_EQ(translated.error().kind, ErrorKind::kCommitStateUnknown);
   EXPECT_NE(translated.error().message.find("TestOp::DropThing"), std::string::npos);
 
   Status ok;  // success
-  auto pass_through =
-      CommitStateUnknownOnTransportFailure(std::move(ok), "TestOp::DropThing");
+  auto pass_through = CommitStateUnknownOnTransportFailure(
+      std::move(ok), "TestOp::DropThing", /*mutation_attempted=*/true);
   EXPECT_TRUE(pass_through.has_value());
+
+  Status pre_read = ServiceUnavailable("GetDatabase blew up");
+  auto preserved = CommitStateUnknownOnTransportFailure(
+      std::move(pre_read), "TestOp::DropThing", /*mutation_attempted=*/false);
+  ASSERT_FALSE(preserved.has_value());
+  EXPECT_EQ(preserved.error().kind, ErrorKind::kServiceUnavailable)
+      << "Status overload must honour the mutation_attempted gate the same way";
 }
 
 }  // namespace iceberg::hive
