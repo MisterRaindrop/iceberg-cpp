@@ -20,3 +20,7 @@ add_subdirectory(memory)
 if(ICEBERG_BUILD_REST)
   add_subdirectory(rest)
 endif()
+
+if(ICEBERG_BUILD_HADOOP)
+  add_subdirectory(hadoop)
+endif()

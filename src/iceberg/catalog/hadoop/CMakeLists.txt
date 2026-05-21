@@ -15,12 +15,8 @@
 # specific language governing permissions and limitations
 # under the License.
 
-subdir('memory')
-
-if get_option('rest').enabled()
-    subdir('rest')
-endif
-
-if get_option('hadoop').enabled()
-    subdir('hadoop')
-endif
+# Hadoop catalog library skeleton.
+# Sources are introduced incrementally starting in H02 (HadoopCatalogProperties).
+# The export header is installed here so downstream consumers can pin against
+# iceberg::iceberg_hadoop once the library target is registered.
+iceberg_install_all_headers(iceberg/catalog/hadoop)

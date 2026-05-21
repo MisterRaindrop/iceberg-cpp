@@ -44,4 +44,11 @@ option(
     value: 'disabled',
 )
 
+option(
+    'hadoop',
+    type: 'feature',
+    description: 'Build hadoop catalog client',
+    value: 'enabled',
+)
+
 option('tests', type: 'feature', description: 'Build tests', value: 'enabled')
