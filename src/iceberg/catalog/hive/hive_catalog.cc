@@ -171,9 +171,23 @@ Result<std::unordered_map<std::string, std::string>> HiveCatalog::GetNamespacePr
 
 Status HiveCatalog::DropNamespace(const Namespace& ns) {
   ICEBERG_RETURN_UNEXPECTED(ValidateNamespace(ns));
-  return client_pool_->Run([&](HmsClient* client) {
-    return client->DropDatabase(ns.levels[0], /*cascade=*/false);
-  });
+  // Replay safety: HmsClientPool::Run reconnects once and re-invokes
+  // the same lambda on transport failure. If our first DropDatabase
+  // landed server-side but the reply was lost, the retry would see
+  // NoSuchNamespace for what is actually our own success. Mirror
+  // `DropTable`'s attempted-flag recovery so the caller sees success
+  // for "the namespace is gone because we dropped it" instead of a
+  // spurious NoSuchNamespace.
+  return client_pool_->Run(
+      [&, drop_attempted = false](HmsClient* client) mutable -> Status {
+        auto status = client->DropDatabase(ns.levels[0], /*cascade=*/false);
+        if (!status.has_value() && drop_attempted &&
+            status.error().kind == ErrorKind::kNoSuchNamespace) {
+          return {};  // our previous attempt landed; HMS confirms the after-state
+        }
+        drop_attempted = true;
+        return status;
+      });
 }
 
 Result<bool> HiveCatalog::NamespaceExists(const Namespace& ns) const {
@@ -474,23 +488,33 @@ Status HiveCatalog::RenameTable(const TableIdentifier& from, const TableIdentifi
   // Replay safety: a transport failure between the AlterTable RPC and
   // its reply leaves the rename committed but the pool reconnects and
   // re-runs the lambda. The replay sees the source row gone and would
-  // otherwise return NoSuchTable. The captured `rename_attempted` flag
-  // lets us recognise that branch, look up the target row, and report
-  // success when HMS confirms the rename landed.
+  // otherwise return NoSuchTable. Capture the source's metadata_location
+  // before issuing AlterTable so a retry that finds an Iceberg row at
+  // `to` can verify it carries the SAME metadata_location -- not just
+  // "any Iceberg table happens to live at the destination now". Without
+  // that identity check a concurrent third-party rename or pre-existing
+  // foreign Iceberg row at `to` could be mistaken for our own success.
   return client_pool_->Run(
-      [&, rename_attempted = false](HmsClient* client) mutable -> Status {
+      [&, rename_attempted = false,
+       source_metadata_location = std::string{}](HmsClient* client) mutable -> Status {
         auto from_or_error = client->GetTable(from.ns.levels[0], from.name);
         if (!from_or_error.has_value()) {
           if (rename_attempted && from_or_error.error().kind == ErrorKind::kNoSuchTable) {
             auto to_or_error = client->GetTable(to.ns.levels[0], to.name);
             if (to_or_error.has_value() &&
                 ValidateIcebergTable(to, to_or_error->parameters).has_value()) {
-              return {};
+              auto target_location = GetMetadataLocation(to_or_error->parameters);
+              if (target_location.has_value() &&
+                  *target_location == source_metadata_location) {
+                return {};
+              }
             }
           }
           return std::unexpected(from_or_error.error());
         }
         ICEBERG_RETURN_UNEXPECTED(ValidateIcebergTable(from, from_or_error->parameters));
+        ICEBERG_ASSIGN_OR_RAISE(source_metadata_location,
+                                GetMetadataLocation(from_or_error->parameters));
         auto& table = from_or_error.value();
         table.db_name = to.ns.levels[0];
         table.table_name = to.name;
