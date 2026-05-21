@@ -240,6 +240,26 @@ Status HadoopCatalog::UpdateNamespaceProperties(
       "Java HadoopCatalog rejects namespace property mutation.");
 }
 
+namespace {
+
+// suppress-permission-error: downgrade permission failures from the
+// FileIO into a log warning + empty result. Mirrors Java's flag of the
+// same name (in HadoopCatalog the flag only covers listing / existence
+// checks; commit failures still surface).
+bool SuppressedPermissionError(const HadoopCatalogProperties& config, const Error& err) {
+  if (!config.Get(HadoopCatalogProperties::kSuppressPermissionError)) {
+    return false;
+  }
+  if (err.kind == ErrorKind::kForbidden || err.kind == ErrorKind::kNotAuthorized) {
+    std::cerr << "[iceberg::hadoop] WARNING (suppress-permission-error): " << err.message
+              << '\n';
+    return true;
+  }
+  return false;
+}
+
+}  // namespace
+
 Result<std::vector<TableIdentifier>> HadoopCatalog::ListTables(
     const Namespace& ns) const {
   ICEBERG_ASSIGN_OR_RAISE(auto warehouse, config_.Warehouse());
@@ -252,7 +272,14 @@ Result<std::vector<TableIdentifier>> HadoopCatalog::ListTables(
     return NoSuchNamespace("Namespace '{}' does not exist.", ns.ToString());
   }
 
-  ICEBERG_ASSIGN_OR_RAISE(auto entries, file_io_->ListDir(ns_dir));
+  auto entries_result = file_io_->ListDir(ns_dir);
+  if (!entries_result.has_value()) {
+    if (SuppressedPermissionError(config_, entries_result.error())) {
+      return std::vector<TableIdentifier>{};
+    }
+    return std::unexpected<Error>(entries_result.error());
+  }
+  const auto& entries = *entries_result;
   std::vector<TableIdentifier> tables;
   for (const auto& entry : entries) {
     if (!entry.is_directory) {
@@ -410,7 +437,14 @@ Result<bool> HadoopCatalog::TableExists(const TableIdentifier& identifier) const
   ICEBERG_RETURN_UNEXPECTED(hadoop::ValidateTableIdentifier(identifier));
   ICEBERG_ASSIGN_OR_RAISE(auto warehouse, config_.Warehouse());
   ICEBERG_ASSIGN_OR_RAISE(auto table_dir, hadoop::TableDir(warehouse, identifier));
-  return hadoop::IsHadoopTableDir(*file_io_, table_dir);
+  auto result = hadoop::IsHadoopTableDir(*file_io_, table_dir);
+  if (!result.has_value()) {
+    if (SuppressedPermissionError(config_, result.error())) {
+      return false;
+    }
+    return std::unexpected<Error>(result.error());
+  }
+  return *result;
 }
 
 Status HadoopCatalog::DropTable(const TableIdentifier& identifier, bool purge) {
