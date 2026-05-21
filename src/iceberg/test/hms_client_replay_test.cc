@@ -951,8 +951,451 @@ TEST(HmsClientThriftGlue, CreateDatabaseRoundTripsRichInput) {
   EXPECT_EQ(captured.parameters.at("x"), "1");
 }
 
+// ----- Remaining specific catch arms across every RPC --------------
+//
+// Each RPC declares ~5-7 catch arms for distinct HMS exception types.
+// Earlier tests covered the "common" arms (NoSuchObjectException +
+// TTransport + generic TException). These add the remaining specific
+// arms so every `catch (const X&)` branch in hms_client.cc executes.
+
+#define THROW_HMS(type, msg)       \
+  do {                             \
+    Apache::Hadoop::Hive::type _e; \
+    _e.message = (msg);            \
+    throw _e;                      \
+  } while (0)
+
+// --- GetDatabase: UnknownDBException + MetaException ---
+
+TEST(HmsClientThriftGlue, GetDatabaseUnknownDBMapsToNoSuchNamespace) {
+  auto c = MakeWith([](FakeBackend& f) {
+    f.on_get_database = [](Database&, const std::string&) {
+      THROW_HMS(UnknownDBException, "db");
+    };
+  });
+  EXPECT_EQ(c->GetDatabase("x").error().kind, ErrorKind::kNoSuchNamespace);
+}
+
+TEST(HmsClientThriftGlue, GetDatabaseMetaExceptionMapsToIoError) {
+  auto c = MakeWith([](FakeBackend& f) {
+    f.on_get_database = [](Database&, const std::string&) {
+      THROW_HMS(MetaException, "meta");
+    };
+  });
+  EXPECT_EQ(c->GetDatabase("x").error().kind, ErrorKind::kIOError);
+}
+
+// --- CreateDatabase: MetaException ---
+
+TEST(HmsClientThriftGlue, CreateDatabaseMetaExceptionMapsToIoError) {
+  auto c = MakeWith([](FakeBackend& f) {
+    f.on_create_database = [](const Database&) { THROW_HMS(MetaException, "meta"); };
+  });
+  EXPECT_EQ(c->CreateDatabase({.name = "x"}).error().kind, ErrorKind::kIOError);
+}
+
+// --- DropDatabase: NoSuchObject + MetaException ---
+
+TEST(HmsClientThriftGlue, DropDatabaseNoSuchObjectMapsToNoSuchNamespace) {
+  auto c = MakeWith([](FakeBackend& f) {
+    f.on_drop_database = [](const std::string&, bool, bool) {
+      THROW_HMS(NoSuchObjectException, "no db");
+    };
+  });
+  EXPECT_EQ(c->DropDatabase("x", false).error().kind, ErrorKind::kNoSuchNamespace);
+}
+
+TEST(HmsClientThriftGlue, DropDatabaseMetaExceptionMapsToIoError) {
+  auto c = MakeWith([](FakeBackend& f) {
+    f.on_drop_database = [](const std::string&, bool, bool) {
+      THROW_HMS(MetaException, "meta");
+    };
+  });
+  EXPECT_EQ(c->DropDatabase("x", false).error().kind, ErrorKind::kIOError);
+}
+
+// --- AlterDatabase: InvalidOperation + MetaException ---
+
+TEST(HmsClientThriftGlue, AlterDatabaseInvalidOperationMapsToNotAllowed) {
+  auto c = MakeWith([](FakeBackend& f) {
+    f.on_alter_database = [](const std::string&, const Database&) {
+      THROW_HMS(InvalidOperationException, "bad");
+    };
+  });
+  EXPECT_EQ(c->AlterDatabase("x", {.name = "x"}).error().kind, ErrorKind::kNotAllowed);
+}
+
+TEST(HmsClientThriftGlue, AlterDatabaseMetaExceptionMapsToIoError) {
+  auto c = MakeWith([](FakeBackend& f) {
+    f.on_alter_database = [](const std::string&, const Database&) {
+      THROW_HMS(MetaException, "meta");
+    };
+  });
+  EXPECT_EQ(c->AlterDatabase("x", {.name = "x"}).error().kind, ErrorKind::kIOError);
+}
+
+// --- GetAllTables: NoSuchObject + UnknownDB + MetaException ---
+
+TEST(HmsClientThriftGlue, GetAllTablesNoSuchObjectMapsToNoSuchNamespace) {
+  auto c = MakeWith([](FakeBackend& f) {
+    f.on_get_all_tables = [](std::vector<std::string>&, const std::string&) {
+      THROW_HMS(NoSuchObjectException, "no db");
+    };
+  });
+  EXPECT_EQ(c->GetAllTables("x").error().kind, ErrorKind::kNoSuchNamespace);
+}
+
+TEST(HmsClientThriftGlue, GetAllTablesUnknownDBMapsToNoSuchNamespace) {
+  auto c = MakeWith([](FakeBackend& f) {
+    f.on_get_all_tables = [](std::vector<std::string>&, const std::string&) {
+      THROW_HMS(UnknownDBException, "no db");
+    };
+  });
+  EXPECT_EQ(c->GetAllTables("x").error().kind, ErrorKind::kNoSuchNamespace);
+}
+
+TEST(HmsClientThriftGlue, GetAllTablesMetaExceptionMapsToIoError) {
+  auto c = MakeWith([](FakeBackend& f) {
+    f.on_get_all_tables = [](std::vector<std::string>&, const std::string&) {
+      THROW_HMS(MetaException, "meta");
+    };
+  });
+  EXPECT_EQ(c->GetAllTables("x").error().kind, ErrorKind::kIOError);
+}
+
+// --- GetTable: UnknownTable + UnknownDB ---
+
+TEST(HmsClientThriftGlue, GetTableUnknownTableMapsToNoSuchTable) {
+  auto c = MakeWith([](FakeBackend& f) {
+    f.on_get_table_req = [](GetTableResult&, const GetTableRequest&) {
+      THROW_HMS(UnknownTableException, "no t");
+    };
+  });
+  EXPECT_EQ(c->GetTable("db", "t").error().kind, ErrorKind::kNoSuchTable);
+}
+
+TEST(HmsClientThriftGlue, GetTableUnknownDBMapsToNoSuchNamespace) {
+  auto c = MakeWith([](FakeBackend& f) {
+    f.on_get_table_req = [](GetTableResult&, const GetTableRequest&) {
+      THROW_HMS(UnknownDBException, "no db");
+    };
+  });
+  EXPECT_EQ(c->GetTable("db", "t").error().kind, ErrorKind::kNoSuchNamespace);
+}
+
+// --- CreateTable: InvalidObject + NoSuchObject + MetaException ---
+
+TEST(HmsClientThriftGlue, CreateTableInvalidObjectMapsToInvalidArgument) {
+  HiveTable t;
+  t.db_name = "db";
+  t.table_name = "t";
+  auto c = MakeWith([](FakeBackend& f) {
+    f.on_create_table = [](const Table&) { THROW_HMS(InvalidObjectException, "bad"); };
+  });
+  EXPECT_EQ(c->CreateTable(t).error().kind, ErrorKind::kInvalidArgument);
+}
+
+TEST(HmsClientThriftGlue, CreateTableNoSuchObjectMapsToNoSuchNamespace) {
+  HiveTable t;
+  t.db_name = "db";
+  t.table_name = "t";
+  auto c = MakeWith([](FakeBackend& f) {
+    f.on_create_table = [](const Table&) { THROW_HMS(NoSuchObjectException, "no db"); };
+  });
+  EXPECT_EQ(c->CreateTable(t).error().kind, ErrorKind::kNoSuchNamespace);
+}
+
+TEST(HmsClientThriftGlue, CreateTableMetaExceptionMapsToIoError) {
+  HiveTable t;
+  t.db_name = "db";
+  t.table_name = "t";
+  auto c = MakeWith([](FakeBackend& f) {
+    f.on_create_table = [](const Table&) { THROW_HMS(MetaException, "meta"); };
+  });
+  EXPECT_EQ(c->CreateTable(t).error().kind, ErrorKind::kIOError);
+}
+
+// --- DropTable: InvalidOperation + MetaException ---
+
+TEST(HmsClientThriftGlue, DropTableInvalidOperationMapsToNotAllowed) {
+  auto c = MakeWith([](FakeBackend& f) {
+    f.on_drop_table = [](const std::string&, const std::string&, bool) {
+      THROW_HMS(InvalidOperationException, "bad");
+    };
+  });
+  EXPECT_EQ(c->DropTable("db", "t", false).error().kind, ErrorKind::kNotAllowed);
+}
+
+TEST(HmsClientThriftGlue, DropTableMetaExceptionMapsToIoError) {
+  auto c = MakeWith([](FakeBackend& f) {
+    f.on_drop_table = [](const std::string&, const std::string&, bool) {
+      THROW_HMS(MetaException, "meta");
+    };
+  });
+  EXPECT_EQ(c->DropTable("db", "t", false).error().kind, ErrorKind::kIOError);
+}
+
+// --- AlterTable: InvalidObject + InvalidOperation + MetaException ---
+
+TEST(HmsClientThriftGlue, AlterTableInvalidObjectMapsToInvalidArgument) {
+  HiveTable t;
+  t.db_name = "db";
+  t.table_name = "t";
+  auto c = MakeWith([](FakeBackend& f) {
+    f.on_alter_table = [](const std::string&, const std::string&, const Table&) {
+      THROW_HMS(InvalidObjectException, "bad");
+    };
+  });
+  EXPECT_EQ(c->AlterTable("db", "t", t).error().kind, ErrorKind::kInvalidArgument);
+}
+
+TEST(HmsClientThriftGlue, AlterTableInvalidOperationMapsToNotAllowed) {
+  HiveTable t;
+  t.db_name = "db";
+  t.table_name = "t";
+  auto c = MakeWith([](FakeBackend& f) {
+    f.on_alter_table = [](const std::string&, const std::string&, const Table&) {
+      THROW_HMS(InvalidOperationException, "bad");
+    };
+  });
+  EXPECT_EQ(c->AlterTable("db", "t", t).error().kind, ErrorKind::kNotAllowed);
+}
+
+TEST(HmsClientThriftGlue, AlterTableMetaExceptionMapsToIoError) {
+  HiveTable t;
+  t.db_name = "db";
+  t.table_name = "t";
+  auto c = MakeWith([](FakeBackend& f) {
+    f.on_alter_table = [](const std::string&, const std::string&, const Table&) {
+      THROW_HMS(MetaException, "meta");
+    };
+  });
+  EXPECT_EQ(c->AlterTable("db", "t", t).error().kind, ErrorKind::kIOError);
+}
+
+// --- LockExclusive's lock() catch arms: TxnAborted + MetaException + generic ---
+
+TEST(HmsClientThriftGlue, LockExclusiveTxnAbortedFailsCommitFailed) {
+  auto c = MakeWith([](FakeBackend& f) {
+    f.on_lock = [](LockResponse&, const LockRequest&) {
+      THROW_HMS(TxnAbortedException, "txn aborted");
+    };
+  });
+  EXPECT_EQ(c->LockExclusive("db", "t").error().kind, ErrorKind::kCommitFailed);
+}
+
+TEST(HmsClientThriftGlue, LockExclusiveMetaExceptionMapsToIoError) {
+  auto c = MakeWith([](FakeBackend& f) {
+    f.on_lock = [](LockResponse&, const LockRequest&) {
+      THROW_HMS(MetaException, "meta");
+    };
+  });
+  EXPECT_EQ(c->LockExclusive("db", "t").error().kind, ErrorKind::kIOError);
+}
+
+TEST(HmsClientThriftGlue, LockExclusiveGenericThriftMapsToIoError) {
+  auto c = MakeWith([](FakeBackend& f) {
+    f.on_lock = [](LockResponse&, const LockRequest&) {
+      throw apache::thrift::TException("generic");
+    };
+  });
+  EXPECT_EQ(c->LockExclusive("db", "t").error().kind, ErrorKind::kIOError);
+}
+
+// --- Unlock: NoSuchLock + TxnOpen + MetaException ---
+
+TEST(HmsClientThriftGlue, UnlockNoSuchLockMapsToNotFound) {
+  // Per hms_client.cc: NoSuchLockException -> NotFound (kNotFound).
+  auto c = MakeWith([](FakeBackend& f) {
+    f.on_unlock = [](int64_t) { THROW_HMS(NoSuchLockException, "vanished"); };
+  });
+  HmsClient::HmsLockHandle h{.lock_id = 1};
+  EXPECT_EQ(c->Unlock(h).error().kind, ErrorKind::kNotFound);
+}
+
+TEST(HmsClientThriftGlue, UnlockTxnOpenMapsToNotAllowed) {
+  // Per hms_client.cc: TxnOpenException -> InvalidOperationError ->
+  // kNotAllowed.
+  auto c = MakeWith([](FakeBackend& f) {
+    f.on_unlock = [](int64_t) { THROW_HMS(TxnOpenException, "txn open"); };
+  });
+  HmsClient::HmsLockHandle h{.lock_id = 1};
+  EXPECT_EQ(c->Unlock(h).error().kind, ErrorKind::kNotAllowed);
+}
+
+TEST(HmsClientThriftGlue, UnlockMetaExceptionMapsToIoError) {
+  auto c = MakeWith([](FakeBackend& f) {
+    f.on_unlock = [](int64_t) { THROW_HMS(MetaException, "meta"); };
+  });
+  HmsClient::HmsLockHandle h{.lock_id = 1};
+  EXPECT_EQ(c->Unlock(h).error().kind, ErrorKind::kIOError);
+}
+
+// --- Heartbeat: TxnAborted + MetaException + generic ---
+
+TEST(HmsClientThriftGlue, HeartbeatTxnAbortedMapsToCommitFailed) {
+  auto c = MakeWith([](FakeBackend& f) {
+    f.on_heartbeat = [](const HeartbeatRequest&) {
+      THROW_HMS(TxnAbortedException, "txn aborted");
+    };
+  });
+  EXPECT_EQ(c->Heartbeat(1).error().kind, ErrorKind::kCommitFailed);
+}
+
+TEST(HmsClientThriftGlue, HeartbeatMetaExceptionMapsToIoError) {
+  auto c = MakeWith([](FakeBackend& f) {
+    f.on_heartbeat = [](const HeartbeatRequest&) { THROW_HMS(MetaException, "meta"); };
+  });
+  EXPECT_EQ(c->Heartbeat(1).error().kind, ErrorKind::kIOError);
+}
+
+TEST(HmsClientThriftGlue, HeartbeatGenericThriftMapsToIoError) {
+  auto c = MakeWith([](FakeBackend& f) {
+    f.on_heartbeat = [](const HeartbeatRequest&) {
+      throw apache::thrift::TException("generic");
+    };
+  });
+  EXPECT_EQ(c->Heartbeat(1).error().kind, ErrorKind::kIOError);
+}
+
+// ----- PollCheckLock 6 catch arms -----------------------------------
+//
+// The polling loop catches everything check_lock can throw and folds
+// it into a synthetic `LockState::ABORT` with an error message. Each
+// arm is reachable via LockExclusive(WAITING -> check_lock throws X).
+
+namespace {
+
+// Helper: drive LockExclusive through a script where lock() returns
+// WAITING and check_lock() throws the supplied callable's exception.
+template <typename Throw>
+Result<HmsClient::HmsLockHandle> RunPollingLockWithCheckLockException(Throw throw_fn) {
+  auto c = MakeWith([throw_fn](FakeBackend& f) {
+    f.on_lock = [](LockResponse& out, const LockRequest&) {
+      out.lockid = 1;
+      out.state = LockState::WAITING;
+    };
+    f.on_check_lock = [throw_fn](LockResponse&, int64_t) { throw_fn(); };
+    f.on_unlock = [](int64_t) {};  // accept the release-of-queued-handle
+  });
+  HmsLockOptions opt;
+  opt.check_min_wait_ms = 1;
+  opt.check_max_wait_ms = 2;
+  opt.acquire_timeout_ms = 50;
+  return c->LockExclusive("db", "t", opt);
+}
+
+}  // namespace
+
+TEST(HmsClientThriftGlue, PollCheckLockNoSuchLockMapsToAbort) {
+  auto r = RunPollingLockWithCheckLockException(
+      [] { THROW_HMS(NoSuchLockException, "vanished"); });
+  EXPECT_FALSE(r.has_value());  // ABORT -> kCommitFailed
+}
+
+TEST(HmsClientThriftGlue, PollCheckLockTxnAbortedMapsToAbort) {
+  auto r = RunPollingLockWithCheckLockException(
+      [] { THROW_HMS(TxnAbortedException, "txn aborted"); });
+  EXPECT_FALSE(r.has_value());
+}
+
+TEST(HmsClientThriftGlue, PollCheckLockTxnOpenMapsToAbort) {
+  auto r = RunPollingLockWithCheckLockException(
+      [] { THROW_HMS(TxnOpenException, "txn open"); });
+  EXPECT_FALSE(r.has_value());
+}
+
+TEST(HmsClientThriftGlue, PollCheckLockMetaExceptionMapsToAbort) {
+  auto r = RunPollingLockWithCheckLockException([] { THROW_HMS(MetaException, "meta"); });
+  EXPECT_FALSE(r.has_value());
+}
+
+TEST(HmsClientThriftGlue, PollCheckLockTransportSetsTransportFailedFlag) {
+  auto r = RunPollingLockWithCheckLockException([] {
+    throw apache::thrift::transport::TTransportException(
+        apache::thrift::transport::TTransportException::END_OF_FILE, "tx");
+  });
+  EXPECT_FALSE(r.has_value());
+}
+
+TEST(HmsClientThriftGlue, PollCheckLockGenericThriftMapsToAbort) {
+  auto r = RunPollingLockWithCheckLockException(
+      [] { throw apache::thrift::TException("generic"); });
+  EXPECT_FALSE(r.has_value());
+}
+
+// ----- Conversion helper edges --------------------------------------
+
+TEST(HmsClientThriftGlue, GetDatabaseRoundTripsOwnerTypeUser) {
+  auto c = MakeWith([](FakeBackend& f) {
+    f.on_get_database = [](Database& out, const std::string& name) {
+      out.name = name;
+      out.ownerName = "alice";
+      out.ownerType = Apache::Hadoop::Hive::PrincipalType::USER;
+      out.__isset.ownerType = true;
+    };
+  });
+  auto r = c->GetDatabase("x");
+  ASSERT_TRUE(r.has_value());
+  EXPECT_EQ(r->owner_type, "USER");
+}
+
+TEST(HmsClientThriftGlue, GetDatabaseRoundTripsOwnerTypeRole) {
+  auto c = MakeWith([](FakeBackend& f) {
+    f.on_get_database = [](Database& out, const std::string& name) {
+      out.name = name;
+      out.ownerType = Apache::Hadoop::Hive::PrincipalType::ROLE;
+      out.__isset.ownerType = true;
+    };
+  });
+  auto r = c->GetDatabase("x");
+  ASSERT_TRUE(r.has_value());
+  EXPECT_EQ(r->owner_type, "ROLE");
+}
+
+TEST(HmsClientThriftGlue, GetDatabaseRoundTripsOwnerTypeGroup) {
+  auto c = MakeWith([](FakeBackend& f) {
+    f.on_get_database = [](Database& out, const std::string& name) {
+      out.name = name;
+      out.ownerType = Apache::Hadoop::Hive::PrincipalType::GROUP;
+      out.__isset.ownerType = true;
+    };
+  });
+  auto r = c->GetDatabase("x");
+  ASSERT_TRUE(r.has_value());
+  EXPECT_EQ(r->owner_type, "GROUP");
+}
+
+TEST(HmsClientThriftGlue, CreateDatabaseHandlesOwnerTypeRole) {
+  // Drives ToThriftDatabase's "owner_type=ROLE" branch.
+  Database captured;
+  auto c = MakeWith([&](FakeBackend& f) {
+    f.on_create_database = [&](const Database& d) { captured = d; };
+  });
+  HiveDatabase d;
+  d.name = "x";
+  d.owner_name = "g";
+  d.owner_type = "ROLE";
+  ASSERT_TRUE(c->CreateDatabase(d).has_value());
+  EXPECT_EQ(captured.ownerType, Apache::Hadoop::Hive::PrincipalType::ROLE);
+}
+
+TEST(HmsClientThriftGlue, CreateDatabaseHandlesOwnerTypeGroup) {
+  Database captured;
+  auto c = MakeWith([&](FakeBackend& f) {
+    f.on_create_database = [&](const Database& d) { captured = d; };
+  });
+  HiveDatabase d;
+  d.name = "x";
+  d.owner_name = "g";
+  d.owner_type = "GROUP";
+  ASSERT_TRUE(c->CreateDatabase(d).has_value());
+  EXPECT_EQ(captured.ownerType, Apache::Hadoop::Hive::PrincipalType::GROUP);
+}
+
 #undef IT_THROWS_TRANSPORT
 #undef IT_THROWS_GENERIC
+#undef THROW_HMS
 
 // ----- HmsLockHeartbeat ---------------------------------------------
 
