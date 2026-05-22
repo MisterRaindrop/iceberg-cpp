@@ -159,6 +159,12 @@ Result<std::shared_ptr<HadoopCatalog>> HadoopCatalog::Make(
       }
     }
   } else if (IsS3Scheme(warehouse)) {
+    if (warehouse.starts_with("s3a://") || warehouse.starts_with("s3n://")) {
+      return InvalidArgument(
+          "HadoopCatalog::Make: arrow-fs-s3 only accepts 's3://' URIs; the "
+          "warehouse '{}' uses a JVM-only Hadoop alias. Use 's3://' instead.",
+          warehouse);
+    }
     io_name = std::string(FileIORegistry::kArrowS3FileIO);
   }
 

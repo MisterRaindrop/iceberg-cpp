@@ -610,27 +610,45 @@ Result<std::vector<FileIO::ListEntry>> ArrowFileSystemFileIO::ListDir(
                    infos_result.status().ToString());
   }
 
-  // arrow's FileInfo::path() returns the path within the arrow filesystem
-  // (no scheme/authority). The FileIO::ListDir contract is that returned
-  // locations are valid inputs to FileIO methods, so we must restore the
-  // scheme+authority that the caller used.
-  std::string uri_prefix;
-  if (auto scheme_end = dir_location.find("://"); scheme_end != std::string::npos) {
-    const auto authority_start = scheme_end + 3;
-    const auto path_start = dir_location.find('/', authority_start);
-    uri_prefix = path_start == std::string::npos ? dir_location
-                                                 : dir_location.substr(0, path_start);
+  // arrow's FileInfo::path() returns the path inside the arrow filesystem
+  // (no scheme/authority). LocalFileSystem returns absolute POSIX paths;
+  // S3 returns "bucket/key"; HDFS returns absolute paths within the
+  // namenode. The FileIO::ListDir contract requires returned locations to
+  // be valid inputs to FileIO methods, so we reconstruct them in the same
+  // URI form the caller supplied.
+  //
+  // We rebuild each entry by substituting the resolved base path with the
+  // caller-supplied prefix: an entry whose internal path is
+  // `<base_path><tail>` becomes `<dir_location><tail>`. This works for
+  // every backend because we never invent a "scheme://authority" join --
+  // we just splice the tail onto whatever the caller already passed in.
+  std::string_view base_view = path;
+  while (base_view.size() > 1 && base_view.back() == '/') {
+    base_view.remove_suffix(1);
+  }
+  std::string_view caller_prefix = dir_location;
+  while (caller_prefix.size() > 1 && caller_prefix.back() == '/') {
+    caller_prefix.remove_suffix(1);
   }
 
   std::vector<FileIO::ListEntry> entries;
   entries.reserve(infos_result->size());
   for (const auto& info : *infos_result) {
-    std::string loc = info.path();
-    if (!uri_prefix.empty() && loc.find("://") == std::string::npos) {
-      if (loc.empty() || loc.front() != '/') {
-        loc.insert(loc.begin(), '/');
+    const std::string& full_path = info.path();
+    std::string loc;
+    if (std::string_view(full_path).starts_with(base_view)) {
+      std::string_view tail = std::string_view(full_path).substr(base_view.size());
+      loc = std::string(caller_prefix);
+      if (!tail.empty() && tail.front() != '/') {
+        loc.push_back('/');
       }
-      loc = uri_prefix + loc;
+      loc.append(tail);
+    } else {
+      // Defensive: arrow returned a path that isn't a child of the
+      // requested base (shouldn't happen). Don't fabricate a URI we
+      // can't validate; pass the raw arrow path through and let the
+      // caller decide.
+      loc = full_path;
     }
     entries.push_back(FileIO::ListEntry{
         .location = std::move(loc),

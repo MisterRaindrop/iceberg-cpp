@@ -124,9 +124,13 @@ class ICEBERG_HADOOP_EXPORT HadoopTableOperations {
   ///      rename(overwrite=true). The lock serialises writers so a single
   ///      atomic replace is enough; this keeps the protocol crash-safe
   ///      without exposing a no-hint window.
-  ///   9. On rename failure, re-read the hint: if it already points at the
-  ///      new version somebody beat us to but we are consistent;
-  ///      otherwise clean up and return kCommitFailed.
+  ///   9. On rename failure, re-read the hint. If it already points at
+  ///      our new version (e.g. a transient post-success error on
+  ///      HDFS/S3) treat the commit as landed. Otherwise clean up the
+  ///      v{N+1} file + tmp hint and propagate the ORIGINAL rename
+  ///      error -- the metadata rename already committed, so wrapping
+  ///      the error as kCommitFailed would make Transaction retry
+  ///      forever against a permanent infrastructure failure.
   ///   10. Release the lock in a `finally`-like cleanup.
   Status Commit(const TableMetadata& base, const TableMetadata& updated);
 

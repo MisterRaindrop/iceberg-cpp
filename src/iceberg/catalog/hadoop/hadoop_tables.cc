@@ -35,6 +35,7 @@
 #include "iceberg/sort_order.h"
 #include "iceberg/table.h"
 #include "iceberg/table_metadata.h"
+#include "iceberg/table_properties.h"
 #include "iceberg/util/gzip_internal.h"
 #include "iceberg/util/macros.h"
 #include "iceberg/util/uuid.h"
@@ -138,6 +139,12 @@ std::string_view HdfsAuthority(std::string_view path) {
 
 Result<std::shared_ptr<FileIO>> HadoopTables::ResolveFileIO(std::string_view path) {
   std::lock_guard lk(resolve_mutex_);
+  if (path.starts_with("s3a://") || path.starts_with("s3n://")) {
+    return InvalidArgument(
+        "HadoopTables: arrow-fs-s3 only accepts 's3://' URIs; the path '{}' uses "
+        "a JVM-only Hadoop alias. Use 's3://' instead.",
+        path);
+  }
   std::string io_name = DetectIoName(path);
   const std::string_view authority = HdfsAuthority(path);
   if (file_io_ != nullptr) {
@@ -185,6 +192,9 @@ Result<std::shared_ptr<FileIO>> HadoopTables::ResolveFileIO(std::string_view pat
 }
 
 Result<std::shared_ptr<Table>> HadoopTables::Load(const std::string& path) {
+  if (path.empty()) {
+    return InvalidArgument("HadoopTables::Load requires a non-empty path.");
+  }
   ICEBERG_ASSIGN_OR_RAISE(auto io, ResolveFileIO(path));
 
   // Java's HadoopTables.load returns kNoSuchTable when the path is not a
@@ -209,6 +219,9 @@ Result<std::shared_ptr<Table>> HadoopTables::Load(const std::string& path) {
 }
 
 Result<bool> HadoopTables::Exists(const std::string& path) {
+  if (path.empty()) {
+    return InvalidArgument("HadoopTables::Exists requires a non-empty path.");
+  }
   ICEBERG_ASSIGN_OR_RAISE(auto io, ResolveFileIO(path));
   return hadoop::IsHadoopTableDir(*io, path);
 }
@@ -231,6 +244,16 @@ Result<std::shared_ptr<Table>> HadoopTables::Create(
     return AlreadyExists("Table already exists at '{}'.", path);
   }
 
+  // Path-based Hadoop tables cannot redirect their metadata directory.
+  // Mirror the same check HadoopCatalog::WriteInitialTableLocked applies
+  // so HadoopTables and HadoopCatalog stay invariant-compatible.
+  if (properties.contains(std::string(TableProperties::kWriteMetadataLocation.key()))) {
+    return InvalidArgument(
+        "HadoopTables::Create: path-based Hadoop tables cannot set '{}'; "
+        "the metadata directory is fixed under the table location.",
+        TableProperties::kWriteMetadataLocation.key());
+  }
+
   ICEBERG_ASSIGN_OR_RAISE(auto metadata,
                           TableMetadata::Make(*schema, *spec, *order, path, properties));
 
@@ -250,6 +273,9 @@ Result<std::shared_ptr<Table>> HadoopTables::Create(
 }
 
 Status HadoopTables::DropTable(const std::string& path, bool /*purge*/) {
+  if (path.empty()) {
+    return InvalidArgument("HadoopTables::DropTable requires a non-empty path.");
+  }
   ICEBERG_ASSIGN_OR_RAISE(auto io, ResolveFileIO(path));
   ICEBERG_ASSIGN_OR_RAISE(auto is_table, hadoop::IsHadoopTableDir(*io, path));
   if (!is_table) {
@@ -263,6 +289,9 @@ Status HadoopTables::DropTable(const std::string& path, bool /*purge*/) {
 
 Result<std::shared_ptr<Table>> HadoopTables::RegisterTable(
     const std::string& path, const std::string& metadata_file_location) {
+  if (path.empty()) {
+    return InvalidArgument("HadoopTables::RegisterTable requires a non-empty path.");
+  }
   if (metadata_file_location.empty()) {
     return InvalidArgument(
         "HadoopTables::RegisterTable requires a non-empty metadata_file_location.");
@@ -296,6 +325,16 @@ Result<std::shared_ptr<Table>> HadoopTables::RegisterTable(
   }
   ICEBERG_ASSIGN_OR_RAISE(auto json, FromJsonString(body));
   ICEBERG_ASSIGN_OR_RAISE(auto metadata, TableMetadataFromJson(json));
+
+  // Path-based Hadoop tables cannot carry a write.metadata.path that
+  // points outside <table>/metadata. Mirror HadoopCatalog::RegisterTable.
+  if (metadata->properties.configs().contains(
+          TableProperties::kWriteMetadataLocation.key())) {
+    return InvalidArgument(
+        "HadoopTables::RegisterTable: source metadata sets '{}', which "
+        "path-based Hadoop tables do not support.",
+        TableProperties::kWriteMetadataLocation.key());
+  }
 
   std::string target;
   ICEBERG_RETURN_UNEXPECTED(PublishInitialMetadata(*io, path, codec, raw, target));
