@@ -88,6 +88,32 @@ class MetadataIOTest : public TempFileTestBase {
   std::string temp_filepath_;
 };
 
+TEST_F(MetadataIOTest, WriteAutoCreatesNestedParentDirs) {
+  // Regression: arrow::fs::LocalFileSystem::OpenOutputStream does NOT
+  // mkdir intermediate directories. Production code (HiveCatalog +
+  // any other catalog that writes metadata.json under a freshly
+  // created namespace) first hits this when its very first table
+  // commit tries to land at
+  // `<warehouse>/<ns>.db/<tbl>/metadata/<uuid>.metadata.json`.
+  // `ArrowOutputFile::Create` must invoke `CreateDir(parent,
+  // recursive=true)` first; without that the write fails with
+  // "[errno 2] No such file or directory" and 207 unit tests miss it.
+  TableMetadata metadata = PrepareMetadata();
+  // Use a path with TWO levels of fresh nesting that don't exist yet.
+  auto nested = std::format("{}/{}/{}", location_, "fresh_namespace", "fresh_table");
+  // Intentionally do NOT call `create_directories` -- production code
+  // does not, and the bug was that arrow failed silently when asked
+  // to write into the missing tree.
+  ICEBERG_UNWRAP_OR_FAIL(
+      auto new_loc,
+      TableMetadataUtil::Write(*io_, nullptr, nested + "/metadata/seed.metadata.json",
+                               metadata));
+  EXPECT_TRUE(std::filesystem::exists(new_loc))
+      << "WriteFile must auto-mkdir the parent chain; otherwise HiveCatalog "
+         "(and every other producer using arrow-fs-local) fails on the very "
+         "first table commit under a fresh namespace.";
+}
+
 TEST_F(MetadataIOTest, ReadWriteMetadata) {
   TableMetadata metadata = PrepareMetadata();
 

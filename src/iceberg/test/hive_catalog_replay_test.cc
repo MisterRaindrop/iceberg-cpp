@@ -1235,6 +1235,114 @@ TEST(HiveCatalogOps, NameAccessor) {
   EXPECT_EQ(catalog->name(), "hive");
 }
 
+// =====================================================================
+// Regression tests for the production bugs caught only when running
+// hive_catalog_integration_test against a real apache/hive:4.0.0 HMS:
+// each test below would have caught its bug before integration.
+// =====================================================================
+
+TEST(HiveCatalogOps, CreateNamespaceDerivesLocationUriFromWarehouse) {
+  // Real HMS standalone metastore rejects an empty location_uri with
+  // "java.lang.IllegalArgumentException: Can not create a Path from
+  // an empty string". `HiveCatalog::CreateNamespace` must derive
+  // `<warehouse>/<ns>.db` when the caller did not supply `location`,
+  // mirroring Java HiveCatalog. Capture the Database passed to HMS
+  // and assert location_uri is non-empty and warehouse-rooted.
+  class CapturingFake : public FakeHmsClient {
+   public:
+    HiveDatabase captured;
+    Status CreateDatabase(const HiveDatabase& db) override {
+      captured = db;
+      return Status{};
+    }
+  };
+  auto fake = std::make_unique<CapturingFake>();
+  auto* fake_ptr = fake.get();
+
+  auto pool = HmsClientPool::MakeForTesting(
+      1, []() -> Result<std::unique_ptr<HmsClient>> { return IOError("nope"); },
+      std::move(fake));
+  HiveCatalogProperties props = HiveCatalogProperties::FromMap(
+      {{std::string(HiveCatalogProperties::kWarehouse.key()), "file:///tmp/iceberg"}});
+  auto catalog = HiveCatalog::MakeForTesting(std::move(props), std::move(pool), nullptr);
+
+  auto status = catalog->CreateNamespace(Namespace{{"warehouse"}}, {});
+  ASSERT_TRUE(status.has_value()) << status.error().message;
+  EXPECT_EQ(fake_ptr->captured.location_uri, "file:///tmp/iceberg/warehouse.db")
+      << "empty location_uri makes real HMS reject the request; we must "
+         "derive it from the warehouse property";
+}
+
+TEST(HiveCatalogOps, CreateNamespacePreservesExplicitLocation) {
+  // When the caller supplies an explicit `location` property, that
+  // value wins; the default-derivation must NOT clobber it.
+  class CapturingFake : public FakeHmsClient {
+   public:
+    HiveDatabase captured;
+    Status CreateDatabase(const HiveDatabase& db) override {
+      captured = db;
+      return Status{};
+    }
+  };
+  auto fake = std::make_unique<CapturingFake>();
+  auto* fake_ptr = fake.get();
+
+  auto pool = HmsClientPool::MakeForTesting(
+      1, []() -> Result<std::unique_ptr<HmsClient>> { return IOError("nope"); },
+      std::move(fake));
+  HiveCatalogProperties props = HiveCatalogProperties::FromMap(
+      {{std::string(HiveCatalogProperties::kWarehouse.key()), "file:///tmp/iceberg"}});
+  auto catalog = HiveCatalog::MakeForTesting(std::move(props), std::move(pool), nullptr);
+
+  auto status = catalog->CreateNamespace(Namespace{{"warehouse"}},
+                                         {{"location", "s3://custom/path"}});
+  ASSERT_TRUE(status.has_value());
+  EXPECT_EQ(fake_ptr->captured.location_uri, "s3://custom/path");
+}
+
+TEST(HiveCatalogOps, UpdateNamespacePropertiesClearsOwnerTypeWhenOwnerRemoved) {
+  // Real HMS auto-stamps `ownerType=USER` on CreateDatabase. If the
+  // user later removes the `owner` property but keeps `owner-type`,
+  // ValidateOwnerSettings rejects the read-modify-write because
+  // owner-type requires owner. UpdateNamespaceProperties implicitly
+  // clears owner-type whenever owner is removed; capture the
+  // AlterDatabase argument and pin that behavior.
+  class CapturingFake : public FakeHmsClient {
+   public:
+    HiveDatabase captured;
+    Result<HiveDatabase> GetDatabase(std::string_view name) override {
+      HiveDatabase db;
+      db.name = std::string(name);
+      // Simulate HMS auto-stamping owner + owner-type on create.
+      db.owner_name = "alice";
+      db.owner_type = "USER";
+      return db;
+    }
+    Status AlterDatabase(std::string_view, const HiveDatabase& db) override {
+      captured = db;
+      return Status{};
+    }
+  };
+  auto fake = std::make_unique<CapturingFake>();
+  auto* fake_ptr = fake.get();
+
+  auto pool = HmsClientPool::MakeForTesting(
+      1, []() -> Result<std::unique_ptr<HmsClient>> { return IOError("nope"); },
+      std::move(fake));
+  auto catalog = HiveCatalog::MakeForTesting(HiveCatalogProperties::default_properties(),
+                                             std::move(pool), nullptr);
+
+  auto status = catalog->UpdateNamespaceProperties(Namespace{{"warehouse"}},
+                                                   /*updates=*/{{"team", "data"}},
+                                                   /*removals=*/{"owner"});
+  ASSERT_TRUE(status.has_value()) << status.error().message;
+  EXPECT_TRUE(fake_ptr->captured.owner_name.empty())
+      << "removing owner must clear owner_name in the HMS write";
+  EXPECT_TRUE(fake_ptr->captured.owner_type.empty())
+      << "owner-type is a paired setting; clearing owner without owner-type "
+         "makes real HMS (and our ValidateOwnerSettings) reject the request";
+}
+
 TEST(HiveTableOpsDirect, CommitVerifyTransportFailureIsCommitStateUnknown) {
   // AlterTable transport-fails AND the subsequent verify GetTable
   // ALSO fails with a non-NoSuchTable error -- the commit may have
