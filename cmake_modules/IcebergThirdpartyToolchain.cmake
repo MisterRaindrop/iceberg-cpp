@@ -241,6 +241,20 @@ function(resolve_avro_dependency)
 
   fetchcontent_makeavailable(avro-cpp)
 
+  # Avro's CMakeLists fetches fmt 10.2.1, which uses `consteval` on
+  # `basic_format_string`. With newer Apple clang on macOS 26 (Tahoe)
+  # the strict consteval evaluator rejects fmt's own internal
+  # FMT_STRING calls (the "compile_string is not a constant
+  # expression" error spam in `format-inl.h`). Force fmt back onto
+  # the constexpr path on the avro targets that pull it in; we don't
+  # rely on compile-time format-string checking via vendored fmt
+  # anyway -- iceberg core uses std::format.
+  foreach(_avro_target IN ITEMS avrocpp avrocpp_s)
+    if(TARGET ${_avro_target})
+      target_compile_definitions(${_avro_target} PRIVATE FMT_USE_CONSTEVAL=0)
+    endif()
+  endforeach()
+
   if(avro-cpp_SOURCE_DIR)
     if(NOT TARGET avro-cpp::avrocpp_static)
       add_library(avro-cpp::avrocpp_static INTERFACE IMPORTED)
