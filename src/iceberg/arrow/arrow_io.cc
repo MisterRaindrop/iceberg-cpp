@@ -609,11 +609,31 @@ Result<std::vector<FileIO::ListEntry>> ArrowFileSystemFileIO::ListDir(
     return IOError("ListDir failed for '{}': {}", dir_location,
                    infos_result.status().ToString());
   }
+
+  // arrow's FileInfo::path() returns the path within the arrow filesystem
+  // (no scheme/authority). The FileIO::ListDir contract is that returned
+  // locations are valid inputs to FileIO methods, so we must restore the
+  // scheme+authority that the caller used.
+  std::string uri_prefix;
+  if (auto scheme_end = dir_location.find("://"); scheme_end != std::string::npos) {
+    const auto authority_start = scheme_end + 3;
+    const auto path_start = dir_location.find('/', authority_start);
+    uri_prefix = path_start == std::string::npos ? dir_location
+                                                 : dir_location.substr(0, path_start);
+  }
+
   std::vector<FileIO::ListEntry> entries;
   entries.reserve(infos_result->size());
   for (const auto& info : *infos_result) {
+    std::string loc = info.path();
+    if (!uri_prefix.empty() && loc.find("://") == std::string::npos) {
+      if (loc.empty() || loc.front() != '/') {
+        loc.insert(loc.begin(), '/');
+      }
+      loc = uri_prefix + loc;
+    }
     entries.push_back(FileIO::ListEntry{
-        .location = info.path(),
+        .location = std::move(loc),
         .is_directory = info.type() == ::arrow::fs::FileType::Directory,
     });
   }

@@ -98,18 +98,22 @@ class ICEBERG_HADOOP_EXPORT InMemoryLockManager : public LockManager {
 /// \brief Filesystem-backed lock manager.
 ///
 /// `FileLockManager` writes a `_lock` file under
-/// `<entity_id>/metadata/_lock` using fail-if-exists semantics. The file
-/// contents are `<owner_id>|<acquire_ts_ms>` so that another process can
-/// detect when the holder died -- the lock is considered stale when its
-/// recorded timestamp is older than `lock.heartbeat-timeout-ms`. Stale
-/// locks are deleted and re-acquired by the next caller.
+/// `<entity_id>/metadata/_lock` using fail-if-exists semantics (via a
+/// UUID-named temp + `Rename(overwrite=false)`). The file contents are
+/// `<owner_id>|<acquire_ts_ms>`; the recorded timestamp lets a separate
+/// reaper / operator decide when the lock is no longer live. A background
+/// heartbeat thread refreshes the timestamp every
+/// `lock.heartbeat-interval-ms` so a legitimately slow commit is not
+/// mis-classified as a dead holder.
 ///
-/// A background heartbeat thread refreshes the lock's timestamp every
-/// `lock.heartbeat-interval-ms` so that legitimately slow commits do not
-/// race against the stale-lock GC. The thread verifies the lock still
-/// belongs to us before refreshing -- if another process stole the lock
-/// (we hung past `heartbeat-timeout-ms`), the heartbeat becomes a no-op and
-/// Release will surface kNotAllowed.
+/// **Stale-lock reclamation is NOT performed inline by `Acquire`.** A
+/// `read body -> rename source aside` snatch is fundamentally unsafe
+/// without a "verify body THEN unlink source" primitive (it can move a
+/// fresh post-stale lock that a third racer just published). `Acquire`
+/// therefore leaves any stale `_lock` file in place and logs a warning
+/// once per call. Operators (or an external reaper that knows the
+/// expected holder is gone) must remove the file; after removal the next
+/// `Acquire` succeeds normally via the rename CAS.
 ///
 /// **Cross-process atomicity envelope.**
 ///
@@ -129,21 +133,14 @@ class ICEBERG_HADOOP_EXPORT InMemoryLockManager : public LockManager {
 /// 2. **Heartbeat refresh is best-effort even on LocalFileSystem.** The
 ///    background heartbeat thread reads the current body, checks owner
 ///    equality, then writes the new timestamp. There is no atomic
-///    compare-and-write primitive available in `FileIO`, so a stealer
-///    that deletes our stale lock and re-acquires between our heartbeat
-///    read and write will see its lock body overwritten by our stale
-///    refresh. Consequences are bounded:
-///    - Mutual exclusion of `Acquire` is preserved by the rename CAS at
-///      step (1); no third party can take the lock while either of us
-///      holds it on disk.
-///    - The stealer's subsequent `Release` will fail with
-///      `kNotAllowed` because the body says `owner_id` belongs to us.
-///    - The lock file may persist (with the wrong recorded owner) until
-///      another heartbeat-timeout-ms passes, at which point the
-///      stale-lock GC reclaims it.
-///    - HadoopCatalog's commit-time CAS on `v{N}.metadata.json`
-///      prevents any data corruption that the bounded mis-attribution
-///      could otherwise cause.
+///    compare-and-write primitive available in `FileIO`, so if the
+///    on-disk lock is externally reaped and another acquirer publishes a
+///    fresh body between our heartbeat read and write, our stale write
+///    can clobber the new body. The race window is bounded (microseconds),
+///    consequences are bounded too: the stealer's later `Release` returns
+///    `kNotAllowed`, HadoopCatalog's commit-time CAS on
+///    `v{N+1}.metadata.json` prevents any actual data corruption, and
+///    the lock body is informational rather than the source of truth.
 ///
 /// In short: the lock body is informational; the real safety is the
 /// Acquire-time rename CAS plus the commit-time metadata rename CAS.

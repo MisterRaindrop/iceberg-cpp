@@ -204,16 +204,27 @@ when a single process is the only writer, or layer an external
 coordination service (DynamoDB lock manager, S3 conditional PUT, etc.)
 on top -- iceberg-cpp does not wire one up automatically.
 
+**Stale-lock reclamation is not performed inline by `Acquire`.** A
+`read body -> rename source aside` snatch is unsafe without a "verify
+body THEN unlink source" primitive (it can race a third party that just
+cleaned the stale lock and published a fresh one). `Acquire` instead
+leaves the stale `_lock` file in place and emits a one-time-per-call
+warning identifying the recorded owner. Operators (or an external
+reaper that knows the holder is truly gone) must remove the file with
+something like `hdfs dfs -rm` / `aws s3 rm` / `rm` for the local case;
+the next `Acquire` then succeeds via the normal rename CAS.
+
 **Heartbeat refresh is best-effort even on LocalFileSystem.** The
 background heartbeat thread does a read-check-write to refresh the lock
 timestamp without an atomic compare-and-write primitive available in
-`FileIO`. A stealer that times us out, deletes our stale lock and
-re-acquires between our read and write will get its body silently
-overwritten by our stale refresh. The consequences are bounded: mutual
-exclusion of `Acquire` is preserved by the rename CAS, the stealer's
-later `Release` returns `kNotAllowed`, and HadoopCatalog's commit-time
-CAS on `v{N}.metadata.json` prevents any actual data corruption. The
-lock body is informational; the real safety is layered on top.
+`FileIO`. If the on-disk lock is externally reaped and another acquirer
+publishes a fresh body between our heartbeat read and write, our stale
+write can clobber the new body. The race window is bounded
+(microseconds), consequences are bounded too: the stealer's later
+`Release` returns `kNotAllowed`, and HadoopCatalog's commit-time CAS on
+`v{N+1}.metadata.json` prevents any actual data corruption. The lock
+body is informational; the real safety is the Acquire-time rename CAS
+plus the commit-time metadata rename CAS.
 
 ## HDFS and Kerberos
 

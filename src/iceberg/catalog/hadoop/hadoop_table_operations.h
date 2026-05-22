@@ -111,7 +111,7 @@ class ICEBERG_HADOOP_EXPORT HadoopTableOperations {
   /// Implements the 10-step Java HadoopTableOperations protocol:
   ///   1. Reject any change to `metadata.location` (Java requires
   ///      filesystem tables to stay at their original path).
-  ///   2. Reject metadata that overrides `write.metadata.location`.
+  ///   2. Reject metadata that overrides `write.metadata.path`.
   ///   3. Acquire the LockManager. Acquire timeout -> kCommitFailed.
   ///   4. Re-resolve the current pointer; if it has drifted from `base`,
   ///      return kCommitFailed so `iceberg::Transaction` can retry.

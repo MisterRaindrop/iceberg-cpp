@@ -333,8 +333,24 @@ Result<bool> FileLockManager::Acquire(const std::string& entity_id,
     // `lock-impl=file` is documented as best-effort; stale-lock
     // reclamation is an operator responsibility (or an external reaper)
     // rather than something inline on the Acquire fast path.
-    if (auto existing = file_io_->ReadFile(lock_path, /*length=*/std::nullopt);
-        existing.has_value() && !stale_warned_this_call) {
+    auto existing = file_io_->ReadFile(lock_path, /*length=*/std::nullopt);
+    if (!existing.has_value()) {
+      // Disambiguate "file just got deleted by a Release racing us" from a
+      // real read error (permission denied, IO failure). The former is
+      // expected and we should keep retrying; the latter must propagate
+      // so the caller doesn't see a misleading kCommitFailed timeout.
+      auto still_there = file_io_->Exists(lock_path);
+      if (!still_there.has_value()) {
+        return std::unexpected<Error>(still_there.error());
+      }
+      if (*still_there) {
+        // File exists but we couldn't read it -- propagate the original
+        // ReadFile error.
+        return std::unexpected<Error>(existing.error());
+      }
+      // Race with Release / external delete: fall through to the wait
+      // tick and try Acquire again next iteration.
+    } else if (!stale_warned_this_call) {
       if (auto decoded = DecodeLockBody(*existing); decoded.has_value()) {
         const int64_t age_ms = MillisSinceEpoch() - decoded->ts_ms;
         if (age_ms > heartbeat_timeout_.count()) {

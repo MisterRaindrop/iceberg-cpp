@@ -209,7 +209,9 @@ Result<std::shared_ptr<TableMetadata>> HadoopTableOperations::Refresh() {
 
 namespace {
 
-constexpr std::string_view kWriteMetadataLocation = "write.metadata.location";
+// Resolve the actual table-property key at use sites via
+// TableProperties::kWriteMetadataLocation.key() ("write.metadata.path") so we
+// stay in sync with the canonical definition.
 
 // Walk <table>/metadata/ and delete the oldest v{N}.metadata.json[.codec]
 // files, keeping the newest `previous_versions_max` plus the current one.
@@ -302,11 +304,12 @@ Status HadoopTableOperations::Commit(const TableMetadata& base,
   }
   // (2) Path-based tables cannot redirect metadata to an external location;
   // doing so would break version-hint.text resolution.
-  if (updated.properties.configs().contains(std::string(kWriteMetadataLocation))) {
+  if (updated.properties.configs().contains(
+          TableProperties::kWriteMetadataLocation.key())) {
     return InvalidArgument(
         "Hadoop path-based tables cannot set '{}'; the metadata directory is fixed "
         "under the table location.",
-        kWriteMetadataLocation);
+        TableProperties::kWriteMetadataLocation.key());
   }
 
   // (3) Acquire the lock.
@@ -383,9 +386,9 @@ Status HadoopTableOperations::Commit(const TableMetadata& base,
 
   auto rename_status = file_io_->Rename(hint_tmp, hint, /*overwrite=*/true);
   if (!rename_status.has_value()) {
-    // (9) Recovery: the rename failed. Check whether some other writer (or
-    // an earlier crashed run) already advanced the hint to our new version
-    // -- if so, we landed despite the error.
+    // (9) Recovery: the rename reported an error but the hint may already
+    // have advanced to our version (e.g. a transient network error after
+    // a successful HDFS/S3 rename). If so, treat the commit as landed.
     auto recheck = ResolveCurrentMetadata(*file_io_, table_dir_);
     if (recheck.has_value() && recheck->version == next_version) {
       std::ignore = file_io_->DeleteFile(hint_tmp);
@@ -393,14 +396,15 @@ Status HadoopTableOperations::Commit(const TableMetadata& base,
       current_version_ = next_version;
       return {};
     }
-    // Otherwise treat as a true failure: clean up our v{N+1} file and the
-    // tmp hint, return kCommitFailed so the Transaction can retry.
+    // True failure. Clean up our v{N+1} file and the tmp hint and
+    // propagate the ORIGINAL error -- the metadata rename already
+    // committed, so this is post-CAS bookkeeping that failed for an
+    // unrelated reason (permission, NotSupported, permanent IO). Wrapping
+    // it as kCommitFailed would make Transaction retry forever against
+    // an error that won't resolve.
     std::ignore = file_io_->DeleteFile(target);
     std::ignore = file_io_->DeleteFile(hint_tmp);
-    return CommitFailed(
-        "HadoopTableOperations::Commit: rename of version-hint.text failed and the "
-        "hint did not advance: {}.",
-        rename_status.error().message);
+    return rename_status;
   }
 
   current_location_ = target;

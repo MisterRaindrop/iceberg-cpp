@@ -34,6 +34,7 @@
 #include "iceberg/json_serde_internal.h"
 #include "iceberg/table.h"
 #include "iceberg/table_metadata.h"
+#include "iceberg/table_properties.h"
 #include "iceberg/table_requirements.h"
 #include "iceberg/table_update.h"
 #include "iceberg/util/checked_cast.h"
@@ -470,6 +471,17 @@ Result<std::string> PublishV1AfterLock(FileIO& file_io, const std::string& table
 Result<std::string> HadoopCatalog::WriteInitialTableLocked(
     const std::string& table_dir, const TableMetadata& metadata,
     const std::string& owner_prefix) {
+  // Path-based tables cannot redirect metadata to an external location.
+  // Same rule HadoopTableOperations::Commit applies to UpdateTable; we
+  // enforce it on the create paths too so a user-supplied
+  // write.metadata.path can't pin the wrong metadata directory at v1.
+  if (metadata.properties.configs().contains(
+          TableProperties::kWriteMetadataLocation.key())) {
+    return InvalidArgument(
+        "Hadoop path-based tables cannot set '{}'; the metadata directory is fixed "
+        "under the table location.",
+        TableProperties::kWriteMetadataLocation.key());
+  }
   ICEBERG_ASSIGN_OR_RAISE(auto codec, hadoop::ResolveCommitCodec(metadata));
   ICEBERG_ASSIGN_OR_RAISE(auto bytes, hadoop::EncodeMetadataWithCodec(metadata, codec));
   return WriteInitialBytesLocked(table_dir, bytes, codec, owner_prefix);
@@ -711,6 +723,17 @@ Result<std::shared_ptr<Table>> HadoopCatalog::RegisterTable(
   }
   ICEBERG_ASSIGN_OR_RAISE(auto json, FromJsonString(body));
   ICEBERG_ASSIGN_OR_RAISE(auto metadata, TableMetadataFromJson(json));
+
+  // Same Java parity rule HadoopCatalog::Commit / CreateTable enforce:
+  // path-based tables cannot redirect their metadata directory via
+  // `write.metadata.path`.
+  if (metadata->properties.configs().contains(
+          TableProperties::kWriteMetadataLocation.key())) {
+    return InvalidArgument(
+        "HadoopCatalog::RegisterTable: source metadata sets '{}', which Hadoop "
+        "path-based tables do not support.",
+        TableProperties::kWriteMetadataLocation.key());
+  }
 
   // Publish via the same lock + UUID-temp + atomic-rename path as CreateTable
   // so concurrent register/create attempts cannot overwrite each other.
