@@ -331,9 +331,19 @@ Status HadoopTableOperations::Commit(const TableMetadata& base,
   auto rename_to_target = file_io_->Rename(temp_path, target, /*overwrite=*/false);
   if (!rename_to_target.has_value()) {
     std::ignore = file_io_->DeleteFile(temp_path);
-    return CommitFailed(
-        "HadoopTableOperations::Commit: rename to '{}' failed (lost CAS race): {}",
-        target, rename_to_target.error().message);
+    // Only the "destination already exists" failure means a concurrent
+    // commit won the CAS race -- that one IS retryable, so surface it
+    // as kCommitFailed for Transaction::Commit. Permission denied,
+    // NotSupported, generic IOError etc. must propagate as themselves,
+    // otherwise Transaction would re-run the commit attempt forever
+    // against an infrastructure failure that will never resolve.
+    if (rename_to_target.error().kind == ErrorKind::kAlreadyExists) {
+      return CommitFailed(
+          "HadoopTableOperations::Commit: lost CAS race to '{}': another writer "
+          "already published the next version.",
+          target);
+    }
+    return rename_to_target;
   }
 
   // (8) Update version-hint.text via write-tmp + atomic-replace. The lock

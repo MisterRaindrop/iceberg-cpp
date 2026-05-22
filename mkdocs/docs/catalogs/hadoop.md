@@ -21,9 +21,13 @@
 
 `HadoopCatalog` is the filesystem-backed catalog. Tables live directly under a
 warehouse directory; there is no metastore and no HTTP service to operate.
-Commit-time consistency is achieved by an atomic rename of `version-hint.text`
-plus an in-process or filesystem lock. The on-disk layout and commit protocol
-are byte-for-byte compatible with Apache Iceberg's Java `HadoopCatalog`.
+Commit-time consistency is achieved by an atomic
+`Rename(overwrite=false)` of the new `v{N+1}.metadata.json` file (created
+under a UUID-named temp) as the CAS primitive, plus an in-process or
+filesystem lock; `version-hint.text` is then published via an
+atomic-replace `Rename(overwrite=true)`. The on-disk layout and commit
+protocol are byte-for-byte compatible with Apache Iceberg's Java
+`HadoopCatalog`.
 
 ## When to use it
 
@@ -258,7 +262,7 @@ same operations:
 | `FileLockManager` (`lock-impl=file`) | ❌ (plugin) | ✅ on `file://`; ⚠ best-effort only on `hdfs://`/`s3://`/`mockfs://` (see Cross-process safety envelope) |
 | `write.metadata.compression-codec=gzip` (on commit AND initial create) | ✅ | ✅ |
 | `write.metadata.compression-codec=zstd` | ✅ | ❌ (`kNotSupported`; iceberg-cpp metadata reader has no zstd path) |
-| `commit.metadata.previous-versions-max` / `delete-after-commit.enabled` | ✅ | ✅ |
+| `write.metadata.previous-versions-max` / `write.metadata.delete-after-commit.enabled` | ✅ | ✅ |
 | `DropTable(purge=true)` snapshot data cleanup via manifest walk | ✅ | ⚠ recursive directory delete only; `LogWarning` flags the divergence |
 | `suppress-permission-error` | ✅ | ✅ (covers `kForbidden`, `kNotAuthorized`, and arrow `kIOError` with permission messages) |
 | `HadoopTables` single-table API | ✅ | ✅ |

@@ -329,40 +329,61 @@ Result<bool> FileLockManager::Acquire(const std::string& entity_id,
       if (decoded.has_value()) {
         const int64_t age_ms = MillisSinceEpoch() - decoded->ts_ms;
         if (age_ms > heartbeat_timeout_.count()) {
-          // Stale-lock GC must be atomic-with-uniqueness: two racers that
-          // both observed the same stale body would otherwise each delete
-          // the file -- including the new owner's just-acquired lock --
-          // and each go on to win the next Acquire CAS, ending up with
-          // two holders. Use Rename(lock_path -> unique stale path,
-          // overwrite=false) as the conditional snatch: on LocalFileSystem
-          // this is `link(2)` + `unlink`, atomic w.r.t. source existence,
-          // so only one racer sees success. The loser sees a missing-
-          // source error and falls through to the wait loop, re-reading
-          // `lock_path` next iteration.
+          // Stale-lock GC: Rename(lock_path -> unique stale path,
+          // overwrite=false) is the conditional snatch. On LocalFileSystem
+          // it is `link(2)` + `unlink`, atomic w.r.t. source existence.
           //
-          // On non-LocalFS backends (HDFS / S3 / mockfs) arrow's
-          // Rename(overwrite=false) degrades to a GetFileInfo precheck +
-          // unconditional Move, which is TOCTOU and CAN allow two racers
-          // to both succeed. The Acquire-time rename CAS at the publish
-          // step is the actual safety net on those backends; the snatch
-          // here narrows the window but does not close it.
+          // The dangerous race the rename ALONE does not prevent: between
+          // our Read above and this Rename, another acquirer can snatch
+          // the stale lock AND publish a fresh new lock at the same path.
+          // Our Rename would then atomically move the new owner's live
+          // lock into our stale path -- silent corruption.
+          //
+          // Defence: after the snatch, re-read what we moved. If the body
+          // matches the (owner, ts) we observed when classifying the lock
+          // as stale, the snatch was correct -- delete it. If the body
+          // differs, we hijacked someone else's lock; best-effort restore
+          // via Rename(stale_path -> lock_path, overwrite=false). On
+          // restore failure we discard the snatched file rather than
+          // overwrite whatever a third racer has since published.
+          //
+          // On non-LocalFS backends arrow's Rename(overwrite=false)
+          // degrades to a precheck + unconditional Move (TOCTOU); the
+          // verify-then-restore step narrows but does not close that
+          // window. The Acquire-time publish-CAS at the bottom of the
+          // loop is still the actual safety net there.
           const std::string stale_path =
               std::format("{}.stale.{}", lock_path, Uuid::GenerateV7().ToString());
           auto snatch = file_io_->Rename(lock_path, stale_path, /*overwrite=*/false);
           if (snatch.has_value()) {
-            std::ignore = file_io_->DeleteFile(stale_path);
+            auto snatched_body = file_io_->ReadFile(stale_path, std::nullopt);
+            bool body_matches = false;
+            if (snatched_body.has_value()) {
+              auto snatched_decoded = DecodeLockBody(*snatched_body);
+              body_matches = snatched_decoded.has_value() &&
+                             snatched_decoded->owner == decoded->owner &&
+                             snatched_decoded->ts_ms == decoded->ts_ms;
+            }
+            if (body_matches) {
+              std::ignore = file_io_->DeleteFile(stale_path);
+            } else {
+              // We hijacked a fresher lock than we intended. Try to put
+              // it back. If lock_path was repopulated in the meantime
+              // discard ours rather than overwrite whatever is there.
+              auto restore = file_io_->Rename(stale_path, lock_path, /*overwrite=*/false);
+              if (!restore.has_value()) {
+                std::ignore = file_io_->DeleteFile(stale_path);
+              }
+            }
           } else if (snatch.error().kind != ErrorKind::kIOError &&
                      snatch.error().kind != ErrorKind::kAlreadyExists &&
                      snatch.error().kind != ErrorKind::kNotFound) {
-            // Permission denied, NotSupported, etc. -- propagate so the
-            // caller sees the real reason rather than spinning until the
-            // acquire timeout. kIOError covers "source disappeared" (we
-            // lost the snatch); kAlreadyExists / kNotFound are also
-            // expected race outcomes, not infrastructure failure.
+            // Permission denied, NotSupported, etc. -- propagate.
+            // kIOError / kAlreadyExists / kNotFound are expected race
+            // outcomes (someone else snatched / source gone), not
+            // infrastructure failure.
             return std::unexpected<Error>(snatch.error());
           }
-          // Whether we won the snatch or another racer did, the stale
-          // body is now gone (or about to be); loop and try to publish.
           continue;
         }
       }
@@ -449,6 +470,13 @@ Result<std::unique_ptr<LockManager>> MakeLockManager(
 
 Result<std::unique_ptr<LockManager>> MakeLockManagerWithIO(
     const HadoopCatalogProperties& config, std::shared_ptr<FileIO> file_io) {
+  // Validate the config before any LockManager constructor touches Get<int>;
+  // ConfigBase::Get<int> would otherwise throw a C++ exception on a
+  // malformed value, escaping the Result<> contract. Callers reaching the
+  // factory directly (without going through HadoopCatalog::Make) must get
+  // the same kInvalidArgument surface treatment.
+  ICEBERG_RETURN_UNEXPECTED(config.Validate());
+
   const auto impl = config.Get(HadoopCatalogProperties::kLockImpl);
   if (impl.empty() || impl == "in-memory") {
     return std::make_unique<InMemoryLockManager>(config);

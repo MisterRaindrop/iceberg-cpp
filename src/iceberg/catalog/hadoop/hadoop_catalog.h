@@ -41,7 +41,11 @@ namespace iceberg::hadoop {
 /// HadoopCatalog stores all catalog state directly in the warehouse directory
 /// tree: namespaces are directories, tables are subdirectories with a
 /// `metadata/` folder, and `version-hint.text` points at the current metadata
-/// version. Commit uses an atomic rename of `version-hint.text` for CAS.
+/// version. Commit uses an atomic rename of the new `v{N+1}.metadata.json`
+/// file (created via a UUID-named temp + `Rename(overwrite=false)`) as its
+/// CAS primitive; `version-hint.text` itself is updated by a separate
+/// atomic-replace (`Rename(overwrite=true)`) after the metadata rename
+/// wins. See the commit protocol in `mkdocs/docs/catalogs/hadoop.md`.
 ///
 /// The API mirrors Apache Iceberg's Java `HadoopCatalog` class. Behaviours
 /// that Java explicitly rejects (e.g. namespace properties, RenameTable) are

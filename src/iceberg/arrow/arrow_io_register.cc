@@ -64,9 +64,16 @@ void RegisterHdfsFileIO() {
         auto fs_default = properties.find("fs.defaultFS");
         if (fs_default != properties.end() && !fs_default->second.empty()) {
           auto parsed = ::arrow::fs::HdfsOptions::FromUri(fs_default->second);
-          if (parsed.ok()) {
-            options = *parsed;
+          if (!parsed.ok()) {
+            // Surface the URI parse failure instead of silently falling
+            // back to default HdfsOptions, which would route to the JVM's
+            // core-site default FS and ignore the namenode the caller
+            // actually configured.
+            return InvalidArgument(
+                "HadoopFileSystem: failed to parse fs.defaultFS='{}': {}",
+                fs_default->second, parsed.status().ToString());
           }
+          options = *parsed;
         }
         for (const auto& [key, value] : properties) {
           if (key.starts_with("hadoop.") || key.starts_with("dfs.") ||

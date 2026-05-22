@@ -206,8 +206,14 @@ class ICEBERG_EXPORT FileIO {
 
   /// \brief Atomically rename a file or directory.
   ///
-  /// `overwrite=false` should fail if the destination already exists. This is
-  /// the primitive HadoopCatalog uses to perform CAS on `version-hint.text`.
+  /// `overwrite=false` should fail if the destination already exists; this
+  /// is the primitive HadoopCatalog uses as its commit-time CAS on
+  /// `v{N+1}.metadata.json` and as the conditional create primitive for
+  /// `FileLockManager`. `overwrite=true` is an atomic-replace and is used
+  /// by HadoopCatalog to publish the updated `version-hint.text`.
+  /// Implementations should document which backends provide truly atomic
+  /// create-if-absent semantics; on those that don't, callers must layer
+  /// their own coordination.
   virtual Status Rename(const std::string& from, const std::string& to, bool overwrite) {
     return NotImplemented("Rename not implemented");
   }
