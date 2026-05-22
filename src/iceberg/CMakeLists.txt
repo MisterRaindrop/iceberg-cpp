@@ -298,6 +298,14 @@ if(ICEBERG_BUILD_BUNDLE)
         target_compile_definitions(${target}
                                    PUBLIC "$<BUILD_INTERFACE:ICEBERG_S3_ENABLED=0>")
       endif()
+      # iceberg's avro adapter TUs include avro/Exception.hh which
+      # pulls in fmt 10.2.1's headers. The bundled fmt's `consteval`
+      # ctor on basic_format_string trips macOS 26's new Apple clang
+      # (see IcebergThirdpartyToolchain.cmake's resolve_avro_dependency
+      # for the full story). Mirror the workaround on iceberg's avro
+      # consumer so the cascading "compile_string is not a constant
+      # expression" errors don't blow up the bundle build.
+      target_compile_options(${target} PRIVATE "SHELL:-D FMT_CONSTEVAL=")
     endif()
   endforeach()
 

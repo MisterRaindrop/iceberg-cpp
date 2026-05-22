@@ -256,9 +256,22 @@ function(resolve_avro_dependency)
   # `-DFMT_CONSTEVAL=` (note the trailing `=` to set an empty value)
   # has to go through `target_compile_options` because
   # `target_compile_definitions` strips the trailing `=`.
+  #
+  # We attach the flag to:
+  #   1. avrocpp / avrocpp_s -- the vendored library itself.
+  #   2. fmt-header-only's INTERFACE -- so iceberg's own avro adapter
+  #      TUs (src/iceberg/avro/*.cc) that include avro headers (which
+  #      transitively pull fmt headers) also see the flag. Avro's
+  #      INTERFACE keeps fmt-header-only as a forward dep so the
+  #      define propagates.
   foreach(_avro_target IN ITEMS avrocpp avrocpp_s)
     if(TARGET ${_avro_target})
       target_compile_options(${_avro_target} PRIVATE "SHELL:-D FMT_CONSTEVAL=")
+    endif()
+  endforeach()
+  foreach(_fmt_target IN ITEMS fmt-header-only fmt)
+    if(TARGET ${_fmt_target})
+      target_compile_options(${_fmt_target} INTERFACE "SHELL:-D FMT_CONSTEVAL=")
     endif()
   endforeach()
 
