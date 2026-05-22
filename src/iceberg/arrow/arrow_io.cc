@@ -460,6 +460,18 @@ class ArrowOutputFile : public OutputFile {
         return AlreadyExists("File already exists: {}", location_);
       }
     }
+    // Ensure the parent directory exists before opening the stream.
+    // arrow::fs::LocalFileSystem::OpenOutputStream does NOT create
+    // intermediate directories, so writing
+    // `<warehouse>/<ns>.db/<tbl>/metadata/<uuid>.metadata.json`
+    // fails with "[errno 2] No such file or directory" when the
+    // namespace is freshly created. CreateDir(recursive=true) is a
+    // no-op on object stores (S3 has no real dirs), so this is safe
+    // for every backend.
+    if (auto pos = path_.find_last_of('/'); pos != std::string::npos && pos > 0) {
+      auto parent = path_.substr(0, pos);
+      ICEBERG_ARROW_RETURN_NOT_OK(fs_->CreateDir(parent, /*recursive=*/true));
+    }
     ICEBERG_ARROW_ASSIGN_OR_RETURN(auto output, fs_->OpenOutputStream(path_));
     return std::make_unique<ArrowPositionOutputStream>(std::move(output));
   }

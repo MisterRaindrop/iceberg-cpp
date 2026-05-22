@@ -19,6 +19,7 @@
 
 #include "iceberg/catalog/hive/hive_catalog.h"
 
+#include <format>
 #include <memory>
 #include <optional>
 #include <string>
@@ -115,7 +116,20 @@ std::string_view HiveCatalog::name() const { return name_; }
 
 Status HiveCatalog::CreateNamespace(
     const Namespace& ns, const std::unordered_map<std::string, std::string>& properties) {
-  ICEBERG_ASSIGN_OR_RAISE(auto database, ConvertToHiveDatabase(ns, properties));
+  // HMS rejects an empty `location_uri` with
+  // "java.lang.IllegalArgumentException: Can not create a Path from an
+  // empty string". If the caller did not pass a `location` property,
+  // derive `<warehouse>/<ns>.db` so HMS gets a non-empty path. Mirrors
+  // Java HiveCatalog's `databasePath()` behavior.
+  auto effective = properties;
+  if (effective.find(std::string(kLocationProperty)) == effective.end()) {
+    const std::string warehouse = config_.Get(HiveCatalogProperties::kWarehouse);
+    if (!warehouse.empty() && !ns.levels.empty()) {
+      effective[std::string(kLocationProperty)] =
+          std::format("{}/{}.db", warehouse, ns.levels[0]);
+    }
+  }
+  ICEBERG_ASSIGN_OR_RAISE(auto database, ConvertToHiveDatabase(ns, effective));
   // Replay safety: HmsClientPool::Run retries once on transport failure
   // by re-invoking the same lambda. If our first CreateDatabase's reply
   // was lost, the retry sees `kAlreadyExists` -- but there is NO unique
@@ -266,6 +280,15 @@ Status HiveCatalog::UpdateNamespaceProperties(
     }
     for (const auto& [key, value] : updates) {
       properties[key] = value;
+    }
+    // `owner` and `owner-type` are paired -- HMS rejects (and our own
+    // ValidateOwnerSettings rejects) `owner-type` set without
+    // `owner`. The read-modify-write cycle can land here when the
+    // caller drops `owner` without also dropping `owner-type` (HMS
+    // typically auto-stamps `owner-type=USER` on create). Keep them
+    // consistent by clearing `owner-type` whenever `owner` is gone.
+    if (!properties.contains(std::string(kOwnerProperty))) {
+      properties.erase(std::string(kOwnerTypeProperty));
     }
     ICEBERG_ASSIGN_OR_RAISE(auto altered, ConvertToHiveDatabase(ns, properties));
     mutation_attempted = true;

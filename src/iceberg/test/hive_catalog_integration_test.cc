@@ -43,6 +43,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 
+#include "iceberg/arrow/arrow_io_register.h"
 #include "iceberg/catalog/hive/hive_catalog.h"
 #include "iceberg/catalog/hive/hive_catalog_properties.h"
 #include "iceberg/catalog/hive/hive_table_operations.h"
@@ -98,6 +99,13 @@ bool WaitForPort(uint16_t port) {
 class HiveCatalogIntegrationTest : public ::testing::Test {
  protected:
   static void SetUpTestSuite() {
+    // Force the Arrow FileIO TU to link in. Its namespace-scope static
+    // initializer registers `arrow-fs-local` + `arrow-fs-s3` into
+    // FileIORegistry, but without an explicit reference the static
+    // archive linker discards the whole TU and `HiveCatalog::Make`
+    // fails with "FileIO implementation not found".
+    iceberg::arrow::EnsureArrowFileIOsRegistered();
+
     docker_ = std::make_unique<DockerCompose>(
         std::string(kDockerProjectName),
         std::filesystem::path(GetResourcePath("iceberg-hive-fixture")));
@@ -167,7 +175,8 @@ TEST_F(HiveCatalogIntegrationTest, NamespaceCrudRoundTrip) {
   // Cleanup from any prior aborted run.
   (void)catalog->DropNamespace(ns);
 
-  ASSERT_TRUE(catalog->CreateNamespace(ns, {{"owner", "iceberg-cpp"}}).has_value());
+  auto create_result = catalog->CreateNamespace(ns, {{"owner", "iceberg-cpp"}});
+  ASSERT_TRUE(create_result.has_value()) << create_result.error().message;
 
   auto exists = catalog->NamespaceExists(ns);
   ASSERT_TRUE(exists.has_value()) << exists.error().message;

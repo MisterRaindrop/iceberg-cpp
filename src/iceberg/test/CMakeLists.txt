@@ -307,5 +307,15 @@ if(ICEBERG_BUILD_HIVE)
                           hive_catalog_integration_test.cc
                           util/cmd_util.cc
                           util/docker_compose_util.cc)
+    # Pull in iceberg_bundle so the arrow-fs-local FileIO is
+    # registered. The integration test points its warehouse at
+    # `file:///tmp/iceberg` and resolves it through FileIORegistry's
+    # arrow-fs-local entry; without the bundle, `HiveCatalog::Make`
+    # surfaces "FileIO implementation not found".
+    if(ICEBERG_BUILD_BUNDLE)
+      target_link_libraries(hive_catalog_integration_test
+                            PRIVATE "$<IF:$<TARGET_EXISTS:iceberg_bundle_static>,iceberg_bundle_static,iceberg_bundle_shared>"
+      )
+    endif()
   endif()
 endif()

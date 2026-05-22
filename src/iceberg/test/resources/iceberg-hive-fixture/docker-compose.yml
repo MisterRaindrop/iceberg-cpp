@@ -46,7 +46,11 @@ services:
     ports:
       - "9083:9083"
     healthcheck:
-      test: ["CMD-SHELL", "nc -z localhost 9083 || exit 1"]
+      # apache/hive:4.0.0 lacks `nc`; use bash's builtin /dev/tcp probe
+      # (bash IS in the image because the standalone metastore entry
+      # point is a bash script). This is what actually proves HMS is
+      # listening on 9083 before the test fixture connects.
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/9083' || exit 1"]
       interval: 5s
       timeout: 5s
       retries: 30
@@ -62,7 +66,10 @@ services:
       - "9000:9000"
       - "9001:9001"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/ready"]
+      # minio image lacks `curl`; use the `mc` client baked into the
+      # image to confirm the server is ready (mc admin info is the
+      # canonical probe for the minio server's own state).
+      test: ["CMD-SHELL", "mc ready local || exit 1"]
       interval: 5s
       timeout: 5s
       retries: 30
