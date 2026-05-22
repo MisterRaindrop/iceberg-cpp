@@ -110,8 +110,6 @@ TEST(HadoopFileLayoutTest, MetadataAndAuxiliaryPaths) {
   EXPECT_EQ("file:///tmp/wh/db/events/metadata/version-hint.text",
             VersionHintPath(table));
   EXPECT_EQ("file:///tmp/wh/db/events/metadata/_lock", LockFilePath(table));
-  EXPECT_EQ("file:///tmp/wh/db/namespace.properties",
-            NamespacePropertiesPath("file:///tmp/wh/db"));
 }
 
 TEST(HadoopFileLayoutTest, ParseMetadataFileNameAcceptsAllCodecs) {

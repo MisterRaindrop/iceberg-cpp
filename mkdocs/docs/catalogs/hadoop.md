@@ -51,6 +51,31 @@ find_package(iceberg CONFIG REQUIRED)
 target_link_libraries(my_app PRIVATE iceberg::iceberg_hadoop)
 ```
 
+If your code uses `HadoopCatalog::Make(name, config)` (the auto-detect
+overload that picks the FileIO from the warehouse scheme), you also need
+to link `iceberg::iceberg_bundle`. The arrow-backed FileIOs
+(`arrow-fs-local`, `arrow-fs-s3`, `arrow-fs-hdfs`) are registered by the
+bundle's static initialiser; without that link the auto-detect Make
+returns `kInvalidArgument` with a message that says exactly this.
+Alternatives:
+
+```cmake
+# Option A: pull in the bundle (registers all FileIOs at static-init).
+target_link_libraries(my_app PRIVATE iceberg::iceberg_hadoop iceberg::iceberg_bundle)
+```
+
+```cpp
+// Option B: register explicitly before the catalog is made.
+#include "iceberg/arrow/arrow_io_register.h"
+iceberg::arrow::EnsureArrowFileIOsRegistered();
+auto catalog = HadoopCatalog::Make("...", props).value();
+```
+
+```cpp
+// Option C: pass an explicit FileIO (no bundle dependency required).
+auto catalog = HadoopCatalog::Make("...", file_io, props).value();
+```
+
 ## Quick start
 
 ```cpp
@@ -97,10 +122,12 @@ auto table = catalog->CreateTable(
       data/                        # writer-managed
 ```
 
-`version-hint.text` is updated atomically by writing
-`version-hint.text.tmp`, deleting the old hint, and renaming the temp file in
-place. If the hint is missing or corrupt, readers fall back to a directory scan
-that returns the maximum `vN` file present.
+`version-hint.text` is updated by writing a UUID-suffixed temp file
+(`version-hint.text.tmp.<uuid>`) and then issuing an atomic
+`Rename(overwrite=true)`. The commit-time lock serialises writers; the
+atomic replace keeps the protocol crash-safe (there is no window during
+which the hint file is absent). If the hint is missing or corrupt, readers
+fall back to a directory scan that returns the maximum `vN` file present.
 
 ## Properties
 
@@ -114,9 +141,10 @@ that returns the maximum `vN` file present.
 | `lock-impl` | `in-memory` | `in-memory` (default) or `file`. Other names return `kInvalidArgument`. |
 | `lock.acquire-interval-ms` | 5000 | Probe interval while waiting for the lock. |
 | `lock.acquire-timeout-ms` | 180000 | Lock acquisition timeout (3 min). |
-| `lock.heartbeat-interval-ms` / `lock.heartbeat-timeout-ms` / `lock.heartbeat-threads` | 3000 / 15000 / 4 | Honored by `FileLockManager` (H14); no-op for `InMemoryLockManager`. |
-| `suppress-permission-error` | `false` | When true, downgrade `kForbidden` errors on list / exists into warnings (introduced alongside `H17`). |
-| `fs.defaultFS` / `hadoop.security.authentication` / `hadoop.kerberos.principal` / `hadoop.kerberos.keytab` | (empty) | Forwarded to the HDFS FileIO `extra_conf` when the warehouse scheme is `hdfs://` (H21). |
+| `lock.heartbeat-interval-ms` / `lock.heartbeat-timeout-ms` | 3000 / 15000 | Honored by `FileLockManager`; no-op for `InMemoryLockManager`. |
+| `lock.heartbeat-threads` | 4 | Accepted for Java config compatibility; the cpp `FileLockManager` runs one heartbeat thread per held lock and ignores this value. |
+| `suppress-permission-error` | `false` | When true, downgrade permission errors on list / exists paths (including Arrow's `kIOError` wrapping `EACCES`/`EPERM`) into warnings instead of returning the error. |
+| `fs.defaultFS` / `hadoop.security.authentication` / `hadoop.kerberos.principal` / `hadoop.kerberos.keytab` | (empty) | Forwarded to the HDFS FileIO `extra_conf` when the warehouse scheme is `hdfs://`. |
 
 Any property whose key begins with `hadoop.`, `dfs.`, or `fs.` is preserved
 verbatim and passed through to the underlying HDFS FileIO when applicable.
@@ -134,17 +162,54 @@ implementation:
 4. Re-resolve `version-hint.text`. If it has advanced past `base`'s version
    → `kCommitFailed` (so `iceberg::Transaction` can retry).
 5. Pick the target filename: `v{N+1}.metadata.json` plus the codec suffix
-   selected by `write.metadata.compression-codec` (codec support arrives in
-   H15).
-6. Refuse to overwrite an existing file at that path → `kCommitFailed`.
-7. Write the new metadata.
-8. Three-step pointer update: write `version-hint.text.tmp`, delete the old
-   `version-hint.text`, rename `.tmp` → `version-hint.text` without
-   overwrite. The rename is the CAS primitive.
-9. If rename fails, re-read the hint. If somebody else (or a recovered
-   crash) already advanced it to our new version, treat it as success.
-   Otherwise clean up the new file and `.tmp`, return `kCommitFailed`.
-10. Release the lock in a finally-like cleanup.
+   selected by `write.metadata.compression-codec` (`none` / `gzip`).
+6. Serialise + (optionally) compress the new metadata into a UUID-named
+   temp file under `metadata/`. Crashed writers leave UUID-named orphans
+   that listdir-based recovery ignores.
+7. Atomically rename the temp file to `v{N+1}.metadata.json[.codec]` with
+   `overwrite=false`. This is the CAS primitive: if another writer beat
+   us to `v{N+1}`, the rename fails and we surface `kCommitFailed`.
+8. Update `version-hint.text` via write-tmp + `Rename(overwrite=true)`.
+   The lock already serialises writers, so the atomic replace is enough;
+   no delete-then-rename window where the hint is absent.
+9. If the hint rename fails, re-read the metadata directory. If the hint
+   has somehow already advanced to our version, treat as success.
+   Otherwise clean up the v{N+1} file + tmp hint and return
+   `kCommitFailed`.
+10. Release the lock before any commit-time GC (`PruneOldMetadataFiles`)
+    so long delete loops on deep history do not stall other writers.
+
+## Cross-process safety envelope
+
+The commit protocol's CAS depends on `Rename(overwrite=false)` being a true
+atomic create-if-absent. In iceberg-cpp:
+
+- **`file://` (LocalFileSystem)** — safe. Implemented via POSIX `link(2)`
+  through `std::filesystem::create_hard_link`; two competing writers see
+  `kAlreadyExists` deterministically.
+- **`hdfs://`, `s3://` / `s3a://` / `s3n://`, `mockfs://`** — **NOT safe
+  cross-process**. arrow's `Move` on these backends does not expose an
+  atomic create-if-absent primitive, so iceberg-cpp falls back to a
+  `GetFileInfo` precheck + unconditional `Move`. The precheck has a
+  TOCTOU window: two concurrent commits can both observe "absent" and
+  both rename, overwriting each other's metadata. `HadoopCatalog::Make`
+  emits a runtime warning for these warehouses.
+
+For production deployments on those backends use `lock-impl=in-memory`
+when a single process is the only writer, or layer an external
+coordination service (DynamoDB lock manager, S3 conditional PUT, etc.)
+on top -- iceberg-cpp does not wire one up automatically.
+
+**Heartbeat refresh is best-effort even on LocalFileSystem.** The
+background heartbeat thread does a read-check-write to refresh the lock
+timestamp without an atomic compare-and-write primitive available in
+`FileIO`. A stealer that times us out, deletes our stale lock and
+re-acquires between our read and write will get its body silently
+overwritten by our stale refresh. The consequences are bounded: mutual
+exclusion of `Acquire` is preserved by the rename CAS, the stealer's
+later `Release` returns `kNotAllowed`, and HadoopCatalog's commit-time
+CAS on `v{N}.metadata.json` prevents any actual data corruption. The
+lock body is informational; the real safety is layered on top.
 
 ## HDFS and Kerberos
 
@@ -187,16 +252,17 @@ same operations:
 | Feature | Java | iceberg-cpp |
 |---|---|---|
 | Namespace CRUD + filtering of table dirs | ✅ | ✅ |
-| Table CRUD on local / HDFS | ✅ | ✅ (HDFS wiring via H20–H21) |
+| Table CRUD on local / HDFS | ✅ | ✅ |
 | Commit + LockManager + CAS recovery | ✅ | ✅ |
 | `InMemoryLockManager` default | ✅ | ✅ |
-| `FileLockManager` (`lock-impl=file`) | ❌ (plugin) | ⏳ H14 |
-| `write.metadata.compression-codec` | ✅ | ⏳ H15 |
-| `commit.metadata.previous-versions-max` / `delete-after-commit.enabled` | ✅ | ⏳ H16 |
-| `DropTable(purge=true)` snapshot data cleanup | ✅ | ⏳ H17 |
-| `suppress-permission-error` | ✅ | ⏳ H17 |
-| `HadoopTables` single-table API | ✅ | ⏳ H19 |
-| HDFS via Arrow `HadoopFileSystem` (libhdfs JNI) | n/a (Java is native) | ⏳ H20 |
-| Kerberos passthrough via JVM UGI | ✅ | ⏳ H21 (docs above) |
+| `FileLockManager` (`lock-impl=file`) | ❌ (plugin) | ✅ on `file://`; ⚠ best-effort only on `hdfs://`/`s3://`/`mockfs://` (see Cross-process safety envelope) |
+| `write.metadata.compression-codec=gzip` (on commit AND initial create) | ✅ | ✅ |
+| `write.metadata.compression-codec=zstd` | ✅ | ❌ (`kNotSupported`; iceberg-cpp metadata reader has no zstd path) |
+| `commit.metadata.previous-versions-max` / `delete-after-commit.enabled` | ✅ | ✅ |
+| `DropTable(purge=true)` snapshot data cleanup via manifest walk | ✅ | ⚠ recursive directory delete only; `LogWarning` flags the divergence |
+| `suppress-permission-error` | ✅ | ✅ (covers `kForbidden`, `kNotAuthorized`, and arrow `kIOError` with permission messages) |
+| `HadoopTables` single-table API | ✅ | ✅ |
+| HDFS via Arrow `HadoopFileSystem` (libhdfs JNI) | n/a (Java is native) | ✅ (build with `ICEBERG_HDFS=ON`) |
+| Kerberos passthrough via JVM UGI | ✅ | ✅ (see HDFS section above) |
 | `RenameTable` | ❌ (NotSupported) | ❌ (NotSupported) |
 | `CreateNamespace` with non-empty properties | ❌ (Unsupported) | ❌ (NotSupported) |

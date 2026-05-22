@@ -20,19 +20,24 @@
 #include "iceberg/catalog/hadoop/hadoop_catalog.h"
 
 #include <format>
+#include <optional>
 #include <string_view>
 #include <utility>
+
+#include <nlohmann/json.hpp>
 
 #include "iceberg/catalog/hadoop/hadoop_file_layout.h"
 #include "iceberg/catalog/hadoop/hadoop_log.h"
 #include "iceberg/catalog/hadoop/hadoop_table_operations.h"
 #include "iceberg/file_io.h"
 #include "iceberg/file_io_registry.h"
+#include "iceberg/json_serde_internal.h"
 #include "iceberg/table.h"
 #include "iceberg/table_metadata.h"
 #include "iceberg/table_requirements.h"
 #include "iceberg/table_update.h"
 #include "iceberg/util/checked_cast.h"
+#include "iceberg/util/gzip_internal.h"
 #include "iceberg/util/macros.h"
 #include "iceberg/util/uuid.h"
 
@@ -40,22 +45,62 @@ namespace iceberg::hadoop {
 
 namespace {
 
-constexpr std::string_view kStubMessage =
-    "HadoopCatalog method is a stub; implemented in subsequent commits";
-
-// S3 / object stores do not provide atomic rename semantics, which the
-// HadoopCatalog commit protocol depends on for CAS via `version-hint.text`.
-// Emit a runtime warning to make the foot-gun visible without blocking the
-// user; this matches the spirit of the Java HadoopCatalog docs.
-void MaybeWarnS3Warehouse(std::string_view warehouse) {
-  if (warehouse.starts_with("s3://") || warehouse.starts_with("s3a://") ||
-      warehouse.starts_with("s3n://")) {
+// Only LocalFileSystem currently has a true atomic create-if-absent rename
+// in iceberg-cpp's arrow adapter (see arrow_io.cc::Rename). All other
+// warehouse schemes fall through to a TOCTOU precheck + Move, which means
+// HadoopCatalog's metadata-file CAS and the optional `lock-impl=file`
+// cross-process guarantee both degrade to best-effort. Emit a runtime
+// warning so the foot-gun is visible.
+void MaybeWarnNonAtomicWarehouse(std::string_view warehouse) {
+  if (IsS3Scheme(warehouse)) {
     LogWarning(std::format(
         "HadoopCatalog on object storage ('{}') has non-atomic rename; concurrent "
-        "commits may corrupt version-hint.text. Prefer Glue/REST/Hive for S3 "
+        "commits may overwrite each other. Prefer Glue/REST/Nessie for S3 "
         "workloads.",
         warehouse));
+    return;
   }
+  if (warehouse.starts_with("hdfs://")) {
+    LogWarning(std::format(
+        "HadoopCatalog on HDFS ('{}'): arrow's HDFS adapter does not expose an "
+        "atomic create-if-absent rename, so commit-time CAS and lock-impl=file "
+        "cross-process exclusivity are best-effort. Use lock-impl=in-memory for "
+        "single-process workloads or layer an external coordination service.",
+        warehouse));
+  }
+}
+
+// suppress-permission-error: downgrade permission failures from the FileIO
+// into a log warning + empty result. Mirrors Java's flag of the same name
+// (in HadoopCatalog the flag only covers listing / existence checks; commit
+// failures still surface).
+//
+// Arrow's LocalFileSystem wraps EACCES/EPERM into kIOError with the OS
+// message ("Permission denied", "Operation not permitted") rather than a
+// dedicated kForbidden, so the suppression check matches both the strongly
+// typed kinds and the messages embedded in kIOError.
+bool SuppressedPermissionError(const HadoopCatalogProperties& config, const Error& err) {
+  if (!config.Get(HadoopCatalogProperties::kSuppressPermissionError)) {
+    return false;
+  }
+  auto looks_like_permission = [](const Error& e) {
+    if (e.kind == ErrorKind::kForbidden || e.kind == ErrorKind::kNotAuthorized) {
+      return true;
+    }
+    if (e.kind != ErrorKind::kIOError) {
+      return false;
+    }
+    return e.message.find("Permission denied") != std::string::npos ||
+           e.message.find("permission denied") != std::string::npos ||
+           e.message.find("Operation not permitted") != std::string::npos ||
+           e.message.find("operation not permitted") != std::string::npos ||
+           e.message.find("AccessDenied") != std::string::npos;
+  };
+  if (looks_like_permission(err)) {
+    LogWarning(std::format("suppress-permission-error: {}", err.message));
+    return true;
+  }
+  return false;
 }
 
 }  // namespace
@@ -70,27 +115,49 @@ Result<std::shared_ptr<HadoopCatalog>> HadoopCatalog::Make(
   }
   ICEBERG_ASSIGN_OR_RAISE(auto warehouse, config.Warehouse());
   ICEBERG_RETURN_UNEXPECTED(config.Validate());
-  MaybeWarnS3Warehouse(warehouse);
+  MaybeWarnNonAtomicWarehouse(warehouse);
   ICEBERG_ASSIGN_OR_RAISE(auto lock_manager,
                           hadoop::MakeLockManagerWithIO(config, file_io));
 
-  return std::shared_ptr<HadoopCatalog>(
-      new HadoopCatalog(std::string(name), std::move(file_io), std::move(config),
-                        std::shared_ptr<LockManager>(std::move(lock_manager))));
+  std::string warehouse_str(warehouse);
+  return std::shared_ptr<HadoopCatalog>(new HadoopCatalog(
+      std::string(name), std::move(file_io), std::move(config),
+      std::shared_ptr<LockManager>(std::move(lock_manager)), std::move(warehouse_str)));
 }
 
 Result<std::shared_ptr<HadoopCatalog>> HadoopCatalog::Make(
     std::string_view name, HadoopCatalogProperties config) {
   ICEBERG_ASSIGN_OR_RAISE(auto warehouse, config.Warehouse());
 
-  // Select the FileIO factory keyed by warehouse scheme. The
-  // FileIORegistry has the right entries pre-registered (arrow-fs-local,
-  // arrow-fs-s3, arrow-fs-hdfs); we only need to pick a name.
+  // Select the FileIO factory keyed by warehouse scheme. arrow-fs-local /
+  // arrow-fs-s3 / arrow-fs-hdfs are populated by iceberg_bundle's static
+  // initialiser; if the caller did not link iceberg_bundle (or call
+  // EnsureArrowFileIOsRegistered() themselves) the Load below will surface
+  // a clear kNotSupported error.
   std::string io_name(FileIORegistry::kArrowLocalFileIO);
   if (warehouse.starts_with("hdfs://")) {
     io_name = std::string(FileIORegistry::kArrowHdfsFileIO);
-  } else if (warehouse.starts_with("s3://") || warehouse.starts_with("s3a://") ||
-             warehouse.starts_with("s3n://")) {
+    // P1: parse the warehouse URI authority (host[:port]) and inject it as
+    // fs.defaultFS if the caller did not provide one explicitly. Without
+    // this, arrow's HdfsOptions defaults to the JVM's core-site value and
+    // the user-supplied namenode in `warehouse=hdfs://nn:8020/wh` would be
+    // silently ignored.
+    constexpr std::string_view kHdfsPrefix = "hdfs://";
+    std::string_view tail = warehouse;
+    tail.remove_prefix(kHdfsPrefix.size());
+    const auto authority_end = tail.find('/');
+    const std::string_view authority =
+        authority_end == std::string_view::npos ? tail : tail.substr(0, authority_end);
+    if (!authority.empty()) {
+      auto& configs = config.mutable_configs();
+      auto fs_default =
+          configs.find(std::string(HadoopCatalogProperties::kFsDefaultFS.key()));
+      if (fs_default == configs.end() || fs_default->second.empty()) {
+        configs[std::string(HadoopCatalogProperties::kFsDefaultFS.key())] =
+            std::format("hdfs://{}", authority);
+      }
+    }
+  } else if (IsS3Scheme(warehouse)) {
     io_name = std::string(FileIORegistry::kArrowS3FileIO);
   }
 
@@ -100,25 +167,42 @@ Result<std::shared_ptr<HadoopCatalog>> HadoopCatalog::Make(
     io_name = override_impl;
   }
 
-  ICEBERG_ASSIGN_OR_RAISE(auto file_io, FileIORegistry::Load(io_name, config.configs()));
-  return Make(name, std::shared_ptr<FileIO>(std::move(file_io)), std::move(config));
+  auto file_io_result = FileIORegistry::Load(io_name, config.configs());
+  if (!file_io_result.has_value()) {
+    const auto& err = file_io_result.error();
+    if (err.kind == ErrorKind::kNotImplemented || err.kind == ErrorKind::kNotFound) {
+      return InvalidArgument(
+          "HadoopCatalog::Make: FileIO '{}' is not registered. The auto-detect "
+          "Make(name, config) overload relies on iceberg_bundle to register the "
+          "arrow-backed FileIOs at static-init time. Either (a) link your binary "
+          "against iceberg_bundle (the auto-registration runs automatically), "
+          "(b) call iceberg::arrow::EnsureArrowFileIOsRegistered() before this "
+          "Make() call, or (c) use the Make(name, file_io, config) overload to "
+          "pass an explicit FileIO instance. Underlying error: {}",
+          io_name, err.message);
+    }
+    return std::unexpected<Error>(err);
+  }
+  return Make(name, std::shared_ptr<FileIO>(std::move(*file_io_result)),
+              std::move(config));
 }
 
 HadoopCatalog::HadoopCatalog(std::string name, std::shared_ptr<FileIO> file_io,
                              HadoopCatalogProperties config,
-                             std::shared_ptr<LockManager> lock_manager)
+                             std::shared_ptr<LockManager> lock_manager,
+                             std::string warehouse)
     : name_(std::move(name)),
       file_io_(std::move(file_io)),
       config_(std::move(config)),
-      lock_manager_(std::move(lock_manager)) {}
+      lock_manager_(std::move(lock_manager)),
+      warehouse_(std::move(warehouse)) {}
 
 std::string_view HadoopCatalog::name() const { return name_; }
 
 Status HadoopCatalog::CreateNamespace(
     const Namespace& ns, const std::unordered_map<std::string, std::string>& properties) {
   // Java HadoopCatalog rejects any non-empty metadata payload. We mirror that
-  // contract here so cross-language users do not silently lose data. The
-  // optional namespace.properties persistence is a follow-up (Phase 5).
+  // contract here so cross-language users do not silently lose data.
   if (!properties.empty()) {
     return NotSupported(
         "HadoopCatalog::CreateNamespace does not support namespace properties; "
@@ -128,8 +212,7 @@ Status HadoopCatalog::CreateNamespace(
     return InvalidArgument(
         "HadoopCatalog::CreateNamespace requires a non-empty namespace.");
   }
-  ICEBERG_ASSIGN_OR_RAISE(auto warehouse, config_.Warehouse());
-  ICEBERG_ASSIGN_OR_RAISE(auto ns_dir, hadoop::NamespaceDir(warehouse, ns));
+  ICEBERG_ASSIGN_OR_RAISE(auto ns_dir, hadoop::NamespaceDir(warehouse_, ns));
 
   ICEBERG_ASSIGN_OR_RAISE(auto already, file_io_->Exists(ns_dir));
   if (already) {
@@ -140,13 +223,18 @@ Status HadoopCatalog::CreateNamespace(
 }
 
 Result<std::vector<Namespace>> HadoopCatalog::ListNamespaces(const Namespace& ns) const {
-  ICEBERG_ASSIGN_OR_RAISE(auto warehouse, config_.Warehouse());
-  ICEBERG_ASSIGN_OR_RAISE(auto parent_dir, hadoop::NamespaceDir(warehouse, ns));
+  ICEBERG_ASSIGN_OR_RAISE(auto parent_dir, hadoop::NamespaceDir(warehouse_, ns));
 
   // Listing the warehouse root when ns is empty is allowed; otherwise the
   // parent must exist.
-  ICEBERG_ASSIGN_OR_RAISE(auto parent_exists, file_io_->Exists(parent_dir));
-  if (!parent_exists) {
+  auto parent_exists_result = file_io_->Exists(parent_dir);
+  if (!parent_exists_result.has_value()) {
+    if (SuppressedPermissionError(config_, parent_exists_result.error())) {
+      return std::vector<Namespace>{};
+    }
+    return std::unexpected<Error>(parent_exists_result.error());
+  }
+  if (!*parent_exists_result) {
     if (ns.levels.empty()) {
       return std::vector<Namespace>{};
     }
@@ -157,22 +245,39 @@ Result<std::vector<Namespace>> HadoopCatalog::ListNamespaces(const Namespace& ns
     return NoSuchNamespace("Namespace '{}' is not a directory.", ns.ToString());
   }
 
-  ICEBERG_ASSIGN_OR_RAISE(auto entries, file_io_->ListDir(parent_dir));
+  auto entries_result = file_io_->ListDir(parent_dir);
+  if (!entries_result.has_value()) {
+    if (SuppressedPermissionError(config_, entries_result.error())) {
+      return std::vector<Namespace>{};
+    }
+    return std::unexpected<Error>(entries_result.error());
+  }
+  const auto& entries = *entries_result;
   std::vector<Namespace> children;
   for (const auto& entry : entries) {
     if (!entry.is_directory) {
       continue;
     }
-    std::string_view path = entry.location;
-    auto slash = path.find_last_of('/');
-    std::string_view leaf =
-        slash == std::string_view::npos ? path : path.substr(slash + 1);
+    const std::string_view leaf = hadoop::Basename(entry.location);
     if (leaf.empty()) {
       continue;
     }
-    // Skip directories that look like tables.
-    ICEBERG_ASSIGN_OR_RAISE(auto is_table, hadoop::IsHadoopTableDir(*file_io_, path));
-    if (is_table) {
+    // Skip directories that look like tables. The strict check (metadata/
+    // exists AND contains at least one v{N}.metadata.json) is required for
+    // correctness -- a "fast" Exists(metadata/) probe would false-positive
+    // on a legitimate namespace called `metadata` or on a half-created
+    // table that hasn't published v1 yet.
+    auto is_table_result = hadoop::IsHadoopTableDir(*file_io_, entry.location);
+    if (!is_table_result.has_value()) {
+      if (SuppressedPermissionError(config_, is_table_result.error())) {
+        // Cannot classify this child; skip it from the listing instead of
+        // failing the whole call. Mirrors Java's behaviour when the flag is
+        // set and a child's metadata/ is unreadable.
+        continue;
+      }
+      return std::unexpected<Error>(is_table_result.error());
+    }
+    if (*is_table_result) {
       continue;
     }
     Namespace child;
@@ -185,10 +290,15 @@ Result<std::vector<Namespace>> HadoopCatalog::ListNamespaces(const Namespace& ns
 
 Result<std::unordered_map<std::string, std::string>>
 HadoopCatalog::GetNamespaceProperties(const Namespace& ns) const {
-  ICEBERG_ASSIGN_OR_RAISE(auto warehouse, config_.Warehouse());
-  ICEBERG_ASSIGN_OR_RAISE(auto ns_dir, hadoop::NamespaceDir(warehouse, ns));
-  ICEBERG_ASSIGN_OR_RAISE(auto exists, file_io_->Exists(ns_dir));
-  if (!exists) {
+  ICEBERG_ASSIGN_OR_RAISE(auto ns_dir, hadoop::NamespaceDir(warehouse_, ns));
+  auto exists_result = file_io_->Exists(ns_dir);
+  if (!exists_result.has_value()) {
+    if (SuppressedPermissionError(config_, exists_result.error())) {
+      return std::unordered_map<std::string, std::string>{};
+    }
+    return std::unexpected<Error>(exists_result.error());
+  }
+  if (!*exists_result) {
     return NoSuchNamespace("Namespace '{}' does not exist.", ns.ToString());
   }
   // Java HadoopCatalog returns a single-entry map keyed by "location". We
@@ -201,8 +311,7 @@ Status HadoopCatalog::DropNamespace(const Namespace& ns) {
     return InvalidArgument(
         "HadoopCatalog::DropNamespace requires a non-empty namespace.");
   }
-  ICEBERG_ASSIGN_OR_RAISE(auto warehouse, config_.Warehouse());
-  ICEBERG_ASSIGN_OR_RAISE(auto ns_dir, hadoop::NamespaceDir(warehouse, ns));
+  ICEBERG_ASSIGN_OR_RAISE(auto ns_dir, hadoop::NamespaceDir(warehouse_, ns));
   ICEBERG_ASSIGN_OR_RAISE(auto exists, file_io_->Exists(ns_dir));
   if (!exists) {
     return NoSuchNamespace("Namespace '{}' does not exist.", ns.ToString());
@@ -216,10 +325,15 @@ Status HadoopCatalog::DropNamespace(const Namespace& ns) {
 }
 
 Result<bool> HadoopCatalog::NamespaceExists(const Namespace& ns) const {
-  ICEBERG_ASSIGN_OR_RAISE(auto warehouse, config_.Warehouse());
-  ICEBERG_ASSIGN_OR_RAISE(auto ns_dir, hadoop::NamespaceDir(warehouse, ns));
-  ICEBERG_ASSIGN_OR_RAISE(auto exists, file_io_->Exists(ns_dir));
-  if (!exists) {
+  ICEBERG_ASSIGN_OR_RAISE(auto ns_dir, hadoop::NamespaceDir(warehouse_, ns));
+  auto exists_result = file_io_->Exists(ns_dir);
+  if (!exists_result.has_value()) {
+    if (SuppressedPermissionError(config_, exists_result.error())) {
+      return false;
+    }
+    return std::unexpected<Error>(exists_result.error());
+  }
+  if (!*exists_result) {
     return false;
   }
   ICEBERG_ASSIGN_OR_RAISE(auto is_dir, file_io_->IsDirectory(ns_dir));
@@ -243,31 +357,17 @@ Status HadoopCatalog::UpdateNamespaceProperties(
       "Java HadoopCatalog rejects namespace property mutation.");
 }
 
-namespace {
-
-// suppress-permission-error: downgrade permission failures from the
-// FileIO into a log warning + empty result. Mirrors Java's flag of the
-// same name (in HadoopCatalog the flag only covers listing / existence
-// checks; commit failures still surface).
-bool SuppressedPermissionError(const HadoopCatalogProperties& config, const Error& err) {
-  if (!config.Get(HadoopCatalogProperties::kSuppressPermissionError)) {
-    return false;
-  }
-  if (err.kind == ErrorKind::kForbidden || err.kind == ErrorKind::kNotAuthorized) {
-    LogWarning(std::format("suppress-permission-error: {}", err.message));
-    return true;
-  }
-  return false;
-}
-
-}  // namespace
-
 Result<std::vector<TableIdentifier>> HadoopCatalog::ListTables(
     const Namespace& ns) const {
-  ICEBERG_ASSIGN_OR_RAISE(auto warehouse, config_.Warehouse());
-  ICEBERG_ASSIGN_OR_RAISE(auto ns_dir, hadoop::NamespaceDir(warehouse, ns));
-  ICEBERG_ASSIGN_OR_RAISE(auto ns_exists, file_io_->Exists(ns_dir));
-  if (!ns_exists) {
+  ICEBERG_ASSIGN_OR_RAISE(auto ns_dir, hadoop::NamespaceDir(warehouse_, ns));
+  auto ns_exists_result = file_io_->Exists(ns_dir);
+  if (!ns_exists_result.has_value()) {
+    if (SuppressedPermissionError(config_, ns_exists_result.error())) {
+      return std::vector<TableIdentifier>{};
+    }
+    return std::unexpected<Error>(ns_exists_result.error());
+  }
+  if (!*ns_exists_result) {
     if (ns.levels.empty()) {
       return std::vector<TableIdentifier>{};
     }
@@ -287,18 +387,116 @@ Result<std::vector<TableIdentifier>> HadoopCatalog::ListTables(
     if (!entry.is_directory) {
       continue;
     }
-    ICEBERG_ASSIGN_OR_RAISE(auto is_table,
-                            hadoop::IsHadoopTableDir(*file_io_, entry.location));
-    if (!is_table) {
+    // Strict check: a table dir has a metadata/ subdir AND contains at
+    // least one v{N}.metadata.json. Cheaper "metadata/ exists" probes would
+    // list half-created tables that TableExists/DropTable later refuse to
+    // recognise, breaking listing/load symmetry.
+    auto is_table_result = hadoop::IsHadoopTableDir(*file_io_, entry.location);
+    if (!is_table_result.has_value()) {
+      if (SuppressedPermissionError(config_, is_table_result.error())) {
+        // Cannot classify this child; skip it from the listing instead of
+        // failing the whole call.
+        continue;
+      }
+      return std::unexpected<Error>(is_table_result.error());
+    }
+    if (!*is_table_result) {
       continue;
     }
-    std::string_view path = entry.location;
-    auto slash = path.find_last_of('/');
-    std::string_view name =
-        slash == std::string_view::npos ? path : path.substr(slash + 1);
-    tables.push_back(TableIdentifier{.ns = ns, .name = std::string(name)});
+    tables.push_back(
+        TableIdentifier{.ns = ns, .name = std::string(hadoop::Basename(entry.location))});
   }
   return tables;
+}
+
+namespace {
+
+// Atomically publish a v1 metadata file + version-hint.text under
+// `table_dir`. `produce_bytes` returns the bytes to write (TableMetadata
+// serialisation happens at the caller's discretion); `codec` selects the
+// filename suffix. Caller holds the lock; this helper only does the
+// publish + version-hint update.
+Result<std::string> PublishV1AfterLock(FileIO& file_io, const std::string& table_dir,
+                                       MetadataCompressionCodec codec,
+                                       std::string_view bytes) {
+  const std::string metadata_dir = hadoop::MetadataDir(table_dir);
+  const std::string metadata_path =
+      hadoop::MetadataFilePath(table_dir, /*version=*/1, codec);
+  const std::string temp_path = std::format("{}/{}-v1.metadata.json.tmp", metadata_dir,
+                                            Uuid::GenerateV7().ToString());
+
+  if (auto write_result = file_io.WriteFile(temp_path, bytes);
+      !write_result.has_value()) {
+    std::ignore = file_io.DeleteFile(temp_path);
+    return std::unexpected<Error>(write_result.error());
+  }
+  if (auto rename_result = file_io.Rename(temp_path, metadata_path, /*overwrite=*/false);
+      !rename_result.has_value()) {
+    std::ignore = file_io.DeleteFile(temp_path);
+    // Only the "destination exists" failure means a table is already
+    // there; permission errors, NotSupported, generic IOError must be
+    // surfaced as themselves so the operator can diagnose them.
+    if (rename_result.error().kind == ErrorKind::kAlreadyExists) {
+      return AlreadyExists(
+          "HadoopCatalog: v1.metadata.json already exists at {} "
+          "(possibly an orphan from a crashed creator).",
+          metadata_path);
+    }
+    return std::unexpected<Error>(rename_result.error());
+  }
+
+  // Write version-hint.text via UUID-suffixed temp + atomic-replace rename.
+  // The lock already serialises writers; rename(overwrite=true) keeps the
+  // protocol crash-safe (no window with no hint file present).
+  const std::string hint_path = hadoop::VersionHintPath(table_dir);
+  const std::string hint_tmp =
+      std::format("{}.tmp.{}", hint_path, Uuid::GenerateV7().ToString());
+  if (auto hint_write = file_io.WriteFile(hint_tmp, std::string("1\n"));
+      !hint_write.has_value()) {
+    std::ignore = file_io.DeleteFile(metadata_path);
+    return std::unexpected<Error>(hint_write.error());
+  }
+  if (auto hint_rename = file_io.Rename(hint_tmp, hint_path, /*overwrite=*/true);
+      !hint_rename.has_value()) {
+    std::ignore = file_io.DeleteFile(hint_tmp);
+    std::ignore = file_io.DeleteFile(metadata_path);
+    return std::unexpected<Error>(hint_rename.error());
+  }
+  return metadata_path;
+}
+
+}  // namespace
+
+Result<std::string> HadoopCatalog::WriteInitialTableLocked(
+    const std::string& table_dir, const TableMetadata& metadata,
+    const std::string& owner_prefix) {
+  ICEBERG_ASSIGN_OR_RAISE(auto codec, hadoop::ResolveCommitCodec(metadata));
+  ICEBERG_ASSIGN_OR_RAISE(auto bytes, hadoop::EncodeMetadataWithCodec(metadata, codec));
+  return WriteInitialBytesLocked(table_dir, bytes, codec, owner_prefix);
+}
+
+Result<std::string> HadoopCatalog::WriteInitialBytesLocked(
+    const std::string& table_dir, std::string_view raw_bytes,
+    MetadataCompressionCodec codec, const std::string& owner_prefix) {
+  ICEBERG_RETURN_UNEXPECTED(file_io_->CreateDir(hadoop::MetadataDir(table_dir)));
+
+  const std::string owner =
+      name_ + ":" + owner_prefix + ":" + Uuid::GenerateV7().ToString();
+  ICEBERG_ASSIGN_OR_RAISE(auto acquired, lock_manager_->Acquire(table_dir, owner));
+  if (!acquired) {
+    return CommitFailed(
+        "HadoopCatalog: failed to acquire table lock for '{}' within the configured "
+        "timeout.",
+        table_dir);
+  }
+  LockReleaseGuard guard(lock_manager_.get(), table_dir, owner);
+
+  ICEBERG_ASSIGN_OR_RAISE(auto recheck, hadoop::IsHadoopTableDir(*file_io_, table_dir));
+  if (recheck) {
+    return AlreadyExists("Table already exists at {}.", table_dir);
+  }
+
+  return PublishV1AfterLock(*file_io_, table_dir, codec, raw_bytes);
 }
 
 Result<std::shared_ptr<Table>> HadoopCatalog::CreateTable(
@@ -311,13 +509,12 @@ Result<std::shared_ptr<Table>> HadoopCatalog::CreateTable(
     return InvalidArgument(
         "HadoopCatalog::CreateTable requires non-null schema, spec, and order.");
   }
-  ICEBERG_ASSIGN_OR_RAISE(auto warehouse, config_.Warehouse());
-  ICEBERG_ASSIGN_OR_RAISE(auto table_dir, hadoop::TableDir(warehouse, identifier));
+  ICEBERG_ASSIGN_OR_RAISE(auto table_dir, hadoop::TableDir(warehouse_, identifier));
 
   // Java's HadoopCatalog rejects creation when the table directory already
-  // looks like an Iceberg table. We deliberately do not refuse plain
-  // pre-existing directories so users can drop the metadata layout into a
-  // pre-created folder; an existing table is the foot-gun we guard against.
+  // looks like an Iceberg table. The check is repeated under the lock inside
+  // WriteInitialTableLocked; doing it here first lets us avoid acquiring the
+  // lock on the common no-op case.
   ICEBERG_ASSIGN_OR_RAISE(auto already_table,
                           hadoop::IsHadoopTableDir(*file_io_, table_dir));
   if (already_table) {
@@ -326,85 +523,13 @@ Result<std::shared_ptr<Table>> HadoopCatalog::CreateTable(
   }
 
   const std::string base_location = location.empty() ? table_dir : location;
-
   ICEBERG_ASSIGN_OR_RAISE(auto metadata, TableMetadata::Make(*schema, *spec, *order,
                                                              base_location, properties));
 
-  // Ensure the metadata directory exists before publishing v1.
-  const std::string metadata_dir = hadoop::MetadataDir(table_dir);
-  ICEBERG_RETURN_UNEXPECTED(file_io_->CreateDir(metadata_dir));
+  ICEBERG_ASSIGN_OR_RAISE(
+      auto metadata_path,
+      WriteInitialTableLocked(table_dir, *metadata, "create:" + identifier.ToString()));
 
-  // Acquire the lock manager so two concurrent CreateTable calls on the
-  // same identifier cannot both pass the IsHadoopTableDir guard and then
-  // race to overwrite each other. Mirrors the Commit-time serialisation in
-  // HadoopTableOperations.
-  const std::string create_owner =
-      name_ + ":create:" + identifier.ToString() + ":" + Uuid::GenerateV7().ToString();
-  ICEBERG_ASSIGN_OR_RAISE(auto acquired, lock_manager_->Acquire(table_dir, create_owner));
-  if (!acquired) {
-    return CommitFailed(
-        "HadoopCatalog::CreateTable: failed to acquire table lock for '{}' within "
-        "the configured timeout.",
-        table_dir);
-  }
-  // Re-check after taking the lock; another thread may have committed v1
-  // while we were waiting.
-  auto recheck = hadoop::IsHadoopTableDir(*file_io_, table_dir);
-  if (!recheck.has_value()) {
-    std::ignore = lock_manager_->Release(table_dir, create_owner);
-    return std::unexpected<Error>(recheck.error());
-  }
-  if (*recheck) {
-    std::ignore = lock_manager_->Release(table_dir, create_owner);
-    return AlreadyExists("Table '{}' already exists at {}.", identifier.ToString(),
-                         table_dir);
-  }
-
-  // Write the v1 metadata via a UUID-named temp file, then atomic rename.
-  // Same logic as HadoopTableOperations::Commit -- shields the catalog from
-  // orphan files left over by a crashed creator (whose UUID name does NOT
-  // match ParseMetadataFileName, so listdir-based recovery ignores it).
-  const std::string metadata_path =
-      hadoop::MetadataFilePath(table_dir, /*version=*/1, MetadataCompressionCodec::kNone);
-  const std::string temp_path = std::format("{}/{}-v1.metadata.json.tmp", metadata_dir,
-                                            Uuid::GenerateV7().ToString());
-
-  auto write_result = TableMetadataUtil::Write(*file_io_, temp_path, *metadata);
-  if (!write_result.has_value()) {
-    std::ignore = file_io_->DeleteFile(temp_path);
-    std::ignore = lock_manager_->Release(table_dir, create_owner);
-    return std::unexpected<Error>(write_result.error());
-  }
-  auto rename_result = file_io_->Rename(temp_path, metadata_path, /*overwrite=*/false);
-  if (!rename_result.has_value()) {
-    std::ignore = file_io_->DeleteFile(temp_path);
-    std::ignore = lock_manager_->Release(table_dir, create_owner);
-    return AlreadyExists(
-        "HadoopCatalog::CreateTable: v1.metadata.json already exists at {} "
-        "(possibly an orphan from a crashed creator).",
-        metadata_path);
-  }
-
-  // Write version-hint.text via temp + rename so a crashed creator does
-  // not leave the hint pointing at a non-existent version.
-  const std::string hint_path = hadoop::VersionHintPath(table_dir);
-  const std::string hint_tmp = hint_path + ".tmp";
-  auto hint_write = file_io_->WriteFile(hint_tmp, std::string("1\n"));
-  if (!hint_write.has_value()) {
-    std::ignore = file_io_->DeleteFile(metadata_path);
-    std::ignore = lock_manager_->Release(table_dir, create_owner);
-    return std::unexpected<Error>(hint_write.error());
-  }
-  std::ignore = file_io_->DeleteFile(hint_path);  // best-effort
-  auto hint_rename = file_io_->Rename(hint_tmp, hint_path, /*overwrite=*/false);
-  if (!hint_rename.has_value()) {
-    std::ignore = file_io_->DeleteFile(hint_tmp);
-    std::ignore = file_io_->DeleteFile(metadata_path);
-    std::ignore = lock_manager_->Release(table_dir, create_owner);
-    return std::unexpected<Error>(hint_rename.error());
-  }
-
-  std::ignore = lock_manager_->Release(table_dir, create_owner);
   std::shared_ptr<TableMetadata> metadata_ptr = std::move(metadata);
   return Table::Make(identifier, metadata_ptr, metadata_path, file_io_,
                      shared_from_this());
@@ -415,19 +540,17 @@ Result<std::shared_ptr<Table>> HadoopCatalog::UpdateTable(
     const std::vector<std::unique_ptr<TableRequirement>>& requirements,
     const std::vector<std::unique_ptr<TableUpdate>>& updates) {
   ICEBERG_RETURN_UNEXPECTED(hadoop::ValidateTableIdentifier(identifier));
-  ICEBERG_ASSIGN_OR_RAISE(auto warehouse, config_.Warehouse());
-  ICEBERG_ASSIGN_OR_RAISE(auto table_dir, hadoop::TableDir(warehouse, identifier));
-
-  // Build the per-call owner id so concurrent calls from the same catalog
-  // can be told apart in the lock manager logs.
-  std::string owner_id = name_ + ":" + identifier.ToString();
-  HadoopTableOperations ops(file_io_, table_dir, lock_manager_, std::move(owner_id));
+  ICEBERG_ASSIGN_OR_RAISE(auto table_dir, hadoop::TableDir(warehouse_, identifier));
 
   ICEBERG_ASSIGN_OR_RAISE(auto is_create, TableRequirements::IsCreate(requirements));
+
   std::shared_ptr<TableMetadata> base;
   std::unique_ptr<TableMetadataBuilder> builder;
+  std::optional<HadoopTableOperations> ops;
   if (is_create) {
-    // Reject if a table already exists at this location.
+    // Fast pre-check before paying for an Acquire on a known-existing table;
+    // the lock-then-recheck inside WriteInitialTableLocked is still the
+    // correctness guard.
     ICEBERG_ASSIGN_OR_RAISE(auto already_table,
                             hadoop::IsHadoopTableDir(*file_io_, table_dir));
     if (already_table) {
@@ -444,7 +567,9 @@ Result<std::shared_ptr<Table>> HadoopCatalog::UpdateTable(
     }
     builder = TableMetadataBuilder::BuildFromEmpty(format_version);
   } else {
-    ICEBERG_ASSIGN_OR_RAISE(base, ops.Refresh());
+    std::string owner_id = name_ + ":" + identifier.ToString();
+    ops.emplace(file_io_, table_dir, lock_manager_, std::move(owner_id));
+    ICEBERG_ASSIGN_OR_RAISE(base, ops->Refresh());
     builder = TableMetadataBuilder::BuildFrom(base.get());
   }
 
@@ -457,25 +582,19 @@ Result<std::shared_ptr<Table>> HadoopCatalog::UpdateTable(
   ICEBERG_ASSIGN_OR_RAISE(auto updated, builder->Build());
 
   if (is_create) {
-    // For create transactions, write v1 + version-hint via the same path as
-    // CreateTable so the on-disk layout is consistent.
-    const std::string metadata_dir = hadoop::MetadataDir(table_dir);
-    ICEBERG_RETURN_UNEXPECTED(file_io_->CreateDir(metadata_dir));
-    const std::string metadata_path = hadoop::MetadataFilePath(
-        table_dir, /*version=*/1, MetadataCompressionCodec::kNone);
-    ICEBERG_RETURN_UNEXPECTED(
-        TableMetadataUtil::Write(*file_io_, metadata_path, *updated));
-    ICEBERG_RETURN_UNEXPECTED(
-        file_io_->WriteFile(hadoop::VersionHintPath(table_dir), std::string("1\n")));
+    // Route through the same lock+UUID-temp+atomic-rename sequence as
+    // CreateTable so create-via-Transaction shares CreateTable's safety.
+    ICEBERG_ASSIGN_OR_RAISE(
+        auto metadata_path,
+        WriteInitialTableLocked(table_dir, *updated, "create:" + identifier.ToString()));
     std::shared_ptr<TableMetadata> updated_ptr = std::move(updated);
     return Table::Make(identifier, updated_ptr, metadata_path, file_io_,
                        shared_from_this());
   }
 
-  // Otherwise delegate to HadoopTableOperations::Commit for the CAS path.
-  ICEBERG_RETURN_UNEXPECTED(ops.Commit(*base, *updated));
+  ICEBERG_RETURN_UNEXPECTED(ops->Commit(*base, *updated));
   std::shared_ptr<TableMetadata> updated_ptr = std::move(updated);
-  return Table::Make(identifier, updated_ptr, ops.current_metadata_location(), file_io_,
+  return Table::Make(identifier, updated_ptr, ops->current_metadata_location(), file_io_,
                      shared_from_this());
 }
 
@@ -484,13 +603,12 @@ Result<std::shared_ptr<Transaction>> HadoopCatalog::StageCreateTable(
     const std::shared_ptr<PartitionSpec>& /*spec*/,
     const std::shared_ptr<SortOrder>& /*order*/, const std::string& /*location*/,
     const std::unordered_map<std::string, std::string>& /*properties*/) {
-  return NotSupported("HadoopCatalog::StageCreateTable: {}", kStubMessage);
+  return NotSupported("HadoopCatalog::StageCreateTable is not yet supported.");
 }
 
 Result<bool> HadoopCatalog::TableExists(const TableIdentifier& identifier) const {
   ICEBERG_RETURN_UNEXPECTED(hadoop::ValidateTableIdentifier(identifier));
-  ICEBERG_ASSIGN_OR_RAISE(auto warehouse, config_.Warehouse());
-  ICEBERG_ASSIGN_OR_RAISE(auto table_dir, hadoop::TableDir(warehouse, identifier));
+  ICEBERG_ASSIGN_OR_RAISE(auto table_dir, hadoop::TableDir(warehouse_, identifier));
   auto result = hadoop::IsHadoopTableDir(*file_io_, table_dir);
   if (!result.has_value()) {
     if (SuppressedPermissionError(config_, result.error())) {
@@ -501,10 +619,9 @@ Result<bool> HadoopCatalog::TableExists(const TableIdentifier& identifier) const
   return *result;
 }
 
-Status HadoopCatalog::DropTable(const TableIdentifier& identifier, bool /*purge*/) {
+Status HadoopCatalog::DropTable(const TableIdentifier& identifier, bool purge) {
   ICEBERG_RETURN_UNEXPECTED(hadoop::ValidateTableIdentifier(identifier));
-  ICEBERG_ASSIGN_OR_RAISE(auto warehouse, config_.Warehouse());
-  ICEBERG_ASSIGN_OR_RAISE(auto table_dir, hadoop::TableDir(warehouse, identifier));
+  ICEBERG_ASSIGN_OR_RAISE(auto table_dir, hadoop::TableDir(warehouse_, identifier));
 
   ICEBERG_ASSIGN_OR_RAISE(auto is_table, hadoop::IsHadoopTableDir(*file_io_, table_dir));
   if (!is_table) {
@@ -514,30 +631,37 @@ Status HadoopCatalog::DropTable(const TableIdentifier& identifier, bool /*purge*
   // Both purge values map onto the same primitive: recursively remove the
   // table directory tree. For the default LocationProvider (data under
   // <table>/data/) this matches Java's `purge=true` outcome exactly. Tables
-  // that put their data outside the table directory via a custom
-  // LocationProvider need a separate manifest-walking GC step which lives
-  // in iceberg_bundle (Avro reader), and is therefore out of scope for the
-  // lightweight iceberg_hadoop library; callers running such tables should
-  // run `expire_snapshots` before DropTable to surface orphaned files.
+  // with a custom LocationProvider need a manifest-walk to find data files
+  // outside the table directory; that helper lives in iceberg_bundle (Avro
+  // reader) and is out of scope for the lightweight iceberg_hadoop library,
+  // so we warn operators when they ask for purge=true so the divergence
+  // from Java is visible.
+  if (purge) {
+    LogWarning(std::format(
+        "HadoopCatalog::DropTable(purge=true) on '{}' deletes the table directory "
+        "tree only; data files outside it (custom LocationProvider) are NOT "
+        "manifest-walked. Run `expire_snapshots` first if your table uses a custom "
+        "location.",
+        identifier.ToString()));
+  }
   return file_io_->DeleteDir(table_dir, /*recursive=*/true);
 }
 
 Status HadoopCatalog::RenameTable(const TableIdentifier& /*from*/,
                                   const TableIdentifier& /*to*/) {
-  // Java HadoopCatalog explicitly throws UnsupportedOperationException for
-  // RenameTable; the cpp implementation follows the same contract. H17 will
-  // re-state this rule alongside the relevant docs once the surrounding APIs
-  // exist.
+  // Java HadoopCatalog explicitly throws UnsupportedOperationException: the
+  // table identifier is derived from its path, so renaming would require
+  // moving the on-disk data tree (not safe on object stores, and offered no
+  // benefit on POSIX) -- callers should drop + recreate instead.
   return NotSupported(
-      "HadoopCatalog::RenameTable is not supported because filesystem rename is "
-      "non-atomic across the catalog tree.");
+      "HadoopCatalog::RenameTable is not supported; tables are path-identified, "
+      "so rename would require moving on-disk data. Drop and recreate instead.");
 }
 
 Result<std::shared_ptr<Table>> HadoopCatalog::LoadTable(
     const TableIdentifier& identifier) {
   ICEBERG_RETURN_UNEXPECTED(hadoop::ValidateTableIdentifier(identifier));
-  ICEBERG_ASSIGN_OR_RAISE(auto warehouse, config_.Warehouse());
-  ICEBERG_ASSIGN_OR_RAISE(auto table_dir, hadoop::TableDir(warehouse, identifier));
+  ICEBERG_ASSIGN_OR_RAISE(auto table_dir, hadoop::TableDir(warehouse_, identifier));
 
   HadoopTableOperations ops(file_io_, table_dir);
   ICEBERG_ASSIGN_OR_RAISE(auto metadata, ops.Refresh());
@@ -552,8 +676,7 @@ Result<std::shared_ptr<Table>> HadoopCatalog::RegisterTable(
     return InvalidArgument(
         "HadoopCatalog::RegisterTable requires a non-empty metadata_file_location.");
   }
-  ICEBERG_ASSIGN_OR_RAISE(auto warehouse, config_.Warehouse());
-  ICEBERG_ASSIGN_OR_RAISE(auto table_dir, hadoop::TableDir(warehouse, identifier));
+  ICEBERG_ASSIGN_OR_RAISE(auto table_dir, hadoop::TableDir(warehouse_, identifier));
 
   ICEBERG_ASSIGN_OR_RAISE(auto already_table,
                           hadoop::IsHadoopTableDir(*file_io_, table_dir));
@@ -562,16 +685,9 @@ Result<std::shared_ptr<Table>> HadoopCatalog::RegisterTable(
                          table_dir);
   }
 
-  // Read the external metadata and copy it to v1.metadata.json (with codec
-  // detected from the source filename so registering a gzipped metadata file
-  // produces a gzipped local copy too).
-  ICEBERG_ASSIGN_OR_RAISE(auto metadata,
-                          TableMetadataUtil::Read(*file_io_, metadata_file_location));
-
-  std::string_view source = metadata_file_location;
-  auto slash = source.find_last_of('/');
-  std::string_view file_name =
-      slash == std::string_view::npos ? source : source.substr(slash + 1);
+  // Detect codec from the source filename so a gzipped source produces a
+  // gzipped local copy.
+  const std::string_view file_name = hadoop::Basename(metadata_file_location);
   hadoop::MetadataCompressionCodec codec = hadoop::MetadataCompressionCodec::kNone;
   if (file_name.ends_with(".metadata.json.gz")) {
     codec = hadoop::MetadataCompressionCodec::kGzip;
@@ -579,20 +695,28 @@ Result<std::shared_ptr<Table>> HadoopCatalog::RegisterTable(
     codec = hadoop::MetadataCompressionCodec::kZstd;
   }
 
-  const std::string metadata_dir = hadoop::MetadataDir(table_dir);
-  ICEBERG_RETURN_UNEXPECTED(file_io_->CreateDir(metadata_dir));
-
-  const std::string target = hadoop::MetadataFilePath(table_dir, /*version=*/1, codec);
-  // Read the raw bytes again (preserving codec encoding) and write them to
-  // the target. TableMetadataUtil::Read would decode for us; using the raw
-  // file contents keeps the file bytes byte-for-byte identical so external
-  // readers see the same content they wrote.
+  // Read raw bytes once; parse + copy from the same buffer to avoid a
+  // second IO round trip on large metadata files.
   ICEBERG_ASSIGN_OR_RAISE(auto raw,
                           file_io_->ReadFile(metadata_file_location, std::nullopt));
-  ICEBERG_RETURN_UNEXPECTED(file_io_->WriteFile(target, raw));
-  ICEBERG_RETURN_UNEXPECTED(
-      file_io_->WriteFile(hadoop::VersionHintPath(table_dir), std::string("1\n")));
+  std::string body = raw;
+  if (codec == hadoop::MetadataCompressionCodec::kGzip) {
+    GZipDecompressor decompressor;
+    ICEBERG_RETURN_UNEXPECTED(decompressor.Init());
+    ICEBERG_ASSIGN_OR_RAISE(body, decompressor.Decompress(raw));
+  } else if (codec == hadoop::MetadataCompressionCodec::kZstd) {
+    return NotSupported(
+        "HadoopCatalog::RegisterTable: zstd-compressed metadata is not yet "
+        "supported by iceberg-cpp.");
+  }
+  ICEBERG_ASSIGN_OR_RAISE(auto json, FromJsonString(body));
+  ICEBERG_ASSIGN_OR_RAISE(auto metadata, TableMetadataFromJson(json));
 
+  // Publish via the same lock + UUID-temp + atomic-rename path as CreateTable
+  // so concurrent register/create attempts cannot overwrite each other.
+  ICEBERG_ASSIGN_OR_RAISE(auto target,
+                          WriteInitialBytesLocked(table_dir, raw, codec,
+                                                  "register:" + identifier.ToString()));
   std::shared_ptr<TableMetadata> metadata_ptr = std::move(metadata);
   return Table::Make(identifier, metadata_ptr, target, file_io_, shared_from_this());
 }

@@ -19,7 +19,9 @@
 
 #pragma once
 
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -69,7 +71,7 @@ class ICEBERG_HADOOP_EXPORT LockManager {
 /// processes are not coordinated. The heartbeat-related properties on
 /// `HadoopCatalogProperties` are accepted for configuration compatibility
 /// with Java but are no-ops here (a held `std::mutex` cannot expire). For
-/// true cross-process serialization, see `FileLockManager` in H14.
+/// true cross-process serialization, see `FileLockManager`.
 class ICEBERG_HADOOP_EXPORT InMemoryLockManager : public LockManager {
  public:
   /// \brief Construct using the lock-related properties from
@@ -104,6 +106,43 @@ class ICEBERG_HADOOP_EXPORT InMemoryLockManager : public LockManager {
 /// belongs to us before refreshing -- if another process stole the lock
 /// (we hung past `heartbeat-timeout-ms`), the heartbeat becomes a no-op and
 /// Release will surface kNotAllowed.
+///
+/// **Cross-process atomicity envelope.**
+///
+/// 1. **Acquire is a true CAS on LocalFileSystem only.** iceberg-cpp's
+///    `Rename(overwrite=false)` is atomic create-if-absent via
+///    `std::filesystem::create_hard_link` (POSIX `link(2)` returns
+///    EEXIST). Two competing acquirers cannot both publish `_lock`; the
+///    loser observes `kAlreadyExists`. On every other arrow-backed
+///    FileIO (HDFS `hdfs://`, S3 `s3://`/`s3a://`/`s3n://`, `mockfs://`)
+///    arrow's `Move` does not expose a portable create-if-absent
+///    primitive, so the implementation falls back to a `GetFileInfo`
+///    precheck + unconditional `Move`. That fallback is TOCTOU.
+///    Production deployments that need cross-process serialisation on
+///    HDFS/S3 must layer their own coordination (DynamoDB lock manager,
+///    S3 conditional PUT, etc.).
+///
+/// 2. **Heartbeat refresh is best-effort even on LocalFileSystem.** The
+///    background heartbeat thread reads the current body, checks owner
+///    equality, then writes the new timestamp. There is no atomic
+///    compare-and-write primitive available in `FileIO`, so a stealer
+///    that deletes our stale lock and re-acquires between our heartbeat
+///    read and write will see its lock body overwritten by our stale
+///    refresh. Consequences are bounded:
+///    - Mutual exclusion of `Acquire` is preserved by the rename CAS at
+///      step (1); no third party can take the lock while either of us
+///      holds it on disk.
+///    - The stealer's subsequent `Release` will fail with
+///      `kNotAllowed` because the body says `owner_id` belongs to us.
+///    - The lock file may persist (with the wrong recorded owner) until
+///      another heartbeat-timeout-ms passes, at which point the
+///      stale-lock GC reclaims it.
+///    - HadoopCatalog's commit-time CAS on `v{N}.metadata.json`
+///      prevents any data corruption that the bounded mis-attribution
+///      could otherwise cause.
+///
+/// In short: the lock body is informational; the real safety is the
+/// Acquire-time rename CAS plus the commit-time metadata rename CAS.
 class ICEBERG_HADOOP_EXPORT FileLockManager : public LockManager {
  public:
   FileLockManager(std::shared_ptr<FileIO> file_io, const HadoopCatalogProperties& config);
@@ -126,6 +165,39 @@ class ICEBERG_HADOOP_EXPORT FileLockManager : public LockManager {
 
   std::mutex states_mutex_;
   std::unordered_map<std::string, std::unique_ptr<HeartbeatState>> states_;
+
+  // Wakes acquirers parked on the retry interval during ~FileLockManager so
+  // destruction does not block on a full acquire-interval-ms tick.
+  std::mutex shutdown_mutex_;
+  std::condition_variable shutdown_cv_;
+  std::atomic<bool> shutdown_{false};
+};
+
+/// \brief RAII guard that releases a held lock at scope exit.
+///
+/// Holders set `active = true` after a successful `Acquire`; the destructor
+/// releases the lock and routes any release failure through `LogWarning` so
+/// operators see lock leaks instead of silent swallowing. Used by both
+/// `HadoopCatalog::CreateTable` and `HadoopTableOperations::Commit` to keep
+/// their error paths linear.
+class ICEBERG_HADOOP_EXPORT LockReleaseGuard {
+ public:
+  LockReleaseGuard(LockManager* manager, std::string entity_id, std::string owner_id);
+  ~LockReleaseGuard();
+  LockReleaseGuard(const LockReleaseGuard&) = delete;
+  LockReleaseGuard& operator=(const LockReleaseGuard&) = delete;
+  LockReleaseGuard(LockReleaseGuard&&) = delete;
+  LockReleaseGuard& operator=(LockReleaseGuard&&) = delete;
+
+  /// \brief Disarm the guard so the lock is not released at scope exit. Used
+  /// when ownership of the held lock has been transferred elsewhere.
+  void Dismiss();
+
+ private:
+  LockManager* manager_;
+  std::string entity_id_;
+  std::string owner_id_;
+  bool active_;
 };
 
 /// \brief Resolve and construct a `LockManager` from the catalog properties.

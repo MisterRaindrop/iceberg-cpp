@@ -27,6 +27,7 @@
 #include <nlohmann/json.hpp>
 
 #include "iceberg/catalog/hadoop/hadoop_file_layout.h"
+#include "iceberg/catalog/hadoop/hadoop_log.h"
 #include "iceberg/json_serde_internal.h"
 #include "iceberg/partition_spec.h"
 #include "iceberg/schema.h"
@@ -34,6 +35,7 @@
 #include "iceberg/table_properties.h"
 #include "iceberg/util/gzip_internal.h"
 #include "iceberg/util/macros.h"
+#include "iceberg/util/string_util.h"
 #include "iceberg/util/uuid.h"
 
 namespace iceberg::hadoop {
@@ -57,20 +59,6 @@ void TrimAsciiWhitespace(std::string& s) {
   }
 }
 
-Result<int64_t> ParseDecimalInt64(std::string_view text, std::string_view source) {
-  if (text.empty()) {
-    return Invalid("Empty version segment in {}.", source);
-  }
-  int64_t value = 0;
-  for (char c : text) {
-    if (c < '0' || c > '9') {
-      return Invalid("Non-numeric character '{}' in {} version '{}'", c, source, text);
-    }
-    value = (value * 10) + (c - '0');
-  }
-  return value;
-}
-
 }  // namespace
 
 Result<int64_t> ReadVersionHint(FileIO& file_io, std::string_view table_dir) {
@@ -78,33 +66,53 @@ Result<int64_t> ReadVersionHint(FileIO& file_io, std::string_view table_dir) {
   ICEBERG_ASSIGN_OR_RAISE(auto content,
                           file_io.ReadFile(hint_path, /*length=*/std::nullopt));
   TrimAsciiWhitespace(content);
-  ICEBERG_ASSIGN_OR_RAISE(auto version, ParseDecimalInt64(content, "version-hint.text"));
+  ICEBERG_ASSIGN_OR_RAISE(auto version, StringUtils::ParseNumber<int64_t>(content));
   return version;
 }
 
-Result<int64_t> FindLatestMetadataVersion(FileIO& file_io, std::string_view table_dir) {
+namespace {
+
+// Cache the parsed metadata directory listing keyed by name so the resolver
+// can pick the matching v{N} entry without re-listing. Returns a vector of
+// (version, codec, location).
+struct VersionedEntry {
+  int64_t version = 0;
+  MetadataCompressionCodec codec = MetadataCompressionCodec::kNone;
+  std::string location;
+};
+
+Result<std::vector<VersionedEntry>> ListVersionedMetadata(FileIO& file_io,
+                                                          std::string_view table_dir) {
   const std::string metadata_dir = MetadataDir(table_dir);
   ICEBERG_ASSIGN_OR_RAISE(auto entries, file_io.ListDir(metadata_dir));
-  int64_t best = -1;
+  std::vector<VersionedEntry> out;
+  out.reserve(entries.size());
   for (const auto& entry : entries) {
     if (entry.is_directory) {
       continue;
     }
-    std::string_view name = entry.location;
-    auto slash = name.find_last_of('/');
-    if (slash != std::string_view::npos) {
-      name.remove_prefix(slash + 1);
-    }
-    auto parsed = ParseMetadataFileName(name);
+    auto parsed = ParseMetadataFileName(Basename(entry.location));
     if (!parsed.has_value()) {
       continue;
     }
-    if (parsed->version > best) {
-      best = parsed->version;
+    out.push_back(
+        {.version = parsed->version, .codec = parsed->codec, .location = entry.location});
+  }
+  return out;
+}
+
+}  // namespace
+
+Result<int64_t> FindLatestMetadataVersion(FileIO& file_io, std::string_view table_dir) {
+  ICEBERG_ASSIGN_OR_RAISE(auto versioned, ListVersionedMetadata(file_io, table_dir));
+  int64_t best = -1;
+  for (const auto& entry : versioned) {
+    if (entry.version > best) {
+      best = entry.version;
     }
   }
   if (best < 0) {
-    return NoSuchTable("No metadata files found under '{}'.", metadata_dir);
+    return NoSuchTable("No metadata files found under '{}'.", MetadataDir(table_dir));
   }
   return best;
 }
@@ -113,30 +121,45 @@ Result<ResolvedMetadataPointer> ResolveCurrentMetadata(FileIO& file_io,
                                                        std::string_view table_dir) {
   ResolvedMetadataPointer pointer;
 
+  // Surface "table directory doesn't exist" as kNoSuchTable up front so
+  // Catalog::LoadTable returns the documented error kind (arrow's ListDir
+  // on a missing directory returns kIOError, which would otherwise leak).
+  const std::string metadata_dir = MetadataDir(table_dir);
+  ICEBERG_ASSIGN_OR_RAISE(auto md_exists, file_io.Exists(metadata_dir));
+  if (!md_exists) {
+    return NoSuchTable("Table at '{}' has no metadata directory.", table_dir);
+  }
+
+  // One ListDir up front -- subsequent steps just inspect the result rather
+  // than probing extension-by-extension. Saves up to 2 Exists round trips
+  // per resolve on the hot path (Refresh + Commit CAS recheck).
+  ICEBERG_ASSIGN_OR_RAISE(auto versioned, ListVersionedMetadata(file_io, table_dir));
+
   auto hint = ReadVersionHint(file_io, table_dir);
   if (hint.has_value()) {
     pointer.version = *hint;
   } else {
-    // Hint missing or corrupt: scan the metadata directory.
-    ICEBERG_ASSIGN_OR_RAISE(auto scanned, FindLatestMetadataVersion(file_io, table_dir));
-    pointer.version = scanned;
+    int64_t best = -1;
+    for (const auto& entry : versioned) {
+      if (entry.version > best) {
+        best = entry.version;
+      }
+    }
+    if (best < 0) {
+      return NoSuchTable("No metadata files found under '{}'.", MetadataDir(table_dir));
+    }
+    pointer.version = best;
     pointer.from_listdir_fallback = true;
   }
 
-  // The hint gives us the version; the file extension is decided by whichever
-  // codec the writer chose. Probe the three accepted suffixes in turn.
-  const std::string metadata_dir = MetadataDir(table_dir);
-  for (auto codec : {MetadataCompressionCodec::kNone, MetadataCompressionCodec::kGzip,
-                     MetadataCompressionCodec::kZstd}) {
-    std::string candidate = metadata_dir + "/" + MetadataFileName(pointer.version, codec);
-    ICEBERG_ASSIGN_OR_RAISE(auto exists, file_io.Exists(candidate));
-    if (exists) {
-      pointer.location = std::move(candidate);
+  for (auto& entry : versioned) {
+    if (entry.version == pointer.version) {
+      pointer.location = std::move(entry.location);
       return pointer;
     }
   }
   return NoSuchTable("Metadata file v{}.metadata.json[.gz|.zstd] not found under '{}'.",
-                     pointer.version, metadata_dir);
+                     pointer.version, MetadataDir(table_dir));
 }
 
 HadoopTableOperations::HadoopTableOperations(std::shared_ptr<FileIO> file_io,
@@ -168,76 +191,61 @@ namespace {
 
 constexpr std::string_view kWriteMetadataLocation = "write.metadata.location";
 
-// Resolve the codec the writer should use for `metadata`. Defaults to
-// `none` when the property is unset.
+// Walk <table>/metadata/ and delete the oldest v{N}.metadata.json[.codec]
+// files, keeping the newest `previous_versions_max` plus the current one.
+// Mirrors the outcome of Java's
+// `CatalogUtil.deleteRemovedMetadataFiles` for the HadoopCatalog layout
+// without requiring metadata_log tracking inside HadoopTableOperations.
+// Failures are surfaced via LogWarning -- the commit itself already
+// succeeded, but operators need visibility into stuck GC.
+void PruneOldMetadataFiles(FileIO& file_io, std::string_view table_dir,
+                           int64_t current_version, int32_t previous_versions_max) {
+  if (previous_versions_max <= 0) {
+    return;
+  }
+  auto versioned_result = ListVersionedMetadata(file_io, table_dir);
+  if (!versioned_result.has_value()) {
+    LogWarning(std::format("PruneOldMetadataFiles: ListDir failed for '{}': {}",
+                           MetadataDir(table_dir), versioned_result.error().message));
+    return;
+  }
+  auto versioned = std::move(*versioned_result);
+  if (static_cast<int64_t>(versioned.size()) <= previous_versions_max + 1) {
+    return;
+  }
+  std::ranges::sort(versioned,
+                    [](const auto& a, const auto& b) { return a.version < b.version; });
+  const int64_t cutoff_version = current_version - previous_versions_max;
+  for (const auto& entry : versioned) {
+    if (entry.version >= cutoff_version || entry.version == current_version) {
+      continue;
+    }
+    if (auto del = file_io.DeleteFile(entry.location); !del.has_value()) {
+      LogWarning(std::format("PruneOldMetadataFiles: DeleteFile('{}') failed: {}",
+                             entry.location, del.error().message));
+    }
+  }
+}
+
+}  // namespace
+
 Result<MetadataCompressionCodec> ResolveCommitCodec(const TableMetadata& metadata) {
   const auto codec_name =
       metadata.properties.Get<std::string>(TableProperties::kMetadataCompression);
   return ParseMetadataCompressionCodec(codec_name);
 }
 
-// Walk <table>/metadata/ and delete the oldest v{N}.metadata.json[.codec]
-// files, keeping the newest `previous_versions_max` plus the current one.
-// Mirrors the outcome of Java's
-// `CatalogUtil.deleteRemovedMetadataFiles` for the HadoopCatalog layout
-// without requiring metadata_log tracking inside HadoopTableOperations.
-void PruneOldMetadataFiles(FileIO& file_io, std::string_view table_dir,
-                           int64_t current_version, int32_t previous_versions_max) {
-  if (previous_versions_max <= 0) {
-    return;
-  }
-  const std::string metadata_dir = MetadataDir(table_dir);
-  auto entries = file_io.ListDir(metadata_dir);
-  if (!entries.has_value()) {
-    return;
-  }
-  std::vector<std::pair<int64_t, std::string>> versioned;
-  versioned.reserve(entries->size());
-  for (const auto& entry : *entries) {
-    if (entry.is_directory) {
-      continue;
-    }
-    std::string_view name = entry.location;
-    auto slash = name.find_last_of('/');
-    if (slash != std::string_view::npos) {
-      name.remove_prefix(slash + 1);
-    }
-    auto parsed = ParseMetadataFileName(name);
-    if (!parsed.has_value()) {
-      continue;
-    }
-    versioned.emplace_back(parsed->version, entry.location);
-  }
-  // Sort by version ascending; we keep the newest `previous_versions_max`.
-  std::ranges::sort(versioned,
-                    [](const auto& a, const auto& b) { return a.first < b.first; });
-  // Always retain the current version and the previous_versions_max files
-  // immediately below it. Anything older is fair game.
-  const int64_t cutoff_version = current_version - previous_versions_max;
-  for (const auto& [version, path] : versioned) {
-    if (version >= cutoff_version || version == current_version) {
-      continue;
-    }
-    std::ignore = file_io.DeleteFile(path);
-  }
-}
-
-// Serialise + (optionally) compress `metadata` and write it to `location` via
-// FileIO. Mirrors the behaviour the Java HadoopTableOperations achieves via
-// TableMetadataParser.Codec.
-Status WriteMetadataWithCodec(FileIO& file_io, const std::string& location,
-                              const TableMetadata& metadata,
-                              MetadataCompressionCodec codec) {
+Result<std::string> EncodeMetadataWithCodec(const TableMetadata& metadata,
+                                            MetadataCompressionCodec codec) {
   auto json = ToJson(metadata);
   ICEBERG_ASSIGN_OR_RAISE(std::string body, ToJsonString(json));
   switch (codec) {
     case MetadataCompressionCodec::kNone:
-      break;
+      return body;
     case MetadataCompressionCodec::kGzip: {
       GZipCompressor compressor;
       ICEBERG_RETURN_UNEXPECTED(compressor.Init());
-      ICEBERG_ASSIGN_OR_RAISE(body, compressor.Compress(body));
-      break;
+      return compressor.Compress(body);
     }
     case MetadataCompressionCodec::kZstd:
       return NotSupported(
@@ -245,27 +253,15 @@ Status WriteMetadataWithCodec(FileIO& file_io, const std::string& location,
           "but zstd serialisation is not yet implemented in iceberg-cpp; use "
           "'none' or 'gzip'.");
   }
-  return file_io.WriteFile(location, body);
+  return body;
 }
 
-// RAII guard that releases a held lock when leaving the Commit scope. The
-// guard is no-op when no lock manager is wired in (e.g. during unit tests
-// that exercise the algorithm without acquiring) which keeps the body of
-// Commit() linear and easy to reason about.
-struct LockReleaseGuard {
-  LockManager* manager = nullptr;
-  std::string entity_id;
-  std::string owner_id;
-  bool active = false;
-
-  ~LockReleaseGuard() {
-    if (active && manager != nullptr) {
-      std::ignore = manager->Release(entity_id, owner_id);
-    }
-  }
-};
-
-}  // namespace
+Status WriteMetadataWithCodec(FileIO& file_io, const std::string& location,
+                              const TableMetadata& metadata,
+                              MetadataCompressionCodec codec) {
+  ICEBERG_ASSIGN_OR_RAISE(auto body, EncodeMetadataWithCodec(metadata, codec));
+  return file_io.WriteFile(location, body);
+}
 
 Status HadoopTableOperations::Commit(const TableMetadata& base,
                                      const TableMetadata& updated) {
@@ -301,10 +297,7 @@ Status HadoopTableOperations::Commit(const TableMetadata& base,
         "configured timeout.",
         table_dir_);
   }
-  LockReleaseGuard guard{.manager = lock_manager_.get(),
-                         .entity_id = table_dir_,
-                         .owner_id = owner_id_,
-                         .active = true};
+  LockReleaseGuard guard(lock_manager_.get(), table_dir_, owner_id_);
 
   // (4) CAS check: ensure no concurrent writer has advanced the pointer.
   ICEBERG_ASSIGN_OR_RAISE(auto current, ResolveCurrentMetadata(*file_io_, table_dir_));
@@ -343,21 +336,22 @@ Status HadoopTableOperations::Commit(const TableMetadata& base,
         target, rename_to_target.error().message);
   }
 
-  // (8) Update version-hint.text atomically: write tmp -> delete old -> rename.
+  // (8) Update version-hint.text via write-tmp + atomic-replace. The lock
+  // serialises writers, so a single atomic rename(overwrite=true) is enough;
+  // delete-then-rename would leave a brief window with no hint at all, and a
+  // crash there would force every subsequent Refresh into the listdir
+  // fallback path.
   const std::string hint = VersionHintPath(table_dir_);
-  const std::string hint_tmp = hint + ".tmp";
+  const std::string hint_tmp =
+      std::format("{}.tmp.{}", hint, Uuid::GenerateV7().ToString());
   const std::string payload = std::format("{}\n", next_version);
   if (auto write_status = file_io_->WriteFile(hint_tmp, payload);
       !write_status.has_value()) {
     std::ignore = file_io_->DeleteFile(target);
     return write_status;
   }
-  // Delete the old hint best-effort; an explicit DeleteFile failure is ok
-  // because the subsequent Rename(overwrite=false) below would also fail and
-  // we handle that.
-  std::ignore = file_io_->DeleteFile(hint);
 
-  auto rename_status = file_io_->Rename(hint_tmp, hint, /*overwrite=*/false);
+  auto rename_status = file_io_->Rename(hint_tmp, hint, /*overwrite=*/true);
   if (!rename_status.has_value()) {
     // (9) Recovery: the rename failed. Check whether some other writer (or
     // an earlier crashed run) already advanced the hint to our new version
@@ -382,11 +376,21 @@ Status HadoopTableOperations::Commit(const TableMetadata& base,
   current_location_ = target;
   current_version_ = next_version;
 
-  // (9.5) Commit-time stale metadata cleanup, honouring the Java table
+  // (10) Release the lock now -- the commit has landed and any subsequent
+  // bookkeeping (metadata GC) is best-effort and need not block other
+  // writers waiting on the lock.
+  guard.Dismiss();
+  if (auto rel = lock_manager_->Release(table_dir_, owner_id_); !rel.has_value()) {
+    LogWarning(std::format("HadoopCatalog: lock release failed for '{}': {}", table_dir_,
+                           rel.error().message));
+  }
+
+  // (11) Commit-time stale metadata cleanup, honouring the Java table
   // properties `write.metadata.delete-after-commit.enabled` (default false)
-  // and `write.metadata.previous-versions-max` (default 100). Errors are
-  // swallowed because the commit itself already succeeded -- losing a
-  // GC pass is recoverable; failing the commit is not.
+  // and `write.metadata.previous-versions-max` (default 100). Runs outside
+  // the lock so a long delete loop on a deep history does not stall other
+  // writers; failures are logged because the commit itself already
+  // succeeded.
   const bool delete_after_commit =
       updated.properties.Get(TableProperties::kMetadataDeleteAfterCommitEnabled);
   if (delete_after_commit) {
@@ -394,7 +398,6 @@ Status HadoopTableOperations::Commit(const TableMetadata& base,
         updated.properties.Get(TableProperties::kMetadataPreviousVersionsMax);
     PruneOldMetadataFiles(*file_io_, table_dir_, next_version, previous_versions_max);
   }
-  // (10) Lock is released by `guard` at scope exit.
   return {};
 }
 

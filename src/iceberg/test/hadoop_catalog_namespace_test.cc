@@ -34,6 +34,8 @@
 #include "iceberg/schema_field.h"
 #include "iceberg/sort_order.h"
 #include "iceberg/table.h"
+#include "iceberg/table_requirements.h"
+#include "iceberg/table_update.h"
 #include "iceberg/test/matchers.h"
 #include "iceberg/test/temp_file_test_base.h"
 #include "iceberg/type.h"
@@ -312,6 +314,62 @@ TEST_F(HadoopCatalogNamespaceTest, CreateThenLoadTableRoundTrip) {
   auto again = catalog_->CreateTable(id, schema, spec, order, /*location=*/"", {});
   ASSERT_FALSE(again.has_value());
   EXPECT_EQ(ErrorKind::kAlreadyExists, again.error().kind);
+}
+
+TEST_F(HadoopCatalogNamespaceTest, CreateTableHonoursGzipCodec) {
+  // Round-2 fix: the initial v1 publish honours write.metadata.compression-codec,
+  // not just commits. A gzipped CreateTable should land at v1.metadata.json.gz.
+  ASSERT_TRUE(catalog_->CreateNamespace(Namespace{.levels = {"db"}}, {}).has_value());
+  TableIdentifier id{.ns = Namespace{.levels = {"db"}}, .name = "compressed"};
+  auto schema = std::make_shared<Schema>(
+      std::vector<SchemaField>{SchemaField::MakeRequired(1, "id", int64())});
+
+  ICEBERG_UNWRAP_OR_FAIL(
+      auto created, catalog_->CreateTable(
+                        id, schema, PartitionSpec::Unpartitioned(), SortOrder::Unsorted(),
+                        /*location=*/"", {{"write.metadata.compression-codec", "gzip"}}));
+  EXPECT_TRUE(created->metadata_file_location().ends_with("v1.metadata.json.gz"));
+
+  // Round-trip: LoadTable must decode the gzipped v1 transparently.
+  ICEBERG_UNWRAP_OR_FAIL(auto loaded, catalog_->LoadTable(id));
+  EXPECT_EQ(loaded->name(), id);
+}
+
+TEST_F(HadoopCatalogNamespaceTest, LoadMissingTableReturnsNoSuchTable) {
+  // Round-5 fix: a LoadTable on a namespace that has no metadata/ subdir must
+  // surface kNoSuchTable rather than the underlying arrow kIOError.
+  ASSERT_TRUE(catalog_->CreateNamespace(Namespace{.levels = {"db"}}, {}).has_value());
+  TableIdentifier missing{.ns = Namespace{.levels = {"db"}}, .name = "nope"};
+  auto res = catalog_->LoadTable(missing);
+  ASSERT_FALSE(res.has_value());
+  EXPECT_EQ(ErrorKind::kNoSuchTable, res.error().kind);
+}
+
+TEST_F(HadoopCatalogNamespaceTest, UpdateTableCreateRejectsExistingTable) {
+  // Exercise the is_create branch of UpdateTable's fast pre-check: when the
+  // table already exists, the call must surface kAlreadyExists before paying
+  // for a lock acquire. Round-2 routed the is_create path through the same
+  // safe sequence as CreateTable; the pre-check is the visible contract.
+  ASSERT_TRUE(catalog_->CreateNamespace(Namespace{.levels = {"db"}}, {}).has_value());
+  TableIdentifier id{.ns = Namespace{.levels = {"db"}}, .name = "exists"};
+  auto schema = std::make_shared<Schema>(
+      std::vector<SchemaField>{SchemaField::MakeRequired(1, "id", int64())});
+
+  // Seed the table via the regular CreateTable path first.
+  ASSERT_TRUE(catalog_
+                  ->CreateTable(id, schema, PartitionSpec::Unpartitioned(),
+                                SortOrder::Unsorted(), /*location=*/"", {})
+                  .has_value());
+
+  // Now try a create-shape UpdateTable: AssertDoesNotExist + no updates. The
+  // fast pre-check in UpdateTable must surface kAlreadyExists without
+  // touching the lock manager.
+  std::vector<std::unique_ptr<TableUpdate>> updates;
+  std::vector<std::unique_ptr<TableRequirement>> requirements;
+  requirements.push_back(std::make_unique<table::AssertDoesNotExist>());
+  auto duplicate = catalog_->UpdateTable(id, requirements, updates);
+  ASSERT_FALSE(duplicate.has_value());
+  EXPECT_EQ(ErrorKind::kAlreadyExists, duplicate.error().kind);
 }
 
 }  // namespace iceberg::hadoop

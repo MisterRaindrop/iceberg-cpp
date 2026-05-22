@@ -19,9 +19,11 @@
 
 #include <algorithm>
 #include <chrono>
+#include <filesystem>
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <system_error>
 
 #include <arrow/buffer.h>
 #include <arrow/filesystem/filesystem.h>
@@ -648,6 +650,39 @@ Status ArrowFileSystemFileIO::Rename(const std::string& from, const std::string&
   ICEBERG_ASSIGN_OR_RAISE(auto from_path, ResolvePath(from));
   ICEBERG_ASSIGN_OR_RAISE(auto to_path, ResolvePath(to));
   if (!overwrite) {
+    // arrow's Move() ultimately resolves to std::filesystem::rename, which is
+    // an atomic *replace* on POSIX (no NOREPLACE flag). A GetFileInfo precheck
+    // before Move would be TOCTOU -- two concurrent writers can both observe
+    // "absent" and both end up calling Move, with the second silently
+    // overwriting the first. That breaks the HadoopCatalog commit-time CAS
+    // which depends on rename(overwrite=false) being a true compare-and-swap.
+    //
+    // On LocalFileSystem we use std::filesystem::create_hard_link (POSIX
+    // link(2)) which atomically fails with file_already_exists when the
+    // destination is present. THIS IS THE ONLY BACKEND WHERE
+    // Rename(overwrite=false) IS A SAFE CROSS-PROCESS CAS. On every other
+    // backend (HDFS via libhdfs, S3, mock) we fall back to GetFileInfo +
+    // Move, which is TOCTOU and can silently clobber a racing winner --
+    // libhdfs `hdfsRename` and S3 `CopyObject` do not expose a portable
+    // atomic "create-if-absent" primitive that arrow can wire up here.
+    // Callers that need cross-process correctness on HDFS/S3 must layer
+    // their own coordination (DynamoDB lock, conditional PUT, etc.); the
+    // HadoopCatalog header documents this caveat explicitly.
+    if (dynamic_cast<::arrow::fs::LocalFileSystem*>(arrow_fs_.get()) != nullptr) {
+      std::error_code ec;
+      std::filesystem::create_hard_link(from_path, to_path, ec);
+      if (ec == std::errc::file_exists) {
+        return AlreadyExists("Rename destination '{}' already exists.", to);
+      }
+      if (ec) {
+        return IOError("Rename(create_hard_link '{}' -> '{}') failed: {}", from, to,
+                       ec.message());
+      }
+      // Best-effort cleanup of the source; a failure here leaves an orphan
+      // temp file that the next commit's UUID-named temp scheme will ignore.
+      std::filesystem::remove(from_path, ec);
+      return {};
+    }
     auto info_result = arrow_fs_->GetFileInfo(to_path);
     if (!info_result.ok()) {
       return IOError("Rename pre-check failed for '{}': {}", to,

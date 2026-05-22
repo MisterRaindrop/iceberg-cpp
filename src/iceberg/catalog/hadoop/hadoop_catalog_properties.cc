@@ -22,6 +22,7 @@
 #include <utility>
 
 #include "iceberg/util/macros.h"
+#include "iceberg/util/string_util.h"
 
 namespace iceberg::hadoop {
 
@@ -44,20 +45,29 @@ Result<std::string_view> HadoopCatalogProperties::Warehouse() const {
 }
 
 Status HadoopCatalogProperties::Validate() const {
-  auto check_positive_ms = [this](const auto& entry) -> Status {
-    int64_t value = Get(entry);
+  // Read+parse raw string values directly instead of going through
+  // ConfigBase::Get(): the latter calls ICEBERG_ASSIGN_OR_THROW for parse
+  // failures, which would surface as a C++ exception out of Make().
+  // Validate() is the right place to convert a malformed value into a
+  // kInvalidArgument result.
+  auto parse_int64 = [this](const auto& entry) -> Result<int64_t> {
+    auto it = configs_.find(entry.key());
+    if (it == configs_.end()) {
+      return entry.value();
+    }
+    auto parsed = StringUtils::ParseNumber<int64_t>(it->second);
+    if (!parsed.has_value()) {
+      return InvalidArgument(
+          "Hadoop catalog property '{}' must be an integer (got '{}': {}).", entry.key(),
+          it->second, parsed.error().message);
+    }
+    return *parsed;
+  };
+  auto check_positive_ms = [&parse_int64](const auto& entry) -> Status {
+    ICEBERG_ASSIGN_OR_RAISE(auto value, parse_int64(entry));
     if (value <= 0) {
       return InvalidArgument("Hadoop catalog property '{}' must be positive (got {}).",
                              entry.key(), value);
-    }
-    return {};
-  };
-  auto check_non_negative = [this](const auto& entry) -> Status {
-    int32_t value = Get(entry);
-    if (value < 0) {
-      return InvalidArgument(
-          "Hadoop catalog property '{}' must be non-negative (got {}).", entry.key(),
-          value);
     }
     return {};
   };
@@ -66,15 +76,14 @@ Status HadoopCatalogProperties::Validate() const {
   ICEBERG_RETURN_UNEXPECTED(check_positive_ms(kLockAcquireTimeoutMs));
   ICEBERG_RETURN_UNEXPECTED(check_positive_ms(kLockHeartbeatIntervalMs));
   ICEBERG_RETURN_UNEXPECTED(check_positive_ms(kLockHeartbeatTimeoutMs));
-  ICEBERG_RETURN_UNEXPECTED(check_non_negative(kLockHeartbeatThreads));
   ICEBERG_RETURN_UNEXPECTED(check_positive_ms(kCacheExpirationIntervalMs));
 
   // heartbeat-interval should be strictly less than heartbeat-timeout, or
   // every heartbeat would be too late to refresh the lock. Equal values
   // theoretically work but leave zero margin for scheduler jitter; warn
   // by treating them as invalid so operators notice early.
-  const auto interval = Get(kLockHeartbeatIntervalMs);
-  const auto timeout = Get(kLockHeartbeatTimeoutMs);
+  ICEBERG_ASSIGN_OR_RAISE(const auto interval, parse_int64(kLockHeartbeatIntervalMs));
+  ICEBERG_ASSIGN_OR_RAISE(const auto timeout, parse_int64(kLockHeartbeatTimeoutMs));
   if (interval >= timeout) {
     return InvalidArgument(
         "Hadoop catalog property '{}' ({}ms) must be strictly less than '{}' ({}ms) "
@@ -84,12 +93,17 @@ Status HadoopCatalogProperties::Validate() const {
 
   // lock-impl must be one of the recognised names; deferring to MakeLockManager
   // catches this too, but checking early keeps the failure attached to the
-  // bad config rather than the first acquire.
-  const auto impl = Get(kLockImpl);
-  if (!impl.empty() && impl != "in-memory" && impl != "file") {
-    return InvalidArgument(
-        "Hadoop catalog property '{}' must be 'in-memory' or 'file' (got '{}').",
-        kLockImpl.key(), impl);
+  // bad config rather than the first acquire. We read the raw string here
+  // too, but lock-impl is a string entry so Get() is throw-safe in this
+  // particular case -- using configs_ directly keeps Validate uniform.
+  auto impl_it = configs_.find(kLockImpl.key());
+  if (impl_it != configs_.end()) {
+    const auto& impl = impl_it->second;
+    if (!impl.empty() && impl != "in-memory" && impl != "file") {
+      return InvalidArgument(
+          "Hadoop catalog property '{}' must be 'in-memory' or 'file' (got '{}').",
+          kLockImpl.key(), impl);
+    }
   }
   return {};
 }

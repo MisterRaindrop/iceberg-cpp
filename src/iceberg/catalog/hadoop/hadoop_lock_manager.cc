@@ -19,6 +19,7 @@
 
 #include "iceberg/catalog/hadoop/hadoop_lock_manager.h"
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <format>
@@ -29,7 +30,11 @@
 #include <unordered_map>
 
 #include "iceberg/catalog/hadoop/hadoop_file_layout.h"
+#include "iceberg/catalog/hadoop/hadoop_log.h"
 #include "iceberg/util/macros.h"
+#include "iceberg/util/string_util.h"
+#include "iceberg/util/timepoint.h"
+#include "iceberg/util/uuid.h"
 
 namespace iceberg::hadoop {
 
@@ -102,8 +107,9 @@ Status InMemoryLockManager::Release(const std::string& entity_id,
         "InMemoryLockManager: '{}' is held by '{}', cannot be released by '{}'.",
         entity_id, it->second.owner, owner_id);
   }
-  it->second.held = false;
-  it->second.owner.clear();
+  // Erase the entry rather than mark it free; otherwise a long-running process
+  // that touches many distinct tables grows the map unboundedly.
+  impl_->entries.erase(it);
   impl_->cv.notify_all();
   return {};
 }
@@ -114,11 +120,7 @@ Status InMemoryLockManager::Release(const std::string& entity_id,
 
 namespace {
 
-int64_t MillisSinceEpoch() {
-  return std::chrono::duration_cast<std::chrono::milliseconds>(
-             std::chrono::system_clock::now().time_since_epoch())
-      .count();
-}
+int64_t MillisSinceEpoch() { return UnixMsFromTimePointMs(CurrentTimePointMs()); }
 
 std::string EncodeLockBody(std::string_view owner_id, int64_t ts_ms) {
   return std::format("{}|{}\n", owner_id, ts_ms);
@@ -139,18 +141,8 @@ Result<LockBody> DecodeLockBody(std::string_view body) {
   }
   LockBody parsed;
   parsed.owner = std::string(body.substr(0, pipe));
-  std::string_view ts_text = body.substr(pipe + 1);
-  if (ts_text.empty()) {
-    return Invalid("Empty timestamp in lock body");
-  }
-  int64_t ts = 0;
-  for (char c : ts_text) {
-    if (c < '0' || c > '9') {
-      return Invalid("Non-numeric character '{}' in lock timestamp", c);
-    }
-    ts = (ts * 10) + (c - '0');
-  }
-  parsed.ts_ms = ts;
+  ICEBERG_ASSIGN_OR_RAISE(parsed.ts_ms,
+                          StringUtils::ParseNumber<int64_t>(body.substr(pipe + 1)));
   return parsed;
 }
 
@@ -178,9 +170,15 @@ FileLockManager::FileLockManager(std::shared_ptr<FileIO> file_io,
           config.Get(HadoopCatalogProperties::kLockHeartbeatTimeoutMs))) {}
 
 FileLockManager::~FileLockManager() {
-  // Stop any heartbeats still running -- typically Release should have
-  // drained the map, but defensive cleanup avoids leaking threads if the
-  // manager is destroyed while a lock is held.
+  // Wake any acquirers parked in the Acquire retry loop and then drain held
+  // heartbeats. Order matters: signal shutdown first so threads observe it
+  // when StopHeartbeat below unlocks them.
+  {
+    std::lock_guard lk(shutdown_mutex_);
+    shutdown_.store(true);
+  }
+  shutdown_cv_.notify_all();
+
   std::vector<std::unique_ptr<HeartbeatState>> drain;
   {
     std::lock_guard lk(states_mutex_);
@@ -195,6 +193,12 @@ FileLockManager::~FileLockManager() {
   }
 }
 
+// Lifetime contract: the closure spawned at Acquire captures raw `this` and
+// `state` pointer. Both are guaranteed alive for the lifetime of this thread
+// because (a) `state` is owned by `states_` until Release moves it out and
+// joins the thread, and (b) `~FileLockManager` signals shutdown_ + drains
+// `states_` + joins every thread before destroying its fields. So we never
+// observe a freed `this` or `state` inside RunHeartbeat.
 void FileLockManager::RunHeartbeat(HeartbeatState* state) {
   while (true) {
     std::unique_lock lk(state->wake_mutex);
@@ -205,9 +209,14 @@ void FileLockManager::RunHeartbeat(HeartbeatState* state) {
     }
     lk.unlock();
 
-    // Refresh the on-disk timestamp, but only if we still own the lock.
-    // If another process stole it (we hung past heartbeat-timeout-ms), we
-    // must not clobber the stealer's lock body.
+    // Refresh the on-disk timestamp. The read-then-write sequence below
+    // is NOT atomic: a stealer that deletes a stale lock and reacquires
+    // between our read (which observes our owner_id) and our write will
+    // have its lock body silently overwritten by ours. Consequences are
+    // documented in the FileLockManager header -- mutual exclusion of
+    // Acquire is preserved by the rename CAS, and HadoopCatalog's
+    // commit-time CAS prevents any actual data corruption; the lock
+    // body is informational.
     auto body = file_io_->ReadFile(state->lock_path, /*length=*/std::nullopt);
     if (!body.has_value()) {
       continue;  // file gone; might be released elsewhere
@@ -238,34 +247,79 @@ Result<bool> FileLockManager::Acquire(const std::string& entity_id,
     return InvalidArgument("FileLockManager: FileIO is null.");
   }
   const std::string lock_path = LockFilePath(entity_id);
-  std::ignore = file_io_->CreateDir(MetadataDir(entity_id));
+  const std::string lock_dir = MetadataDir(entity_id);
+  // CreateDir is idempotent ("mkdir -p" semantics). Failures here mean the
+  // FileIO can't even create the metadata directory -- there is no point
+  // retrying in the Acquire loop, so propagate.
+  if (auto create = file_io_->CreateDir(lock_dir); !create.has_value()) {
+    return std::unexpected<Error>(create.error());
+  }
 
   const auto deadline = std::chrono::steady_clock::now() + acquire_timeout_;
   while (true) {
-    auto out_file = file_io_->NewOutputFile(lock_path);
-    if (out_file.has_value()) {
-      auto stream = (*out_file)->Create();
-      if (stream.has_value()) {
-        const std::string body = EncodeLockBody(owner_id, MillisSinceEpoch());
-        auto bytes = std::as_bytes(std::span(body.data(), body.size()));
-        auto write = (*stream)->Write(bytes);
-        auto flush = write.has_value() ? (*stream)->Flush() : Status{};
-        auto close_status = (*stream)->Close();
-        if (write.has_value() && flush.has_value() && close_status.has_value()) {
-          // Spawn the heartbeat thread so a legitimately slow commit does
-          // not get its lock stolen by the stale-lock GC.
-          auto state = std::make_unique<HeartbeatState>();
-          state->lock_path = lock_path;
-          state->owner_id = owner_id;
-          HeartbeatState* state_ptr = state.get();
-          state->thread = std::thread([this, state_ptr] { RunHeartbeat(state_ptr); });
-          {
-            std::lock_guard lk(states_mutex_);
-            states_.emplace(entity_id, std::move(state));
+    // CAS attempt: write the body to a UUID-named temp path, then rename
+    // into place with overwrite=false. The rename is the atomic primitive
+    // (POSIX link(2) on LocalFileSystem -- see arrow_io.cc::Rename).
+    // OutputFile::Create() in arrow does GetFileInfo+OpenOutputStream
+    // which is TOCTOU, so we deliberately do NOT use it here.
+    const std::string body = EncodeLockBody(owner_id, MillisSinceEpoch());
+    const std::string tmp_path =
+        std::format("{}/_lock.tmp.{}", lock_dir, Uuid::GenerateV7().ToString());
+    auto write_status = file_io_->WriteFile(tmp_path, body);
+    if (!write_status.has_value()) {
+      // Real infrastructure error -- propagate rather than spin waiting
+      // for the lock file to materialise.
+      return std::unexpected<Error>(write_status.error());
+    }
+    {
+      auto rename_status = file_io_->Rename(tmp_path, lock_path, /*overwrite=*/false);
+      if (rename_status.has_value()) {
+        auto state = std::make_unique<HeartbeatState>();
+        state->lock_path = lock_path;
+        state->owner_id = owner_id;
+        HeartbeatState* state_ptr = state.get();
+        bool collision = false;
+        {
+          // Hold states_mutex_ across the emplace AND thread spawn so a
+          // racing destruction cannot leave a thread alive without an
+          // owning state. We do NOT touch a colliding existing entry --
+          // it represents a live previous-Acquire whose heartbeat thread
+          // is still running; tearing it down here would require a
+          // join-under-mutex (deadlock-prone) AND would clobber its
+          // on-disk lock body.
+          std::lock_guard lk(states_mutex_);
+          auto [it, inserted] = states_.emplace(entity_id, std::move(state));
+          if (!inserted) {
+            collision = true;
+          } else {
+            it->second->thread =
+                std::thread([this, state_ptr] { RunHeartbeat(state_ptr); });
           }
-          return true;
         }
-        std::ignore = file_io_->DeleteFile(lock_path);
+        if (collision) {
+          // The on-disk lock we just published is OUR doing (the rename
+          // succeeded means lock_path didn't exist before). The existing
+          // states_ entry must therefore be from a Release-that-didn't-
+          // clean-up bug; surface that rather than silently smashing it.
+          // Delete the just-published on-disk lock so a future Acquire
+          // can proceed once the duplicate state is sorted out.
+          std::ignore = file_io_->DeleteFile(lock_path);
+          return InvalidArgument(
+              "FileLockManager: entity '{}' already has an unreleased local "
+              "heartbeat state; release it before re-acquiring.",
+              entity_id);
+        }
+        return true;
+      }
+      // Rename failed. Clean up our temp body first.
+      std::ignore = file_io_->DeleteFile(tmp_path);
+      // Distinguish "lost the CAS race" (kAlreadyExists -- inspect the
+      // existing lock body to decide stale vs busy) from real
+      // infrastructure errors (permission denied, backend doesn't support
+      // rename, IO error). Real errors must propagate so the caller sees
+      // the actual reason instead of a misleading "timeout".
+      if (rename_status.error().kind != ErrorKind::kAlreadyExists) {
+        return std::unexpected<Error>(rename_status.error());
       }
     }
 
@@ -275,7 +329,40 @@ Result<bool> FileLockManager::Acquire(const std::string& entity_id,
       if (decoded.has_value()) {
         const int64_t age_ms = MillisSinceEpoch() - decoded->ts_ms;
         if (age_ms > heartbeat_timeout_.count()) {
-          std::ignore = file_io_->DeleteFile(lock_path);
+          // Stale-lock GC must be atomic-with-uniqueness: two racers that
+          // both observed the same stale body would otherwise each delete
+          // the file -- including the new owner's just-acquired lock --
+          // and each go on to win the next Acquire CAS, ending up with
+          // two holders. Use Rename(lock_path -> unique stale path,
+          // overwrite=false) as the conditional snatch: on LocalFileSystem
+          // this is `link(2)` + `unlink`, atomic w.r.t. source existence,
+          // so only one racer sees success. The loser sees a missing-
+          // source error and falls through to the wait loop, re-reading
+          // `lock_path` next iteration.
+          //
+          // On non-LocalFS backends (HDFS / S3 / mockfs) arrow's
+          // Rename(overwrite=false) degrades to a GetFileInfo precheck +
+          // unconditional Move, which is TOCTOU and CAN allow two racers
+          // to both succeed. The Acquire-time rename CAS at the publish
+          // step is the actual safety net on those backends; the snatch
+          // here narrows the window but does not close it.
+          const std::string stale_path =
+              std::format("{}.stale.{}", lock_path, Uuid::GenerateV7().ToString());
+          auto snatch = file_io_->Rename(lock_path, stale_path, /*overwrite=*/false);
+          if (snatch.has_value()) {
+            std::ignore = file_io_->DeleteFile(stale_path);
+          } else if (snatch.error().kind != ErrorKind::kIOError &&
+                     snatch.error().kind != ErrorKind::kAlreadyExists &&
+                     snatch.error().kind != ErrorKind::kNotFound) {
+            // Permission denied, NotSupported, etc. -- propagate so the
+            // caller sees the real reason rather than spinning until the
+            // acquire timeout. kIOError covers "source disappeared" (we
+            // lost the snatch); kAlreadyExists / kNotFound are also
+            // expected race outcomes, not infrastructure failure.
+            return std::unexpected<Error>(snatch.error());
+          }
+          // Whether we won the snatch or another racer did, the stale
+          // body is now gone (or about to be); loop and try to publish.
           continue;
         }
       }
@@ -287,7 +374,13 @@ Result<bool> FileLockManager::Acquire(const std::string& entity_id,
     auto wait = std::min<std::chrono::steady_clock::duration>(
         remaining, std::chrono::duration_cast<std::chrono::steady_clock::duration>(
                        acquire_interval_));
-    std::this_thread::sleep_for(wait);
+    // Park on the shutdown cv so destruction can wake parked acquirers
+    // instead of letting them serve the full interval.
+    std::unique_lock lk(shutdown_mutex_);
+    shutdown_cv_.wait_for(lk, wait, [this] { return shutdown_.load(); });
+    if (shutdown_.load()) {
+      return false;
+    }
   }
 }
 
@@ -321,6 +414,29 @@ Status FileLockManager::Release(const std::string& entity_id,
   }
   return file_io_->DeleteFile(lock_path);
 }
+
+// ---------------------------------------------------------------------------
+// LockReleaseGuard
+// ---------------------------------------------------------------------------
+
+LockReleaseGuard::LockReleaseGuard(LockManager* manager, std::string entity_id,
+                                   std::string owner_id)
+    : manager_(manager),
+      entity_id_(std::move(entity_id)),
+      owner_id_(std::move(owner_id)),
+      active_(manager != nullptr) {}
+
+LockReleaseGuard::~LockReleaseGuard() {
+  if (!active_ || manager_ == nullptr) {
+    return;
+  }
+  if (auto status = manager_->Release(entity_id_, owner_id_); !status.has_value()) {
+    LogWarning(std::format("HadoopCatalog: lock release failed for '{}' (owner '{}'): {}",
+                           entity_id_, owner_id_, status.error().message));
+  }
+}
+
+void LockReleaseGuard::Dismiss() { active_ = false; }
 
 // ---------------------------------------------------------------------------
 // Factory

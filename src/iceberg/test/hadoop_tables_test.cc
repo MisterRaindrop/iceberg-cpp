@@ -26,6 +26,7 @@
 #include <gtest/gtest.h>
 
 #include "iceberg/arrow/arrow_io_internal.h"
+#include "iceberg/arrow/arrow_io_register.h"
 #include "iceberg/partition_spec.h"
 #include "iceberg/schema.h"
 #include "iceberg/schema_field.h"
@@ -112,6 +113,24 @@ TEST_F(HadoopTablesTest, DropMissingTableReturnsNoSuchTable) {
   auto res = tables_->DropTable(root_ + "/nope", /*purge=*/false);
   ASSERT_FALSE(res.has_value());
   EXPECT_EQ(ErrorKind::kNoSuchTable, res.error().kind);
+}
+
+TEST_F(HadoopTablesTest, AutoDetectRejectsMixedSchemes) {
+  // The auto-detect overload caches the first scheme it sees. A subsequent
+  // call against a different scheme should be rejected up front rather than
+  // silently routed through the cached (wrong) FileIO.
+  ::iceberg::arrow::EnsureArrowFileIOsRegistered();
+  HadoopTables auto_tables;
+  // Force first call to register the local FileIO via the file:// scheme.
+  auto first = auto_tables.Exists(root_ + "/probe");
+  ASSERT_TRUE(first.has_value()) << first.error().message;
+  EXPECT_FALSE(*first);
+  // A different-scheme call must surface kInvalidArgument before reaching
+  // FileIORegistry (which would otherwise return kNotImplemented when HDFS
+  // isn't built into this binary).
+  auto mixed = auto_tables.Exists("hdfs://example/path");
+  ASSERT_FALSE(mixed.has_value());
+  EXPECT_EQ(ErrorKind::kInvalidArgument, mixed.error().kind);
 }
 
 }  // namespace iceberg::hadoop

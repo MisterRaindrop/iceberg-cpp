@@ -26,6 +26,7 @@
 
 #include "iceberg/catalog.h"
 #include "iceberg/catalog/hadoop/hadoop_catalog_properties.h"
+#include "iceberg/catalog/hadoop/hadoop_file_layout.h"
 #include "iceberg/catalog/hadoop/hadoop_lock_manager.h"
 #include "iceberg/catalog/hadoop/iceberg_hadoop_export.h"
 #include "iceberg/result.h"
@@ -79,20 +80,32 @@ class ICEBERG_HADOOP_EXPORT HadoopCatalog
   /// Mapping:
   /// - `file://` (or no scheme) -> `arrow-fs-local`
   /// - `s3://` / `s3a://` / `s3n://` -> `arrow-fs-s3` (when ICEBERG_S3=ON)
-  /// - `hdfs://` -> `arrow-fs-hdfs` (when ICEBERG_HDFS=ON); HDFS-specific
-  ///   properties (`fs.defaultFS`, `hadoop.*`, `dfs.*`) are forwarded into
+  /// - `hdfs://nn[:port]/path` -> `arrow-fs-hdfs` (when ICEBERG_HDFS=ON);
+  ///   the authority (`nn[:port]`) is parsed from the warehouse URI and
+  ///   injected as `fs.defaultFS` when not set explicitly, so the
+  ///   namenode in the warehouse string is actually honoured. Other
+  ///   HDFS-specific properties (`hadoop.*`, `dfs.*`) are forwarded into
   ///   the underlying FileIO so Kerberos / HA config configured on the
   ///   catalog also reaches libhdfs.
   ///
+  /// **Linkage requirement.** The arrow-backed FileIOs are registered by
+  /// `iceberg_bundle`'s static initialiser. Callers using this overload
+  /// MUST either link `iceberg::iceberg_bundle` (auto-registration runs),
+  /// or explicitly invoke `iceberg::arrow::EnsureArrowFileIOsRegistered()`
+  /// before constructing the catalog. If the registry has no entry for the
+  /// derived scheme name, the returned error names the missing FileIO and
+  /// points the operator at this requirement. Callers that prefer to
+  /// manage their own FileIO can avoid the bundle dependency entirely by
+  /// using the explicit-FileIO `Make(name, file_io, config)` overload.
+  ///
   /// Returns `kInvalidArgument` when the requested scheme requires a build
   /// flag that is currently off (e.g. asking for hdfs:// with
-  /// ICEBERG_HDFS=OFF).
+  /// ICEBERG_HDFS=OFF) or when the registry has no implementation for the
+  /// chosen `io-impl`.
   static Result<std::shared_ptr<HadoopCatalog>> Make(std::string_view name,
                                                      HadoopCatalogProperties config);
 
   std::string_view name() const override;
-
-  // -- Catalog interface (stubs in H02; implemented in subsequent commits). --
 
   Status CreateNamespace(
       const Namespace& ns,
@@ -147,13 +160,31 @@ class ICEBERG_HADOOP_EXPORT HadoopCatalog
 
  private:
   HadoopCatalog(std::string name, std::shared_ptr<FileIO> file_io,
-                HadoopCatalogProperties config,
-                std::shared_ptr<LockManager> lock_manager);
+                HadoopCatalogProperties config, std::shared_ptr<LockManager> lock_manager,
+                std::string warehouse);
+
+  // Atomically publish v1.metadata.json + version-hint.text under `table_dir`.
+  // Used by CreateTable, UpdateTable(is_create=true) and RegisterTable so
+  // every entrypoint shares lock + UUID-temp + atomic-rename behaviour.
+  // Returns the location of the published v1 metadata on success.
+  //
+  // `metadata` overload: serialises with the codec selected by the metadata's
+  // `write.metadata.compression-codec` property.
+  // `bytes` overload: writes `raw_bytes` verbatim (used by RegisterTable to
+  // preserve the source file's byte representation, e.g. gzip framing).
+  Result<std::string> WriteInitialTableLocked(const std::string& table_dir,
+                                              const TableMetadata& metadata,
+                                              const std::string& owner_prefix);
+  Result<std::string> WriteInitialBytesLocked(const std::string& table_dir,
+                                              std::string_view raw_bytes,
+                                              MetadataCompressionCodec codec,
+                                              const std::string& owner_prefix);
 
   std::string name_;
   std::shared_ptr<FileIO> file_io_;
   HadoopCatalogProperties config_;
   std::shared_ptr<LockManager> lock_manager_;
+  std::string warehouse_;
 };
 
 }  // namespace iceberg::hadoop

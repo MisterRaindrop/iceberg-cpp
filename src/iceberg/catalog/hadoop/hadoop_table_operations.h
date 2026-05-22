@@ -23,6 +23,7 @@
 #include <memory>
 #include <string>
 
+#include "iceberg/catalog/hadoop/hadoop_file_layout.h"
 #include "iceberg/catalog/hadoop/hadoop_lock_manager.h"
 #include "iceberg/catalog/hadoop/iceberg_hadoop_export.h"
 #include "iceberg/file_io.h"
@@ -65,10 +66,26 @@ ICEBERG_HADOOP_EXPORT Result<int64_t> FindLatestMetadataVersion(
 ICEBERG_HADOOP_EXPORT Result<ResolvedMetadataPointer> ResolveCurrentMetadata(
     FileIO& file_io, std::string_view table_dir);
 
+/// \brief Resolve the metadata compression codec the writer should use for
+/// `metadata`. Reads `write.metadata.compression-codec` from the table
+/// properties; defaults to `kNone`.
+ICEBERG_HADOOP_EXPORT Result<MetadataCompressionCodec> ResolveCommitCodec(
+    const TableMetadata& metadata);
+
+/// \brief Serialise `metadata` (JSON + optional gzip) and return the bytes.
+/// Used by both the commit path and the initial-v1 publish path so on-disk
+/// encoding stays consistent.
+ICEBERG_HADOOP_EXPORT Result<std::string> EncodeMetadataWithCodec(
+    const TableMetadata& metadata, MetadataCompressionCodec codec);
+
+/// \brief Serialise `metadata` (JSON + optional gzip) and write the result to
+/// `location` via `file_io`. Thin wrapper over `EncodeMetadataWithCodec`.
+ICEBERG_HADOOP_EXPORT Status WriteMetadataWithCodec(FileIO& file_io,
+                                                    const std::string& location,
+                                                    const TableMetadata& metadata,
+                                                    MetadataCompressionCodec codec);
+
 /// \brief Filesystem-backed TableOperations.
-///
-/// H08 introduces `Refresh()`. CreateTable / Commit / cleanup are introduced
-/// in subsequent commits.
 class ICEBERG_HADOOP_EXPORT HadoopTableOperations {
  public:
   /// \brief Construct without a lock manager. Refresh() works; Commit() will
@@ -98,13 +115,15 @@ class ICEBERG_HADOOP_EXPORT HadoopTableOperations {
   ///   3. Acquire the LockManager. Acquire timeout -> kCommitFailed.
   ///   4. Re-resolve the current pointer; if it has drifted from `base`,
   ///      return kCommitFailed so `iceberg::Transaction` can retry.
-  ///   5. Pick a target filename. The MVP always writes
-  ///      `v{N}.metadata.json` (codec support comes in H15).
+  ///   5. Pick a target filename based on the table's
+  ///      `write.metadata.compression-codec` property.
   ///   6. Refuse to overwrite an existing v{N}.metadata.json[.codec]
   ///      (kCommitFailed) -- belt-and-braces alongside the rename CAS.
   ///   7. Write the new metadata.
-  ///   8. 3-step `version-hint.text` update: write `.tmp`, delete old,
-  ///      rename `.tmp` -> `version-hint.text` (overwrite=false).
+  ///   8. Update `version-hint.text` via write-tmp + atomic
+  ///      rename(overwrite=true). The lock serialises writers so a single
+  ///      atomic replace is enough; this keeps the protocol crash-safe
+  ///      without exposing a no-hint window.
   ///   9. On rename failure, re-read the hint: if it already points at the
   ///      new version somebody beat us to but we are consistent;
   ///      otherwise clean up and return kCommitFailed.

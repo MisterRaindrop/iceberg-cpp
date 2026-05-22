@@ -61,9 +61,9 @@ class ZlibImpl {
     stream_.avail_in = static_cast<uInt>(compressed_data.size());
     stream_.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(compressed_data.data()));
 
-    // TODO(xiao.dong) magic buffer, can we get an estimated size from compressed data?
     std::vector<char> out_buffer(32 * 1024);
     std::string result;
+    result.reserve(compressed_data.size() * 4);
     int ret = 0;
     do {
       stream_.avail_out = static_cast<uInt>(out_buffer.size());
@@ -113,26 +113,33 @@ class GZipCompressor::ZlibDeflateImpl {
     int ret = deflateInit2(&stream_, Z_DEFAULT_COMPRESSION, Z_DEFLATED, kWindowBits,
                            kMemLevel, Z_DEFAULT_STRATEGY);
     if (ret != Z_OK) {
-      return DecompressError("deflateInit2 failed, result:{}", ret);
+      return IOError("deflateInit2 failed, result:{}", ret);
     }
     initialized_ = true;
     return {};
   }
 
   Result<std::string> Compress(const std::string& data) {
-    ICEBERG_RETURN_UNEXPECTED(Init());
+    if (!initialized_) {
+      ICEBERG_RETURN_UNEXPECTED(Init());
+    } else if (int reset = deflateReset(&stream_); reset != Z_OK) {
+      // After a previous Z_FINISH-driven deflate the stream is in
+      // Z_STREAM_END; reset is required to reuse the compressor.
+      return IOError("deflateReset failed, result:{}", reset);
+    }
     stream_.avail_in = static_cast<uInt>(data.size());
     stream_.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(data.data()));
 
     std::vector<char> out_buffer(32 * 1024);
     std::string result;
+    result.reserve(data.size());
     int ret = 0;
     do {
       stream_.avail_out = static_cast<uInt>(out_buffer.size());
       stream_.next_out = reinterpret_cast<Bytef*>(out_buffer.data());
       ret = deflate(&stream_, Z_FINISH);
       if (ret != Z_OK && ret != Z_STREAM_END && ret != Z_BUF_ERROR) {
-        return DecompressError("deflate failed, result:{}", ret);
+        return IOError("deflate failed, result:{}", ret);
       }
       result.append(out_buffer.data(), out_buffer.size() - stream_.avail_out);
     } while (ret != Z_STREAM_END);

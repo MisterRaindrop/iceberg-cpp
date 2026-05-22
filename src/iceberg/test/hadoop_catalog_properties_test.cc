@@ -133,6 +133,20 @@ TEST(HadoopCatalogPropertiesTest, ValidateRejectsUnknownLockImpl) {
   EXPECT_EQ(ErrorKind::kInvalidArgument, res.error().kind);
 }
 
+TEST(HadoopCatalogPropertiesTest, ValidateRejectsMalformedIntegerWithoutThrowing) {
+  // Round-6 fix: previously Get(int_entry) on a malformed value called
+  // ICEBERG_ASSIGN_OR_THROW, escaping Validate() as a C++ exception.
+  // Validate() must surface kInvalidArgument instead so HadoopCatalog::Make
+  // returns an error result.
+  auto bad = HadoopCatalogProperties::FromMap({
+      {"lock.acquire-timeout-ms", "abc"},
+  });
+  Status res;
+  ASSERT_NO_THROW({ res = bad.Validate(); });
+  ASSERT_FALSE(res.has_value());
+  EXPECT_EQ(ErrorKind::kInvalidArgument, res.error().kind);
+}
+
 TEST(HadoopCatalogLogTest, WarningHandlerInterceptsMessages) {
   std::vector<std::string> captured;
   SetWarningHandler([&captured](std::string_view msg) { captured.emplace_back(msg); });

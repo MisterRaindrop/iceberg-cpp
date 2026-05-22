@@ -19,13 +19,12 @@
 
 #include "iceberg/catalog/hadoop/hadoop_file_layout.h"
 
-#include <algorithm>
-#include <cctype>
 #include <format>
 #include <string>
 
 #include "iceberg/util/location_util.h"
 #include "iceberg/util/macros.h"
+#include "iceberg/util/string_util.h"
 
 namespace iceberg::hadoop {
 
@@ -33,14 +32,6 @@ namespace {
 
 constexpr std::string_view kJsonSuffix = ".metadata.json";
 constexpr std::string_view kVersionPrefix = "v";
-
-std::string ToLowerAscii(std::string_view s) {
-  std::string out(s);
-  std::ranges::transform(out, out.begin(), [](unsigned char c) {
-    return static_cast<char>(std::tolower(c));
-  });
-  return out;
-}
 
 std::string JoinUnderRoot(std::string_view root, std::string_view child) {
   std::string base{LocationUtil::StripTrailingSlash(root)};
@@ -51,8 +42,18 @@ std::string JoinUnderRoot(std::string_view root, std::string_view child) {
 
 }  // namespace
 
+bool IsS3Scheme(std::string_view location) {
+  return location.starts_with("s3://") || location.starts_with("s3a://") ||
+         location.starts_with("s3n://");
+}
+
+std::string_view Basename(std::string_view path) {
+  auto slash = path.find_last_of('/');
+  return slash == std::string_view::npos ? path : path.substr(slash + 1);
+}
+
 Result<MetadataCompressionCodec> ParseMetadataCompressionCodec(std::string_view name) {
-  const std::string lower = ToLowerAscii(name);
+  const std::string lower = StringUtils::ToLower(name);
   if (lower.empty() || lower == "none") {
     return MetadataCompressionCodec::kNone;
   }
@@ -158,10 +159,6 @@ std::string LockFilePath(std::string_view table_dir) {
   return JoinUnderRoot(MetadataDir(table_dir), "_lock");
 }
 
-std::string NamespacePropertiesPath(std::string_view ns_dir) {
-  return JoinUnderRoot(ns_dir, "namespace.properties");
-}
-
 Result<bool> IsHadoopTableDir(FileIO& file_io, std::string_view dir_location) {
   // A HadoopCatalog table contains a metadata/ subdirectory with at least one
   // v{N}.metadata.json[.codec] file. We probe the metadata dir first and only
@@ -181,14 +178,7 @@ Result<bool> IsHadoopTableDir(FileIO& file_io, std::string_view dir_location) {
     if (entry.is_directory) {
       continue;
     }
-    // Extract just the file name portion. arrow_fs returns paths in the
-    // canonical form, but we don't need the directory portion here.
-    std::string_view name = entry.location;
-    auto slash = name.find_last_of('/');
-    if (slash != std::string_view::npos) {
-      name.remove_prefix(slash + 1);
-    }
-    if (ParseMetadataFileName(name).has_value()) {
+    if (ParseMetadataFileName(Basename(entry.location)).has_value()) {
       return true;
     }
   }
@@ -225,16 +215,12 @@ Result<MetadataFileRef> ParseMetadataFileName(std::string_view file_name) {
     return InvalidArgument("Metadata filename '{}' has empty version segment.",
                            file_name);
   }
-  int64_t version = 0;
-  for (char c : version_str) {
-    if (c < '0' || c > '9') {
-      return InvalidArgument(
-          "Metadata filename '{}' has non-numeric version segment '{}'.", file_name,
-          version_str);
-    }
-    version = (version * 10) + (c - '0');
+  auto version = StringUtils::ParseNumber<int64_t>(version_str);
+  if (!version.has_value()) {
+    return InvalidArgument("Metadata filename '{}' has non-numeric version segment '{}'.",
+                           file_name, version_str);
   }
-  return MetadataFileRef{.version = version, .codec = codec};
+  return MetadataFileRef{.version = *version, .codec = codec};
 }
 
 }  // namespace iceberg::hadoop

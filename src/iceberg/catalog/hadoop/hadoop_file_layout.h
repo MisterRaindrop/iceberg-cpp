@@ -59,6 +59,15 @@ ICEBERG_HADOOP_EXPORT Result<MetadataCompressionCodec> ParseMetadataCompressionC
 ICEBERG_HADOOP_EXPORT std::string_view MetadataCompressionCodecName(
     MetadataCompressionCodec codec);
 
+/// \brief True if `location` uses one of the S3-family schemes recognised by
+/// the auto-detect FileIO resolver (s3://, s3a://, s3n://).
+ICEBERG_HADOOP_EXPORT bool IsS3Scheme(std::string_view location);
+
+/// \brief Return the leaf component of a slash-separated path. Returns the
+/// whole input when there is no slash. Pure string operation; does not touch
+/// the filesystem.
+ICEBERG_HADOOP_EXPORT std::string_view Basename(std::string_view path);
+
 /// \brief Validate a single namespace level: must be non-empty and contain
 /// no '/' characters. Java rejects `/` in namespace levels because of the
 /// filesystem mapping; cpp follows suit.
@@ -102,11 +111,6 @@ ICEBERG_HADOOP_EXPORT std::string VersionHintPath(std::string_view table_dir);
 
 /// \brief Path to the optional `_lock` file under a table's metadata directory.
 ICEBERG_HADOOP_EXPORT std::string LockFilePath(std::string_view table_dir);
-
-/// \brief Path to the optional `namespace.properties` file used by Phase 5
-/// (E1) namespace property persistence. Not consumed in the MVP but exposed
-/// here so callers do not have to reinvent the layout convention.
-ICEBERG_HADOOP_EXPORT std::string NamespacePropertiesPath(std::string_view ns_dir);
 
 /// \brief Parsed components of a metadata filename.
 struct MetadataFileRef {

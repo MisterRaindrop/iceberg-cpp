@@ -85,6 +85,9 @@ class ICEBERG_HADOOP_EXPORT HadoopCatalogProperties
                                                         3000};
   inline static Entry<int64_t> kLockHeartbeatTimeoutMs{"lock.heartbeat-timeout-ms",
                                                        15000};
+  /// Accepted for Java config compatibility but not consumed by the cpp
+  /// FileLockManager (which uses one heartbeat thread per held lock; tuning
+  /// this number has no effect).
   inline static Entry<int32_t> kLockHeartbeatThreads{"lock.heartbeat-threads", 4};
   inline static Entry<int64_t> kLockAcquireIntervalMs{"lock.acquire-interval-ms", 5000};
   inline static Entry<int64_t> kLockAcquireTimeoutMs{"lock.acquire-timeout-ms", 180000};
@@ -95,7 +98,7 @@ class ICEBERG_HADOOP_EXPORT HadoopCatalogProperties
   /// into warnings on list/exists paths instead of returning the error.
   inline static Entry<bool> kSuppressPermissionError{"suppress-permission-error", false};
 
-  // -- HDFS / Kerberos (passthrough into HDFS FileIO when wired in H19/H20). --
+  // -- HDFS / Kerberos (passthrough into HDFS FileIO). --
 
   /// \brief The default Hadoop file system (e.g. "hdfs://namenode:8020").
   inline static Entry<std::string> kFsDefaultFS{"fs.defaultFS", ""};

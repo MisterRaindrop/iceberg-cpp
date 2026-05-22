@@ -20,6 +20,7 @@
 #pragma once
 
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 
@@ -95,6 +96,18 @@ class ICEBERG_HADOOP_EXPORT HadoopTables {
 
   std::shared_ptr<FileIO> file_io_;
   HadoopCatalogProperties config_;
+  // Guards `file_io_` writes in the auto-detect overload. Concurrent first
+  // calls would otherwise race on the cache.
+  mutable std::mutex resolve_mutex_;
+  // Records the scheme used to initialise file_io_ in auto-detect mode so a
+  // later call against a different scheme fails fast instead of silently
+  // routing through the cached (wrong) FileIO.
+  std::string cached_scheme_;
+  // For hdfs:// paths we also remember the namenode authority (host:port)
+  // so callers cannot accidentally point a single HadoopTables at two
+  // different HDFS clusters and silently use the first cluster's FileIO
+  // for both.
+  std::string cached_authority_;
 };
 
 }  // namespace iceberg::hadoop

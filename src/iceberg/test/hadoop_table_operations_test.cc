@@ -98,7 +98,7 @@ TEST_F(HadoopTableOperationsTest, ReadVersionHintRejectsNonNumeric) {
   SeedVersionHint("abc");
   auto res = ReadVersionHint(*file_io_, table_dir_);
   ASSERT_FALSE(res.has_value());
-  EXPECT_EQ(ErrorKind::kInvalid, res.error().kind);
+  EXPECT_EQ(ErrorKind::kInvalidArgument, res.error().kind);
 }
 
 TEST_F(HadoopTableOperationsTest, FindLatestMetadataVersionPicksMax) {
@@ -371,13 +371,16 @@ TEST_F(HadoopCommitTest, FileLockManagerHeartbeatPreventsStaleSteal) {
   // Heartbeat-timeout much shorter than the sleep below; without the
   // heartbeat refresh, the second Acquire would steal the lock. With the
   // heartbeat thread re-writing the lock body, it stays fresh.
+  // Margin of >=5x between heartbeat-interval and heartbeat-timeout, and
+  // between heartbeat-timeout and the sleep below, so CI scheduler jitter
+  // (especially on busy macOS / Linux runners) does not flake the test.
   auto props = HadoopCatalogProperties::FromMap({
       {"warehouse", warehouse_},
       {"lock-impl", "file"},
-      {"lock.acquire-timeout-ms", "200"},
-      {"lock.acquire-interval-ms", "20"},
-      {"lock.heartbeat-interval-ms", "30"},
-      {"lock.heartbeat-timeout-ms", "100"},
+      {"lock.acquire-timeout-ms", "500"},
+      {"lock.acquire-interval-ms", "40"},
+      {"lock.heartbeat-interval-ms", "40"},
+      {"lock.heartbeat-timeout-ms", "200"},
   });
   ICEBERG_UNWRAP_OR_FAIL(auto raw, MakeLockManagerWithIO(props, file_io_));
   auto file_lock = std::shared_ptr<LockManager>(std::move(raw));
@@ -385,9 +388,9 @@ TEST_F(HadoopCommitTest, FileLockManagerHeartbeatPreventsStaleSteal) {
   ICEBERG_UNWRAP_OR_FAIL(auto first, file_lock->Acquire(table_dir_, "holder"));
   ASSERT_TRUE(first);
 
-  // Sleep longer than heartbeat-timeout-ms; the heartbeat should keep the
-  // lock body fresh so a competing acquirer still sees it as held.
-  std::this_thread::sleep_for(std::chrono::milliseconds(250));
+  // Sleep ~5x heartbeat-timeout-ms; the heartbeat should keep the lock body
+  // fresh so a competing acquirer still sees it as held.
+  std::this_thread::sleep_for(std::chrono::milliseconds(1000));
 
   ICEBERG_UNWRAP_OR_FAIL(auto stolen, file_lock->Acquire(table_dir_, "thief"));
   EXPECT_FALSE(stolen) << "heartbeat should have kept the lock body fresh";

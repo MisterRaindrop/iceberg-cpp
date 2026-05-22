@@ -25,6 +25,8 @@
 
 #if ICEBERG_HDFS_ENABLED
 #  include <arrow/filesystem/hdfs.h>
+#  include <arrow/io/hdfs.h>
+#  include <arrow/result.h>
 
 #  include "iceberg/arrow/arrow_io_internal.h"
 #endif
@@ -69,7 +71,10 @@ void RegisterHdfsFileIO() {
         for (const auto& [key, value] : properties) {
           if (key.starts_with("hadoop.") || key.starts_with("dfs.") ||
               key.starts_with("fs.")) {
-            options.extra_conf.emplace(key, value);
+            // arrow exposes extra_conf on the HdfsConnectionConfig nested
+            // inside HdfsOptions, not on the options struct itself; see
+            // arrow/io/hdfs.h:87.
+            options.connection_config.extra_conf.emplace(key, value);
           }
         }
         auto fs_result = ::arrow::fs::HadoopFileSystem::Make(options);
