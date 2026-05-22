@@ -259,12 +259,22 @@ TEST_F(HadoopCommitTest, FileLockManagerAcquiresAndDetectsStale) {
   ICEBERG_UNWRAP_OR_FAIL(auto second, file_lock->Acquire(table_dir_, "second"));
   EXPECT_FALSE(second);
 
-  // Stale path: write a lock file by hand with an old timestamp, then verify
-  // a fresh acquire steals it.
+  // Stale path: writing a lock file by hand with an old timestamp must NOT
+  // be silently stolen by a subsequent Acquire -- the snatch is unsafe
+  // without a verify-body-then-unlink primitive, so we leave the file in
+  // place and surface a warning. Operators (or an external reaper) must
+  // remove the stale lock; once removed, Acquire succeeds normally.
   ASSERT_TRUE(file_lock->Release(table_dir_, "first").has_value());
   ASSERT_TRUE(file_io_->WriteFile(LockFilePath(table_dir_), "ghost|0\n").has_value());
-  ICEBERG_UNWRAP_OR_FAIL(auto stolen, file_lock->Acquire(table_dir_, "newcomer"));
-  EXPECT_TRUE(stolen);
+  ICEBERG_UNWRAP_OR_FAIL(auto stale_blocked, file_lock->Acquire(table_dir_, "newcomer"));
+  EXPECT_FALSE(stale_blocked)
+      << "stale on-disk lock must not be auto-reclaimed by Acquire";
+
+  // External reaper removes the stale file; the next Acquire then wins via
+  // the normal Rename-CAS publish path.
+  ASSERT_TRUE(file_io_->DeleteFile(LockFilePath(table_dir_)).has_value());
+  ICEBERG_UNWRAP_OR_FAIL(auto after_reap, file_lock->Acquire(table_dir_, "newcomer"));
+  EXPECT_TRUE(after_reap);
   EXPECT_TRUE(file_lock->Release(table_dir_, "newcomer").has_value());
 }
 

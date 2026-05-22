@@ -41,11 +41,15 @@ namespace iceberg::hadoop {
 /// \brief Mutual exclusion primitive for HadoopCatalog commits.
 ///
 /// HadoopCatalog uses a LockManager to make commit-time CAS racy-but-correct:
-/// the filesystem rename of `version-hint.text` is the source of truth, but
-/// holding a lock around the rename window reduces the rate of CAS retries
-/// when many writers race for the same table. The LockManager mirrors Java's
-/// `org.apache.iceberg.util.LockManager` interface so configuration is
-/// portable across language implementations.
+/// the real CAS primitive is the atomic
+/// `Rename(temp, v{N+1}.metadata.json, overwrite=false)` performed during
+/// commit -- only one writer can publish v{N+1}. The LockManager serialises
+/// writers around that rename so the CAS retry rate stays low when many
+/// commits race for the same table; `version-hint.text` is a separate
+/// atomic-replace (`Rename(overwrite=true)`) published AFTER the metadata
+/// rename wins, never the source of truth on its own. The LockManager
+/// mirrors Java's `org.apache.iceberg.util.LockManager` interface so
+/// configuration is portable across language implementations.
 class ICEBERG_HADOOP_EXPORT LockManager {
  public:
   virtual ~LockManager() = default;

@@ -130,12 +130,17 @@ Result<ResolvedMetadataPointer> ResolveCurrentMetadata(FileIO& file_io,
     return NoSuchTable("Table at '{}' has no metadata directory.", table_dir);
   }
 
-  // One ListDir up front -- subsequent steps just inspect the result rather
-  // than probing extension-by-extension. Saves up to 2 Exists round trips
-  // per resolve on the hot path (Refresh + Commit CAS recheck).
+  // Read the version hint BEFORE listing. Writers publish the new
+  // `v{N+1}.metadata.json` file via atomic rename and only then update
+  // version-hint.text, so observing hint=H guarantees v{H} exists on
+  // disk. Listing first and reading the hint second can otherwise see a
+  // listing snapshot taken before the writer's rename, but a hint
+  // updated after both rename and hint write -- the reader then has
+  // hint=N+1 with no v{N+1} in its stale listing and erroneously
+  // surfaces kNoSuchTable.
+  auto hint = ReadVersionHint(file_io, table_dir);
   ICEBERG_ASSIGN_OR_RAISE(auto versioned, ListVersionedMetadata(file_io, table_dir));
 
-  auto hint = ReadVersionHint(file_io, table_dir);
   if (hint.has_value()) {
     pointer.version = *hint;
   } else {
@@ -153,6 +158,21 @@ Result<ResolvedMetadataPointer> ResolveCurrentMetadata(FileIO& file_io,
   }
 
   for (auto& entry : versioned) {
+    if (entry.version == pointer.version) {
+      pointer.location = std::move(entry.location);
+      return pointer;
+    }
+  }
+
+  // Hint pointed at a version not present in our listing. Either the
+  // hint races with a write that hasn't published the file yet (a
+  // protocol violation, since writers rename the metadata file before
+  // updating the hint), or our listing snapshot was taken before the
+  // metadata rename landed. Re-list once and try again -- the writer's
+  // rename has been visible by now if the hint update was.
+  ICEBERG_ASSIGN_OR_RAISE(auto retry_versioned,
+                          ListVersionedMetadata(file_io, table_dir));
+  for (auto& entry : retry_versioned) {
     if (entry.version == pointer.version) {
       pointer.location = std::move(entry.location);
       return pointer;

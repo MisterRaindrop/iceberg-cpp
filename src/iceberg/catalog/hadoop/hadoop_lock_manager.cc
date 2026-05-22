@@ -256,6 +256,7 @@ Result<bool> FileLockManager::Acquire(const std::string& entity_id,
   }
 
   const auto deadline = std::chrono::steady_clock::now() + acquire_timeout_;
+  bool stale_warned_this_call = false;
   while (true) {
     // CAS attempt: write the body to a UUID-named temp path, then rename
     // into place with overwrite=false. The rename is the atomic primitive
@@ -323,68 +324,26 @@ Result<bool> FileLockManager::Acquire(const std::string& entity_id,
       }
     }
 
-    auto existing = file_io_->ReadFile(lock_path, /*length=*/std::nullopt);
-    if (existing.has_value()) {
-      auto decoded = DecodeLockBody(*existing);
-      if (decoded.has_value()) {
+    // Previous revisions tried to "snatch" stale locks here via
+    // Rename(lock_path -> unique stale path, overwrite=false). That is
+    // fundamentally unsafe without a "verify body THEN unlink source"
+    // primitive: the snatch can atomically move a fresh post-stale lock
+    // that a third racer just published, and the best-effort restore
+    // that follows is itself racy. We leave the stale file in place.
+    // `lock-impl=file` is documented as best-effort; stale-lock
+    // reclamation is an operator responsibility (or an external reaper)
+    // rather than something inline on the Acquire fast path.
+    if (auto existing = file_io_->ReadFile(lock_path, /*length=*/std::nullopt);
+        existing.has_value() && !stale_warned_this_call) {
+      if (auto decoded = DecodeLockBody(*existing); decoded.has_value()) {
         const int64_t age_ms = MillisSinceEpoch() - decoded->ts_ms;
         if (age_ms > heartbeat_timeout_.count()) {
-          // Stale-lock GC: Rename(lock_path -> unique stale path,
-          // overwrite=false) is the conditional snatch. On LocalFileSystem
-          // it is `link(2)` + `unlink`, atomic w.r.t. source existence.
-          //
-          // The dangerous race the rename ALONE does not prevent: between
-          // our Read above and this Rename, another acquirer can snatch
-          // the stale lock AND publish a fresh new lock at the same path.
-          // Our Rename would then atomically move the new owner's live
-          // lock into our stale path -- silent corruption.
-          //
-          // Defence: after the snatch, re-read what we moved. If the body
-          // matches the (owner, ts) we observed when classifying the lock
-          // as stale, the snatch was correct -- delete it. If the body
-          // differs, we hijacked someone else's lock; best-effort restore
-          // via Rename(stale_path -> lock_path, overwrite=false). On
-          // restore failure we discard the snatched file rather than
-          // overwrite whatever a third racer has since published.
-          //
-          // On non-LocalFS backends arrow's Rename(overwrite=false)
-          // degrades to a precheck + unconditional Move (TOCTOU); the
-          // verify-then-restore step narrows but does not close that
-          // window. The Acquire-time publish-CAS at the bottom of the
-          // loop is still the actual safety net there.
-          const std::string stale_path =
-              std::format("{}.stale.{}", lock_path, Uuid::GenerateV7().ToString());
-          auto snatch = file_io_->Rename(lock_path, stale_path, /*overwrite=*/false);
-          if (snatch.has_value()) {
-            auto snatched_body = file_io_->ReadFile(stale_path, std::nullopt);
-            bool body_matches = false;
-            if (snatched_body.has_value()) {
-              auto snatched_decoded = DecodeLockBody(*snatched_body);
-              body_matches = snatched_decoded.has_value() &&
-                             snatched_decoded->owner == decoded->owner &&
-                             snatched_decoded->ts_ms == decoded->ts_ms;
-            }
-            if (body_matches) {
-              std::ignore = file_io_->DeleteFile(stale_path);
-            } else {
-              // We hijacked a fresher lock than we intended. Try to put
-              // it back. If lock_path was repopulated in the meantime
-              // discard ours rather than overwrite whatever is there.
-              auto restore = file_io_->Rename(stale_path, lock_path, /*overwrite=*/false);
-              if (!restore.has_value()) {
-                std::ignore = file_io_->DeleteFile(stale_path);
-              }
-            }
-          } else if (snatch.error().kind != ErrorKind::kIOError &&
-                     snatch.error().kind != ErrorKind::kAlreadyExists &&
-                     snatch.error().kind != ErrorKind::kNotFound) {
-            // Permission denied, NotSupported, etc. -- propagate.
-            // kIOError / kAlreadyExists / kNotFound are expected race
-            // outcomes (someone else snatched / source gone), not
-            // infrastructure failure.
-            return std::unexpected<Error>(snatch.error());
-          }
-          continue;
+          LogWarning(std::format(
+              "FileLockManager: '{}' appears stale (owner='{}', age={}ms > "
+              "heartbeat-timeout-ms={}ms); waiting for external cleanup. Delete "
+              "the file manually if you are sure the holder is gone.",
+              lock_path, decoded->owner, age_ms, heartbeat_timeout_.count()));
+          stale_warned_this_call = true;
         }
       }
     }
@@ -412,8 +371,26 @@ Status FileLockManager::Release(const std::string& entity_id,
   }
   const std::string lock_path = LockFilePath(entity_id);
 
-  // Stop the heartbeat thread before reading the on-disk body so the
-  // background refresh cannot race with our delete.
+  // Verify ownership FIRST. A misrouted Release(entity, wrong_owner) used
+  // to stop the real holder's heartbeat before returning kNotAllowed --
+  // the real holder's still-live lock would then go stale and someone
+  // else could steal it. By reading + decoding the body before touching
+  // states_ / heartbeat, an unauthorised Release leaves the holder's
+  // bookkeeping intact.
+  ICEBERG_ASSIGN_OR_RAISE(auto body, file_io_->ReadFile(lock_path, std::nullopt));
+  ICEBERG_ASSIGN_OR_RAISE(auto decoded, DecodeLockBody(body));
+  if (decoded.owner != owner_id) {
+    return NotAllowed("FileLockManager: '{}' is held by '{}', not by '{}'.", lock_path,
+                      decoded.owner, owner_id);
+  }
+
+  // Ownership verified; now it is safe to stop the heartbeat thread and
+  // unlink the on-disk lock. There is a small race between the verify
+  // above and the body actually being ours at delete-time, but that
+  // window is the same one the heartbeat refresh has -- if a stealer
+  // raced in, our DeleteFile removes their body. The Acquire-time rename
+  // CAS at the bottom of the publish path is the actual safety net; the
+  // lock body is informational.
   std::unique_ptr<HeartbeatState> state;
   {
     std::lock_guard lk(states_mutex_);
@@ -425,13 +402,6 @@ Status FileLockManager::Release(const std::string& entity_id,
   }
   if (state != nullptr) {
     StopHeartbeat(std::move(state));
-  }
-
-  ICEBERG_ASSIGN_OR_RAISE(auto body, file_io_->ReadFile(lock_path, std::nullopt));
-  ICEBERG_ASSIGN_OR_RAISE(auto decoded, DecodeLockBody(body));
-  if (decoded.owner != owner_id) {
-    return NotAllowed("FileLockManager: '{}' is held by '{}', not by '{}'.", lock_path,
-                      decoded.owner, owner_id);
   }
   return file_io_->DeleteFile(lock_path);
 }
