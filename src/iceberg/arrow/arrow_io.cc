@@ -619,17 +619,38 @@ Result<std::vector<FileIO::ListEntry>> ArrowFileSystemFileIO::ListDir(
   //
   // We rebuild each entry by substituting the resolved base path with the
   // caller-supplied prefix: an entry whose internal path is
-  // `<base_path><tail>` becomes `<dir_location><tail>`. This works for
-  // every backend because we never invent a "scheme://authority" join --
-  // we just splice the tail onto whatever the caller already passed in.
+  // `<base_path><tail>` becomes `<dir_location><tail>`. The join is done
+  // by `JoinPath` below so root paths and URIs with empty path-portions
+  // (`file:///`, `s3://bucket`, `/`) all produce exactly one separator.
+
+  // Strip at most one trailing '/' off `path` (the arrow-resolved base)
+  // so the entries' starts_with() check matches. We DO NOT strip the
+  // caller's `dir_location` -- the join helper below handles trailing
+  // slashes safely, and stripping naively would turn `file:///` into
+  // `file:` and break the scheme separator.
   std::string_view base_view = path;
-  while (base_view.size() > 1 && base_view.back() == '/') {
+  if (base_view.size() > 1 && base_view.back() == '/') {
     base_view.remove_suffix(1);
   }
-  std::string_view caller_prefix = dir_location;
-  while (caller_prefix.size() > 1 && caller_prefix.back() == '/') {
-    caller_prefix.remove_suffix(1);
-  }
+
+  // Join `prefix` and `tail` with exactly one '/' between them. Handles
+  // the four shapes ListDir actually sees:
+  //   prefix="file:///tmp/wh" tail="/db"    -> "file:///tmp/wh/db"
+  //   prefix="file:///"       tail="/tmp"   -> "file:///tmp"
+  //   prefix="/"              tail="/tmp"   -> "/tmp"
+  //   prefix="s3://bucket"    tail="/wh/db" -> "s3://bucket/wh/db"
+  auto JoinPath = [](std::string_view prefix, std::string_view tail) {
+    std::string out(prefix);
+    const bool prefix_slash = !out.empty() && out.back() == '/';
+    const bool tail_slash = !tail.empty() && tail.front() == '/';
+    if (prefix_slash && tail_slash) {
+      tail.remove_prefix(1);
+    } else if (!prefix_slash && !tail_slash) {
+      out.push_back('/');
+    }
+    out.append(tail);
+    return out;
+  };
 
   std::vector<FileIO::ListEntry> entries;
   entries.reserve(infos_result->size());
@@ -638,11 +659,7 @@ Result<std::vector<FileIO::ListEntry>> ArrowFileSystemFileIO::ListDir(
     std::string loc;
     if (std::string_view(full_path).starts_with(base_view)) {
       std::string_view tail = std::string_view(full_path).substr(base_view.size());
-      loc = std::string(caller_prefix);
-      if (!tail.empty() && tail.front() != '/') {
-        loc.push_back('/');
-      }
-      loc.append(tail);
+      loc = JoinPath(dir_location, tail);
     } else {
       // Defensive: arrow returned a path that isn't a child of the
       // requested base (shouldn't happen). Don't fabricate a URI we

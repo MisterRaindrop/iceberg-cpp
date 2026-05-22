@@ -83,7 +83,13 @@ class ICEBERG_HADOOP_EXPORT HadoopCatalog
   ///
   /// Mapping:
   /// - `file://` (or no scheme) -> `arrow-fs-local`
-  /// - `s3://` / `s3a://` / `s3n://` -> `arrow-fs-s3` (when ICEBERG_S3=ON)
+  /// - `s3://` -> `arrow-fs-s3` (when ICEBERG_S3=ON). arrow-fs-s3 only
+  ///   accepts the canonical `s3://`; auto-detect rejects the JVM-only
+  ///   Hadoop aliases `s3a://` and `s3n://` with a clear
+  ///   `kInvalidArgument`. Callers that have their own FileIO understanding
+  ///   those aliases can still opt in by setting the `io-impl` property
+  ///   to that FileIO's name, or by passing the FileIO explicitly via
+  ///   `Make(name, file_io, config)`.
   /// - `hdfs://nn[:port]/path` -> `arrow-fs-hdfs` (when ICEBERG_HDFS=ON);
   ///   the authority (`nn[:port]`) is parsed from the warehouse URI and
   ///   injected as `fs.defaultFS` when not set explicitly, so the

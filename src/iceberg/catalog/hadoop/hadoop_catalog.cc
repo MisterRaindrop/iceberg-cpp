@@ -159,19 +159,27 @@ Result<std::shared_ptr<HadoopCatalog>> HadoopCatalog::Make(
       }
     }
   } else if (IsS3Scheme(warehouse)) {
-    if (warehouse.starts_with("s3a://") || warehouse.starts_with("s3n://")) {
-      return InvalidArgument(
-          "HadoopCatalog::Make: arrow-fs-s3 only accepts 's3://' URIs; the "
-          "warehouse '{}' uses a JVM-only Hadoop alias. Use 's3://' instead.",
-          warehouse);
-    }
     io_name = std::string(FileIORegistry::kArrowS3FileIO);
   }
 
-  // Allow an explicit override.
+  // Allow an explicit override -- this is also how callers can opt into a
+  // custom FileIO that natively understands s3a:// / s3n://.
   const auto override_impl = config.Get(HadoopCatalogProperties::kIOImpl);
   if (!override_impl.empty()) {
     io_name = override_impl;
+  }
+
+  // arrow-fs-s3 only accepts the canonical `s3://` scheme. Reject the
+  // JVM-only Hadoop aliases now -- but only if the final FileIO is
+  // arrow-fs-s3. A caller who set io-impl to a custom FileIO that does
+  // understand s3a/s3n is free to keep using them.
+  if (io_name == FileIORegistry::kArrowS3FileIO &&
+      (warehouse.starts_with("s3a://") || warehouse.starts_with("s3n://"))) {
+    return InvalidArgument(
+        "HadoopCatalog::Make: arrow-fs-s3 only accepts 's3://' URIs; the "
+        "warehouse '{}' uses a JVM-only Hadoop alias. Use 's3://', or set "
+        "'io-impl' to a custom FileIO that supports the alias.",
+        warehouse);
   }
 
   auto file_io_result = FileIORegistry::Load(io_name, config.configs());

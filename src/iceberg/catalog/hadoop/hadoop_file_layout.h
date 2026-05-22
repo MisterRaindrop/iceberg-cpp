@@ -59,8 +59,13 @@ ICEBERG_HADOOP_EXPORT Result<MetadataCompressionCodec> ParseMetadataCompressionC
 ICEBERG_HADOOP_EXPORT std::string_view MetadataCompressionCodecName(
     MetadataCompressionCodec codec);
 
-/// \brief True if `location` uses one of the S3-family schemes recognised by
-/// the auto-detect FileIO resolver (s3://, s3a://, s3n://).
+/// \brief True if `location` uses one of the S3-family schemes
+/// (`s3://`, `s3a://`, `s3n://`). NOTE: arrow-fs-s3 only accepts the
+/// canonical `s3://`; HadoopCatalog::Make and HadoopTables reject the
+/// JVM-only Hadoop aliases on the auto-detect path. This helper is still
+/// useful for emitting non-atomic-warehouse warnings, scheme-based
+/// branching, and for callers that have a custom FileIO that understands
+/// the aliases via the `io-impl` override.
 ICEBERG_HADOOP_EXPORT bool IsS3Scheme(std::string_view location);
 
 /// \brief Return the leaf component of a slash-separated path. Returns the

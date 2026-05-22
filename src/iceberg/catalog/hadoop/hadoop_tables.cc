@@ -139,12 +139,6 @@ std::string_view HdfsAuthority(std::string_view path) {
 
 Result<std::shared_ptr<FileIO>> HadoopTables::ResolveFileIO(std::string_view path) {
   std::lock_guard lk(resolve_mutex_);
-  if (path.starts_with("s3a://") || path.starts_with("s3n://")) {
-    return InvalidArgument(
-        "HadoopTables: arrow-fs-s3 only accepts 's3://' URIs; the path '{}' uses "
-        "a JVM-only Hadoop alias. Use 's3://' instead.",
-        path);
-  }
   std::string io_name = DetectIoName(path);
   const std::string_view authority = HdfsAuthority(path);
   if (file_io_ != nullptr) {
@@ -171,10 +165,24 @@ Result<std::shared_ptr<FileIO>> HadoopTables::ResolveFileIO(std::string_view pat
     return file_io_;
   }
 
-  // First-time resolve. If this is an HDFS path, inject fs.defaultFS from
-  // the authority so the underlying HadoopFileSystem connects to the
-  // namenode in the URI rather than the JVM core-site default. Mirrors the
-  // same behaviour HadoopCatalog::Make(name, config) implements.
+  // First-time auto-detect resolve. arrow-fs-s3 only accepts canonical
+  // `s3://`; reject the JVM-only Hadoop aliases here, but only on the
+  // auto-detect path -- a caller using the explicit-FileIO constructor
+  // (handled above) is free to bring their own FileIO that understands
+  // s3a/s3n.
+  if (io_name == FileIORegistry::kArrowS3FileIO &&
+      (path.starts_with("s3a://") || path.starts_with("s3n://"))) {
+    return InvalidArgument(
+        "HadoopTables: arrow-fs-s3 only accepts 's3://' URIs; the path '{}' uses "
+        "a JVM-only Hadoop alias. Use 's3://' or construct HadoopTables with an "
+        "explicit FileIO that supports the alias.",
+        path);
+  }
+
+  // If this is an HDFS path, inject fs.defaultFS from the authority so the
+  // underlying HadoopFileSystem connects to the namenode in the URI rather
+  // than the JVM core-site default. Mirrors HadoopCatalog::Make(name,
+  // config).
   auto configs = config_.configs();  // copy: don't mutate the user's config
   if (!authority.empty()) {
     auto fs_default =

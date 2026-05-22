@@ -381,6 +381,41 @@ TEST_F(LocalFileIOTest, ListDirReturnsEntriesAndFlagsDirectories) {
   EXPECT_TRUE(saw_file);
 }
 
+TEST_F(LocalFileIOTest, ListDirPreservesUriShape) {
+  // Round-12 fix: the URI reconstruction in ListDir must not insert
+  // double slashes for absolute-root inputs and must keep `file://`
+  // intact when the caller hands in a URI-shaped location.
+  const std::string root = CreateTempDirectory();
+  EXPECT_THAT(file_io_->CreateDir(root + "/dir1"), IsOk());
+  EXPECT_THAT(file_io_->WriteFile(root + "/file1", "x"), IsOk());
+
+  // Caller passes a trailing-slash absolute path; entries must not have a
+  // doubled separator.
+  ICEBERG_UNWRAP_OR_FAIL(auto trailing_slash_entries, file_io_->ListDir(root + "/"));
+  ASSERT_EQ(trailing_slash_entries.size(), 2);
+  for (const auto& entry : trailing_slash_entries) {
+    EXPECT_TRUE(entry.location.starts_with(root + "/")) << entry.location;
+    EXPECT_EQ(entry.location.find("//"), std::string::npos)
+        << "ListDir must not emit double slashes: " << entry.location;
+  }
+
+  // Caller passes a `file://`-shaped URI; entries must keep the URI
+  // form (no stripped scheme separator, no missing slash before the path).
+  const std::string uri_root = "file://" + root;
+  ICEBERG_UNWRAP_OR_FAIL(auto uri_entries, file_io_->ListDir(uri_root));
+  ASSERT_EQ(uri_entries.size(), 2);
+  for (const auto& entry : uri_entries) {
+    EXPECT_TRUE(entry.location.starts_with("file://" + root + "/"))
+        << "URI prefix lost: " << entry.location;
+    // No malformed "file:/x" -- "file://" must remain a full scheme prefix.
+    EXPECT_EQ(entry.location.find("file:/x"), std::string::npos)
+        << "scheme separator damaged: " << entry.location;
+    EXPECT_TRUE(entry.location.find("file:///") == 0 ||
+                entry.location.find("file://" + root) == 0)
+        << "URI shape unexpected: " << entry.location;
+  }
+}
+
 TEST_F(LocalFileIOTest, DeleteDirRespectsRecursiveFlag) {
   const std::string root = CreateTempDirectory();
   const std::string non_empty = root + "/has_child";
