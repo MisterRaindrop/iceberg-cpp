@@ -241,17 +241,24 @@ function(resolve_avro_dependency)
 
   fetchcontent_makeavailable(avro-cpp)
 
-  # Avro's CMakeLists fetches fmt 10.2.1, which uses `consteval` on
-  # `basic_format_string`. With newer Apple clang on macOS 26 (Tahoe)
-  # the strict consteval evaluator rejects fmt's own internal
-  # FMT_STRING calls (the "compile_string is not a constant
-  # expression" error spam in `format-inl.h`). Force fmt back onto
-  # the constexpr path on the avro targets that pull it in; we don't
-  # rely on compile-time format-string checking via vendored fmt
-  # anyway -- iceberg core uses std::format.
+  # Avro's CMakeLists fetches fmt 10.2.1, which marks
+  # `basic_format_string`'s ctor as `consteval` via the FMT_CONSTEVAL
+  # macro. With newer Apple clang on macOS 26 (Tahoe) the strict
+  # consteval evaluator rejects fmt's own internal FMT_STRING calls
+  # (the "compile_string is not a constant expression" error spam in
+  # `format-inl.h`). Pre-define `FMT_CONSTEVAL` to empty so fmt's
+  # `#ifndef FMT_CONSTEVAL` guard short-circuits to the else branch:
+  # `FMT_CONSTEVAL` becomes a no-op (consteval keyword is dropped),
+  # `FMT_HAS_CONSTEVAL` is left undefined, and the ctor uses the
+  # runtime `check_format_string` path instead. Iceberg core uses
+  # `std::format` so we lose nothing.
+  #
+  # `-DFMT_CONSTEVAL=` (note the trailing `=` to set an empty value)
+  # has to go through `target_compile_options` because
+  # `target_compile_definitions` strips the trailing `=`.
   foreach(_avro_target IN ITEMS avrocpp avrocpp_s)
     if(TARGET ${_avro_target})
-      target_compile_definitions(${_avro_target} PRIVATE FMT_USE_CONSTEVAL=0)
+      target_compile_options(${_avro_target} PRIVATE "SHELL:-D FMT_CONSTEVAL=")
     endif()
   endforeach()
 
