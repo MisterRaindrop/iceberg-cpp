@@ -59,6 +59,39 @@ TEST(HadoopFileLayoutTest, NamespaceLevelValidation) {
   EXPECT_FALSE(ValidateNamespace(reserved).has_value());
 }
 
+TEST(HadoopFileLayoutTest, NamespaceLevelRejectsPercentEncoding) {
+  // arrow's URI parser percent-decodes path components, so `%2e%2e` would
+  // resolve to `..` and escape the warehouse. Reject the '%' marker
+  // (and any non-printable / non-ASCII byte) at the validator before the
+  // component is joined into a URI.
+  EXPECT_FALSE(ValidateNamespaceLevel("%2e%2e").has_value());
+  EXPECT_FALSE(ValidateNamespaceLevel("%2E%2E").has_value());
+  EXPECT_FALSE(ValidateNamespaceLevel("a%2fb").has_value());  // %2f -> '/'
+  EXPECT_FALSE(ValidateNamespaceLevel("plain%name").has_value());
+  // Non-printable / non-ASCII rejected too.
+  std::string with_nul{"abc\0def", 7};
+  EXPECT_FALSE(ValidateNamespaceLevel(with_nul).has_value());
+  EXPECT_FALSE(ValidateNamespaceLevel("back\\slash").has_value());
+
+  TableIdentifier pct{.ns = Namespace{.levels = {"db"}}, .name = "%2e"};
+  EXPECT_FALSE(ValidateTableIdentifier(pct).has_value());
+}
+
+TEST(HadoopFileLayoutTest, IsPathInsideRejectsSiblings) {
+  // Component-aware descendant check: `/wh/db/stats_backup` is a SIBLING
+  // of `/wh/db/stats`, not a child. A naive starts_with() check used to
+  // misclassify it; IsPathInside must require a `/` boundary.
+  EXPECT_TRUE(IsPathInside("file:///wh/db/stats", "file:///wh/db/stats"));
+  EXPECT_TRUE(IsPathInside("file:///wh/db/stats/", "file:///wh/db/stats"));
+  EXPECT_TRUE(IsPathInside("file:///wh/db/stats/x.puffin", "file:///wh/db/stats"));
+  EXPECT_TRUE(IsPathInside("file:///wh/db/stats/x.puffin", "file:///wh/db/stats/"));
+  // Siblings sharing a prefix must NOT be classified as descendants.
+  EXPECT_FALSE(IsPathInside("file:///wh/db/stats_backup", "file:///wh/db/stats"));
+  EXPECT_FALSE(
+      IsPathInside("file:///wh/db/stats_backup/x.puffin", "file:///wh/db/stats"));
+  EXPECT_FALSE(IsPathInside("file:///other", "file:///wh/db/stats"));
+}
+
 TEST(HadoopFileLayoutTest, NamespaceLevelRejectsTraversalAliases) {
   // POSIX path components "." and ".." would let a caller resolve to the
   // parent namespace dir or escape the warehouse entirely. Reject them

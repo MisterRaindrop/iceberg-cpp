@@ -156,6 +156,22 @@ ICEBERG_HADOOP_EXPORT Result<MetadataFileRef> ParseMetadataFileName(
 ICEBERG_HADOOP_EXPORT Result<bool> IsHadoopTableDir(FileIO& file_io,
                                                     std::string_view dir_location);
 
+/// \brief True iff `path` is either equal to `parent_dir` or a strict
+/// descendant of it (i.e. `parent_dir` followed by `/` then a non-empty
+/// remainder). Both inputs are slash-stripped on the right before the
+/// comparison so trailing slashes do not change the result.
+///
+/// CRITICAL: this is a COMPONENT-AWARE descendant test. A naive
+/// `path.starts_with(parent_dir)` would say
+/// `/wh/db/stats_backup` is under `/wh/db/stats`, which is wrong --
+/// allowing such siblings to slip past a "path is inside the table dir"
+/// guard would let `DropTable(purge=true)` silently leave externally
+/// referenced files behind. Use this helper anywhere the catalog needs
+/// to assert that an externally-supplied path stays within the table
+/// (or warehouse) it claims.
+ICEBERG_HADOOP_EXPORT bool IsPathInside(std::string_view path,
+                                        std::string_view parent_dir);
+
 /// \brief True iff `dir_location` exists as a directory and contains a child
 /// entry whose leaf name is not in `{"metadata", "data"}`.
 ///

@@ -103,6 +103,43 @@ bool IsReservedComponent(std::string_view component) {
 
 }  // namespace
 
+namespace {
+
+// Identifier components are joined raw into a URI and later decoded by
+// arrow's URI parser. A `%` in the component would be parsed as the start
+// of a percent-encoded sequence -- e.g. `%2e%2e` decodes to `..` and
+// escapes the warehouse. We do not need percent-encoding for catalog
+// identifiers (Iceberg does not), so reject the marker outright. While
+// here also reject `\\` (Windows separator) and any non-printable byte;
+// they have no legitimate use in identifiers and would only show up in
+// constructed bypasses.
+Status RejectUnsafeIdentifierChars(std::string_view component, std::string_view kind) {
+  for (unsigned char c : component) {
+    if (c < 0x20 || c > 0x7e) {
+      return InvalidArgument(
+          "{} '{}' contains a non-printable or non-ASCII byte (0x{:02x}); "
+          "only printable ASCII is allowed.",
+          kind, component, static_cast<int>(c));
+    }
+    if (c == '%') {
+      return InvalidArgument(
+          "{} '{}' contains '%' which is the URI percent-encoding marker "
+          "and could be decoded into path-traversal sequences "
+          "(e.g. %2e%2e -> '..'); reject up front.",
+          kind, component);
+    }
+    if (c == '\\') {
+      return InvalidArgument(
+          "{} '{}' contains '\\' which is the Windows path separator; "
+          "use '/' (forbidden separately) or rename.",
+          kind, component);
+    }
+  }
+  return {};
+}
+
+}  // namespace
+
 Status ValidateNamespaceLevel(std::string_view level) {
   if (level.empty()) {
     return InvalidArgument("Namespace level must not be empty.");
@@ -120,6 +157,7 @@ Status ValidateNamespaceLevel(std::string_view level) {
         "allowed in HadoopCatalog identifiers.",
         level);
   }
+  ICEBERG_RETURN_UNEXPECTED(RejectUnsafeIdentifierChars(level, "Namespace level"));
   if (IsReservedComponent(level)) {
     return InvalidArgument(
         "Namespace level '{}' is reserved by the HadoopCatalog on-disk layout "
@@ -149,6 +187,7 @@ Status ValidateTableIdentifier(const TableIdentifier& identifier) {
         "allowed in HadoopCatalog identifiers.",
         identifier.name);
   }
+  ICEBERG_RETURN_UNEXPECTED(RejectUnsafeIdentifierChars(identifier.name, "Table name"));
   if (IsReservedComponent(identifier.name)) {
     return InvalidArgument(
         "Table name '{}' is reserved by the HadoopCatalog on-disk layout "
@@ -216,6 +255,25 @@ std::string VersionHintPath(std::string_view table_dir) {
 
 std::string LockFilePath(std::string_view table_dir) {
   return JoinUnderRoot(MetadataDir(table_dir), "_lock");
+}
+
+bool IsPathInside(std::string_view path, std::string_view parent_dir) {
+  const std::string_view stripped_path = LocationUtil::StripTrailingSlash(path);
+  const std::string_view stripped_parent = LocationUtil::StripTrailingSlash(parent_dir);
+  if (stripped_path.size() < stripped_parent.size()) {
+    return false;
+  }
+  if (!stripped_path.starts_with(stripped_parent)) {
+    return false;
+  }
+  if (stripped_path.size() == stripped_parent.size()) {
+    return true;  // exact match counts as "inside"
+  }
+  // Must be a true path boundary: the next character after parent_dir
+  // has to be a separator. `/wh/db/stats_backup` shares the prefix
+  // `/wh/db/stats` but the byte after the prefix is `_`, not `/`, so it
+  // is a sibling, not a descendant.
+  return stripped_path[stripped_parent.size()] == '/';
 }
 
 Result<bool> HasNonTableInternalChildren(FileIO& file_io, std::string_view dir_location) {

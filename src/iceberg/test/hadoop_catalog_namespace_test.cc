@@ -304,6 +304,115 @@ TEST_F(HadoopCatalogNamespaceTest, DropTablePurgeTrueRefusesSnapshottedTable) {
   EXPECT_TRUE(*still_table);
 }
 
+TEST_F(HadoopCatalogNamespaceTest, FileLockCreateDropCreateRoundTrip) {
+  // Regression for the case where DropTable recursively deletes the table
+  // dir while still holding the lock (which lives at
+  // <table>/metadata/_lock). The RAII guard's Release() used to fail
+  // because the lock file is gone, leaving stale local state that
+  // collided with the next Acquire at the same path -- the next
+  // CreateTable then failed with InvalidArgument. Release() now handles
+  // the missing-file case gracefully so create -> drop -> create
+  // succeeds end-to-end.
+  auto props = HadoopCatalogProperties::FromMap({
+      {"warehouse", warehouse_},
+      {"name", "file_lock_drop"},
+      {"lock-impl", "file"},
+      {"lock.acquire-timeout-ms", "1000"},
+  });
+  ICEBERG_UNWRAP_OR_FAIL(
+      auto file_lock_catalog,
+      HadoopCatalog::Make("file_lock_drop", file_io_, std::move(props)));
+  ASSERT_TRUE(
+      file_lock_catalog->CreateNamespace(Namespace{.levels = {"db"}}, {}).has_value());
+  TableIdentifier id{.ns = Namespace{.levels = {"db"}}, .name = "evts"};
+  auto schema = std::make_shared<Schema>(
+      std::vector<SchemaField>{SchemaField::MakeRequired(1, "id", int64())});
+  ASSERT_TRUE(file_lock_catalog
+                  ->CreateTable(id, schema, PartitionSpec::Unpartitioned(),
+                                SortOrder::Unsorted(), "", {})
+                  .has_value());
+  ASSERT_TRUE(file_lock_catalog->DropTable(id, /*purge=*/true).has_value());
+
+  // The second create must NOT fail with "unreleased local heartbeat state".
+  ASSERT_TRUE(file_lock_catalog
+                  ->CreateTable(id, schema, PartitionSpec::Unpartitioned(),
+                                SortOrder::Unsorted(), "", {})
+                  .has_value())
+      << "post-drop CreateTable must succeed under lock-impl=file";
+}
+
+TEST_F(HadoopCatalogNamespaceTest, UpdateTableAccumulatesMetadataLog) {
+  // The non-create UpdateTable path must call SetPreviousMetadataLocation
+  // on the builder so the produced metadata's `metadata_log` records the
+  // previous version. Without it, the on-disk byte parity with Java that
+  // mkdocs/docs/catalogs/hadoop.md advertises is broken.
+  ASSERT_TRUE(catalog_->CreateNamespace(Namespace{.levels = {"db"}}, {}).has_value());
+  TableIdentifier id{.ns = Namespace{.levels = {"db"}}, .name = "log_evts"};
+  auto schema = std::make_shared<Schema>(
+      std::vector<SchemaField>{SchemaField::MakeRequired(1, "id", int64())});
+  ICEBERG_UNWRAP_OR_FAIL(auto created,
+                         catalog_->CreateTable(id, schema, PartitionSpec::Unpartitioned(),
+                                               SortOrder::Unsorted(), "", {}));
+  const std::string v1_location(created->metadata_file_location());
+
+  // Force a non-create commit by adding a property.
+  std::vector<std::unique_ptr<TableRequirement>> reqs;
+  reqs.push_back(std::make_unique<table::AssertUUID>(created->metadata()->table_uuid));
+  std::vector<std::unique_ptr<TableUpdate>> updates;
+  updates.push_back(std::make_unique<table::SetProperties>(
+      std::unordered_map<std::string, std::string>{{"key", "value"}}));
+  ICEBERG_UNWRAP_OR_FAIL(auto updated, catalog_->UpdateTable(id, reqs, updates));
+
+  // The newly published metadata must contain a metadata_log entry
+  // pointing at v1.
+  ASSERT_FALSE(updated->metadata()->metadata_log.empty())
+      << "post-commit metadata_log must record the previous version";
+  EXPECT_EQ(updated->metadata()->metadata_log.back().metadata_file, v1_location);
+}
+
+TEST_F(HadoopCatalogNamespaceTest, DropTablePurgeIgnoresSiblingPrefix) {
+  // Component-aware descendant check: a statistics path at a sibling
+  // directory (e.g. `<table>_backup/...`) must NOT be classified as
+  // inside the table dir. Otherwise DropTable(purge=true) would happily
+  // recursive-delete the table and leave the sibling's data behind.
+  ASSERT_TRUE(catalog_->CreateNamespace(Namespace{.levels = {"db"}}, {}).has_value());
+  TableIdentifier table{.ns = Namespace{.levels = {"db"}}, .name = "stats"};
+  auto schema = std::make_shared<Schema>(
+      std::vector<SchemaField>{SchemaField::MakeRequired(1, "id", int64())});
+  ICEBERG_UNWRAP_OR_FAIL(
+      auto created, catalog_->CreateTable(table, schema, PartitionSpec::Unpartitioned(),
+                                          SortOrder::Unsorted(), "", {}));
+
+  // Inject a statistics entry whose path shares a prefix with the table
+  // dir but lives in a sibling (e.g. `<warehouse>/db/stats_backup/...`).
+  ICEBERG_UNWRAP_OR_FAIL(auto table_dir, hadoop::TableDir(warehouse_, table));
+  const std::string sibling_path = table_dir + "_backup/x.puffin";
+  const std::string metadata_path(created->metadata_file_location());
+  ICEBERG_UNWRAP_OR_FAIL(auto body, file_io_->ReadFile(metadata_path, std::nullopt));
+  const std::string empty_stats_compact = "\"statistics\":[]";
+  const std::string empty_stats_spaced = "\"statistics\": []";
+  auto pos = body.find(empty_stats_compact);
+  size_t replaced_len = empty_stats_compact.size();
+  if (pos == std::string::npos) {
+    pos = body.find(empty_stats_spaced);
+    replaced_len = empty_stats_spaced.size();
+  }
+  ASSERT_NE(pos, std::string::npos);
+  const std::string seeded = std::format(
+      "\"statistics\":[{{\"snapshot-id\":1,\"statistics-path\":\"{}\","
+      "\"file-size-in-bytes\":1,\"file-footer-size-in-bytes\":1,"
+      "\"blob-metadata\":[]}}]",
+      sibling_path);
+  const std::string mutated =
+      body.substr(0, pos) + seeded + body.substr(pos + replaced_len);
+  ASSERT_TRUE(file_io_->DeleteFile(metadata_path).has_value());
+  ASSERT_TRUE(file_io_->WriteFile(metadata_path, mutated).has_value());
+
+  auto drop = catalog_->DropTable(table, /*purge=*/true);
+  ASSERT_FALSE(drop.has_value());
+  EXPECT_EQ(ErrorKind::kNotSupported, drop.error().kind);
+}
+
 TEST_F(HadoopCatalogNamespaceTest, DropTablePurgeTrueRefusesExternalStatistics) {
   // Snapshot-less tables can still reference external `.puffin` paths via
   // UpdateStatistics, so DropTable(purge=true) must inspect statistics too,

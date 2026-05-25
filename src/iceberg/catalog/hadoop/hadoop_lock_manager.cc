@@ -393,8 +393,38 @@ Status FileLockManager::Release(const std::string& entity_id,
   // else could steal it. By reading + decoding the body before touching
   // states_ / heartbeat, an unauthorised Release leaves the holder's
   // bookkeeping intact.
-  ICEBERG_ASSIGN_OR_RAISE(auto body, file_io_->ReadFile(lock_path, std::nullopt));
-  ICEBERG_ASSIGN_OR_RAISE(auto decoded, DecodeLockBody(body));
+  //
+  // Special case: the on-disk lock may have been deleted out from under
+  // us (e.g. HadoopCatalog::DropTable recursively deletes the table dir,
+  // which contains <table>/metadata/_lock, with the lock still held;
+  // operator cleanup of a stale lock; an external reaper). If we cannot
+  // read the file because it's gone, the lock is effectively released --
+  // we MUST still clear our local heartbeat state and stop the heartbeat
+  // thread, otherwise the next Acquire at this entity_id would collide
+  // with the leftover states_ entry and refuse to publish a new lock.
+  auto body = file_io_->ReadFile(lock_path, std::nullopt);
+  if (!body.has_value()) {
+    auto still_there = file_io_->Exists(lock_path);
+    if (still_there.has_value() && !*still_there) {
+      // Lock file already gone. Drop local bookkeeping and return success
+      // so this Release is idempotent against external deletion.
+      std::unique_ptr<HeartbeatState> state;
+      {
+        std::lock_guard lk(states_mutex_);
+        auto it = states_.find(entity_id);
+        if (it != states_.end()) {
+          state = std::move(it->second);
+          states_.erase(it);
+        }
+      }
+      if (state != nullptr) {
+        StopHeartbeat(std::move(state));
+      }
+      return {};
+    }
+    return std::unexpected<Error>(body.error());
+  }
+  ICEBERG_ASSIGN_OR_RAISE(auto decoded, DecodeLockBody(*body));
   if (decoded.owner != owner_id) {
     return NotAllowed("FileLockManager: '{}' is held by '{}', not by '{}'.", lock_path,
                       decoded.owner, owner_id);

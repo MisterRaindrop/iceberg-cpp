@@ -351,12 +351,12 @@ Status HadoopTables::DropTable(const std::string& path, bool purge) {
         "enumerated).",
         path, metadata->snapshots.size());
   }
-  // Snapshot-less tables can still carry external statistics references
-  // (UpdateStatistics doesn't require a snapshot). Refuse if any stat path
-  // lies outside the table directory.
-  const std::string_view dir_view = LocationUtil::StripTrailingSlash(path);
-  auto is_external = [&dir_view](std::string_view p) {
-    return !LocationUtil::StripTrailingSlash(p).starts_with(dir_view);
+  // Snapshot-less tables can still carry external statistics or
+  // metadata-log references. Use the component-aware descendant check
+  // so a sibling directory like `/wh/db/stats_backup` is NOT classified
+  // as a child of `/wh/db/stats`.
+  auto is_external = [&path](std::string_view p) {
+    return !hadoop::IsPathInside(p, path);
   };
   for (const auto& stat : metadata->statistics) {
     if (stat && is_external(stat->path)) {
@@ -372,6 +372,14 @@ Status HadoopTables::DropTable(const std::string& path, bool purge) {
           "HadoopTables::DropTable(purge=true) on '{}' refused: partition "
           "statistics file '{}' lies outside the table directory.",
           path, stat->path);
+    }
+  }
+  for (const auto& entry : metadata->metadata_log) {
+    if (is_external(entry.metadata_file)) {
+      return NotSupported(
+          "HadoopTables::DropTable(purge=true) on '{}' refused: metadata-log "
+          "entry '{}' lies outside the table directory.",
+          path, entry.metadata_file);
     }
   }
   return io->DeleteDir(path, /*recursive=*/true);
@@ -446,6 +454,35 @@ Result<std::shared_ptr<Table>> HadoopTables::RegisterTable(
         "HadoopTables::RegisterTable: source metadata location '{}' must match "
         "the registration path '{}'.",
         metadata->location, path);
+  }
+  // External file references (statistics / partition_statistics /
+  // metadata_log) must also stay under the table dir. Otherwise
+  // DropTable(purge=true) on this path could not honour the purge
+  // contract: refuse the registration up front instead of producing a
+  // table that cannot be safely deleted.
+  for (const auto& stat : metadata->statistics) {
+    if (stat && !hadoop::IsPathInside(stat->path, path)) {
+      return InvalidArgument(
+          "HadoopTables::RegisterTable: statistics file '{}' lies outside the "
+          "registration path '{}'.",
+          stat->path, path);
+    }
+  }
+  for (const auto& stat : metadata->partition_statistics) {
+    if (stat && !hadoop::IsPathInside(stat->path, path)) {
+      return InvalidArgument(
+          "HadoopTables::RegisterTable: partition statistics file '{}' lies "
+          "outside the registration path '{}'.",
+          stat->path, path);
+    }
+  }
+  for (const auto& entry : metadata->metadata_log) {
+    if (!hadoop::IsPathInside(entry.metadata_file, path)) {
+      return InvalidArgument(
+          "HadoopTables::RegisterTable: metadata-log entry '{}' lies outside "
+          "the registration path '{}'.",
+          entry.metadata_file, path);
+    }
   }
 
   std::string target;

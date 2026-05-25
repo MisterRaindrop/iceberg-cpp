@@ -716,6 +716,14 @@ Result<std::shared_ptr<Table>> HadoopCatalog::UpdateTable(
     ops.emplace(file_io_, table_dir, lock_manager_, std::move(owner_id));
     ICEBERG_ASSIGN_OR_RAISE(base, ops->Refresh());
     builder = TableMetadataBuilder::BuildFrom(base.get());
+    // Tell the builder where the current metadata lives so its Build() can
+    // append the corresponding MetadataLogEntry to the new metadata's
+    // `metadata_log`. Without this, every Update commit overwrites the
+    // history pointer and external readers see no metadata-log trail,
+    // breaking the on-disk byte-for-byte parity HadoopCatalog claims with
+    // Java. (The is_create path above starts from BuildFromEmpty so there
+    // is no previous location to set; the v1 publish has metadata_log = [].)
+    builder->SetPreviousMetadataLocation(ops->current_metadata_location());
   }
 
   for (const auto& requirement : requirements) {
@@ -825,11 +833,12 @@ Status HadoopCatalog::DropTable(const TableIdentifier& identifier, bool purge) {
   }
   // Iceberg's UpdateStatistics API does not require a snapshot to exist
   // and accepts arbitrary paths, so a snapshot-less table can still
-  // reference external `.puffin` / partition-statistics files. Refuse if
-  // any statistic path lies outside table_dir.
-  const std::string_view dir_view = LocationUtil::StripTrailingSlash(table_dir);
-  auto is_external = [&dir_view](std::string_view path) {
-    return !LocationUtil::StripTrailingSlash(path).starts_with(dir_view);
+  // reference external `.puffin` / partition-statistics / metadata-log
+  // files. Refuse if any such path is not a descendant of table_dir.
+  // Use the component-aware hadoop::IsPathInside so that a sibling like
+  // `/wh/db/stats_backup` cannot pass as inside `/wh/db/stats`.
+  auto is_external = [&table_dir](std::string_view path) {
+    return !hadoop::IsPathInside(path, table_dir);
   };
   for (const auto& stat : metadata->statistics) {
     if (stat && is_external(stat->path)) {
@@ -849,9 +858,21 @@ Status HadoopCatalog::DropTable(const TableIdentifier& identifier, bool purge) {
           identifier.ToString(), stat->path, table_dir);
     }
   }
-  // No snapshots and no external statistic references: every file we could
-  // be responsible for is under table_dir, so a recursive delete is a
-  // complete purge.
+  // metadata_log entries are historical metadata-file pointers. A registered
+  // table could carry pointers outside table_dir (RegisterTable validates
+  // them too, but a stale registration or external mutation could land an
+  // outside reference). Refuse purge so we don't silently leave them behind.
+  for (const auto& entry : metadata->metadata_log) {
+    if (is_external(entry.metadata_file)) {
+      return NotSupported(
+          "HadoopCatalog::DropTable(purge=true) on '{}' refused: metadata-log "
+          "entry '{}' lies outside the table directory '{}'.",
+          identifier.ToString(), entry.metadata_file, table_dir);
+    }
+  }
+  // No snapshots and no external statistic / metadata-log references:
+  // every file we could be responsible for is under table_dir, so a
+  // recursive delete is a complete purge.
   return file_io_->DeleteDir(table_dir, /*recursive=*/true);
 }
 
@@ -939,6 +960,36 @@ Result<std::shared_ptr<Table>> HadoopCatalog::RegisterTable(
       metadata->properties.configs(), "HadoopCatalog::RegisterTable"));
   ICEBERG_RETURN_UNEXPECTED(RejectCustomLocation(table_dir, metadata->location,
                                                  "HadoopCatalog::RegisterTable"));
+  // statistics / partition_statistics / metadata_log entries are external
+  // file references that DropTable(purge=true) would have to clean up. We
+  // can't, without a manifest walker, reach files outside table_dir on
+  // drop -- so refuse the registration up front if any such reference
+  // points outside, instead of silently producing a table that purge
+  // cannot honour.
+  for (const auto& stat : metadata->statistics) {
+    if (stat && !hadoop::IsPathInside(stat->path, table_dir)) {
+      return InvalidArgument(
+          "HadoopCatalog::RegisterTable: statistics file '{}' is outside the "
+          "table dir '{}'; DropTable(purge=true) could not clean it.",
+          stat->path, table_dir);
+    }
+  }
+  for (const auto& stat : metadata->partition_statistics) {
+    if (stat && !hadoop::IsPathInside(stat->path, table_dir)) {
+      return InvalidArgument(
+          "HadoopCatalog::RegisterTable: partition statistics file '{}' is "
+          "outside the table dir '{}'.",
+          stat->path, table_dir);
+    }
+  }
+  for (const auto& entry : metadata->metadata_log) {
+    if (!hadoop::IsPathInside(entry.metadata_file, table_dir)) {
+      return InvalidArgument(
+          "HadoopCatalog::RegisterTable: metadata-log entry '{}' is outside "
+          "the table dir '{}'; DropTable(purge=true) could not clean it.",
+          entry.metadata_file, table_dir);
+    }
+  }
 
   // Publish via the same lock + UUID-temp + atomic-rename path as CreateTable
   // so concurrent register/create attempts cannot overwrite each other.
