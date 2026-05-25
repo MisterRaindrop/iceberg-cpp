@@ -301,10 +301,12 @@ Status HadoopTables::DropTable(const std::string& path, bool purge) {
     return NoSuchTable("Table '{}' does not exist.", path);
   }
   if (!purge) {
-    // Mirror Catalog::DropTable's contract (see HadoopCatalog::DropTable):
-    // purge=false unregisters the table from the catalog without removing
-    // user data. We delete only the catalog-owned `metadata/` subtree.
-    return io->DeleteDir(hadoop::MetadataDir(path), /*recursive=*/true);
+    // Same rationale as HadoopCatalog::DropTable: leaving the data/ subtree
+    // behind would expose it as a namespace on the next list/create.
+    return NotSupported(
+        "HadoopTables::DropTable(purge=false) is not supported: the table "
+        "directory IS the catalog entry; preserving data would create a "
+        "namespace-shaped orphan. Use purge=true or relocate data first.");
   }
   // purge=true: recursive delete handles the default LocationProvider;
   // tables with custom data paths need expire_snapshots first.

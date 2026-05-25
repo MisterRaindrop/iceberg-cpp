@@ -45,11 +45,18 @@ TEST(HadoopFileLayoutTest, NamespaceLevelValidation) {
   EXPECT_TRUE(ValidateNamespaceLevel("namespaces-with-dashes").has_value());
   EXPECT_FALSE(ValidateNamespaceLevel("").has_value());
   EXPECT_FALSE(ValidateNamespaceLevel("has/slash").has_value());
+  // Reserved by the on-disk layout: a namespace named `metadata` or `data`
+  // would let later CreateTable calls bury an existing nested table by
+  // having `metadata/` happen to be a real namespace.
+  EXPECT_FALSE(ValidateNamespaceLevel("metadata").has_value());
+  EXPECT_FALSE(ValidateNamespaceLevel("data").has_value());
 
   Namespace ok{.levels = {"a", "b", "c"}};
   EXPECT_TRUE(ValidateNamespace(ok).has_value());
   Namespace bad{.levels = {"a", "b/c"}};
   EXPECT_FALSE(ValidateNamespace(bad).has_value());
+  Namespace reserved{.levels = {"a", "metadata"}};
+  EXPECT_FALSE(ValidateNamespace(reserved).has_value());
 }
 
 TEST(HadoopFileLayoutTest, TableIdentifierValidation) {
@@ -61,6 +68,17 @@ TEST(HadoopFileLayoutTest, TableIdentifierValidation) {
 
   TableIdentifier slash{.ns = Namespace{.levels = {"db"}}, .name = "a/b"};
   EXPECT_FALSE(ValidateTableIdentifier(slash).has_value());
+
+  // Reserved names: a table called `metadata` or `data` would collide with
+  // the table-internal subdirectory layout.
+  TableIdentifier reserved_name{.ns = Namespace{.levels = {"db"}}, .name = "metadata"};
+  EXPECT_FALSE(ValidateTableIdentifier(reserved_name).has_value());
+  TableIdentifier reserved_data{.ns = Namespace{.levels = {"db"}}, .name = "data"};
+  EXPECT_FALSE(ValidateTableIdentifier(reserved_data).has_value());
+  // Reserved namespace level also fails even when the leaf table name is ok.
+  TableIdentifier reserved_ns{.ns = Namespace{.levels = {"db", "metadata"}},
+                              .name = "events"};
+  EXPECT_FALSE(ValidateTableIdentifier(reserved_ns).has_value());
 }
 
 TEST(HadoopFileLayoutTest, NamespaceDirJoinsLevels) {

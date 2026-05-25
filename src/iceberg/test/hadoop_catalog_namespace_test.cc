@@ -249,11 +249,11 @@ TEST_F(HadoopCatalogNamespaceTest, ListTablesFiltersToTableShapedDirs) {
   EXPECT_FALSE(*missing);
 }
 
-TEST_F(HadoopCatalogNamespaceTest, DropTablePurgeFalsePreservesData) {
-  // Catalog::DropTable contract: only purge=true is allowed to remove data
-  // files. With purge=false, HadoopCatalog must merely unregister the table
-  // (delete catalog-managed metadata) and leave any data files in place so
-  // operators can recover them via RegisterTable later.
+TEST_F(HadoopCatalogNamespaceTest, DropTablePurgeFalseIsNotSupported) {
+  // HadoopCatalog cannot honour Catalog::DropTable(purge=false) without
+  // turning the leftover data/ subtree into a namespace-shaped orphan that
+  // a subsequent CreateTable would silently adopt. Surfacing
+  // kNotSupported is the only safe choice for the lightweight layout.
   ASSERT_TRUE(catalog_->CreateNamespace(Namespace{.levels = {"db"}}, {}).has_value());
   TableIdentifier table{.ns = Namespace{.levels = {"db"}}, .name = "events"};
   auto schema = std::make_shared<Schema>(
@@ -263,25 +263,14 @@ TEST_F(HadoopCatalogNamespaceTest, DropTablePurgeFalsePreservesData) {
                                 SortOrder::Unsorted(), "", {})
                   .has_value());
 
-  // Seed a synthetic data file so we can prove it survives DropTable(purge=false).
-  ICEBERG_UNWRAP_OR_FAIL(auto table_dir, hadoop::TableDir(warehouse_, table));
-  const std::string data_path = hadoop::DataDir(table_dir) + "/sample.parquet";
-  ASSERT_TRUE(file_io_->CreateDir(hadoop::DataDir(table_dir)).has_value());
-  ASSERT_TRUE(file_io_->WriteFile(data_path, "dummy").has_value());
+  auto res = catalog_->DropTable(table, /*purge=*/false);
+  ASSERT_FALSE(res.has_value());
+  EXPECT_EQ(ErrorKind::kNotSupported, res.error().kind);
 
-  EXPECT_TRUE(catalog_->DropTable(table, /*purge=*/false).has_value());
-
-  // Table is unregistered (TableExists is false), but the data file remains.
-  auto exists_after = catalog_->TableExists(table);
-  ASSERT_TRUE(exists_after.has_value());
-  EXPECT_FALSE(*exists_after);
-  ICEBERG_UNWRAP_OR_FAIL(auto data_exists, file_io_->Exists(data_path));
-  EXPECT_TRUE(data_exists) << "purge=false must not delete data files";
-
-  // Idempotency: second drop returns kNoSuchTable.
-  auto again = catalog_->DropTable(table, /*purge=*/false);
-  ASSERT_FALSE(again.has_value());
-  EXPECT_EQ(ErrorKind::kNoSuchTable, again.error().kind);
+  // Table is still intact after the refusal.
+  auto still_there = catalog_->TableExists(table);
+  ASSERT_TRUE(still_there.has_value());
+  EXPECT_TRUE(*still_there);
 }
 
 TEST_F(HadoopCatalogNamespaceTest, DropTablePurgeTrueRemovesData) {

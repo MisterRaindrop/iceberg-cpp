@@ -19,8 +19,10 @@
 
 #include "iceberg/catalog/hadoop/hadoop_file_layout.h"
 
+#include <array>
 #include <format>
 #include <string>
+#include <string_view>
 
 #include "iceberg/util/location_util.h"
 #include "iceberg/util/macros.h"
@@ -80,12 +82,39 @@ std::string_view MetadataCompressionCodecName(MetadataCompressionCodec codec) {
   return "none";
 }
 
+namespace {
+
+// Names reserved by the HadoopCatalog on-disk layout. Allowing a namespace
+// level or table name to collide with one of these would let a caller bury
+// existing tables: e.g. CreateNamespace(db.team.metadata) + CreateTable
+// nested under it makes the catalog point at the wrong directory the moment
+// someone calls CreateTable(db.team) (whose `metadata/` subdir would happen
+// to be the existing namespace).
+constexpr std::array<std::string_view, 2> kReservedComponentNames = {"metadata", "data"};
+
+bool IsReservedComponent(std::string_view component) {
+  for (const auto& reserved : kReservedComponentNames) {
+    if (component == reserved) {
+      return true;
+    }
+  }
+  return false;
+}
+
+}  // namespace
+
 Status ValidateNamespaceLevel(std::string_view level) {
   if (level.empty()) {
     return InvalidArgument("Namespace level must not be empty.");
   }
   if (level.find('/') != std::string_view::npos) {
     return InvalidArgument("Namespace level '{}' must not contain '/'.", level);
+  }
+  if (IsReservedComponent(level)) {
+    return InvalidArgument(
+        "Namespace level '{}' is reserved by the HadoopCatalog on-disk layout "
+        "(table-internal subdirectory name); choose a different name.",
+        level);
   }
   return {};
 }
@@ -101,6 +130,12 @@ Status ValidateTableIdentifier(const TableIdentifier& identifier) {
   ICEBERG_RETURN_UNEXPECTED(identifier.Validate());
   if (identifier.name.find('/') != std::string::npos) {
     return InvalidArgument("Table name '{}' must not contain '/'.", identifier.name);
+  }
+  if (IsReservedComponent(identifier.name)) {
+    return InvalidArgument(
+        "Table name '{}' is reserved by the HadoopCatalog on-disk layout "
+        "(table-internal subdirectory name); choose a different name.",
+        identifier.name);
   }
   return ValidateNamespace(identifier.ns);
 }

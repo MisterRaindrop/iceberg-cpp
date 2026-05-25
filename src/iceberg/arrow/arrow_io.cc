@@ -681,8 +681,43 @@ Status ArrowFileSystemFileIO::DeleteDir(const std::string& dir_location, bool re
     ICEBERG_ARROW_RETURN_NOT_OK(arrow_fs_->DeleteDir(path));
     return {};
   }
-  // Non-recursive: refuse if any children exist. arrow has no rmdir-like
-  // primitive that rejects non-empty dirs, so list first and bail out.
+  // Non-recursive: the FileIO contract requires rmdir semantics -- fail if
+  // the directory is non-empty. On LocalFileSystem we route directly to
+  // std::filesystem::remove (which is POSIX rmdir(2)) so the empty-check
+  // and the delete are a single atomic syscall. A "list, then recursive
+  // delete" emulation here would be TOCTOU-racy: a concurrent CreateTable
+  // can populate the directory after the empty check passes but before the
+  // recursive delete runs, and the second writer's data would be silently
+  // wiped. THIS IS THE ONLY BACKEND WHERE DeleteDir(recursive=false) HAS
+  // TRUE rmdir SEMANTICS.
+  if (dynamic_cast<::arrow::fs::LocalFileSystem*>(arrow_fs_.get()) != nullptr) {
+    std::error_code ec;
+    const bool removed = std::filesystem::remove(path, ec);
+    if (ec == std::errc::directory_not_empty) {
+      return NotAllowed("DeleteDir(non-recursive) refused: '{}' is not empty.",
+                        dir_location);
+    }
+    if (ec == std::errc::no_such_file_or_directory) {
+      // arrow's DeleteDir on a missing path returns an error; mirror that.
+      return IOError("DeleteDir(non-recursive): '{}' does not exist.", dir_location);
+    }
+    if (ec) {
+      return IOError("DeleteDir(non-recursive, remove '{}') failed: {}", dir_location,
+                     ec.message());
+    }
+    if (!removed) {
+      // remove returned false without an error -- treat as "path did not
+      // exist" for consistency with the LocalFileSystem branch above.
+      return IOError("DeleteDir(non-recursive): '{}' does not exist.", dir_location);
+    }
+    return {};
+  }
+  // Non-local backends: arrow has no rmdir-like primitive that rejects
+  // non-empty dirs, so we fall back to a list + DeleteDir(recursive=true)
+  // emulation. THIS IS BEST-EFFORT: between the empty check and the delete,
+  // a concurrent writer can populate the directory and lose data. Callers
+  // that need atomic empty-dir delete on HDFS/S3 must layer their own
+  // coordination.
   ::arrow::fs::FileSelector selector;
   selector.base_dir = path;
   selector.recursive = false;

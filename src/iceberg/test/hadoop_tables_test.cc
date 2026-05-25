@@ -80,7 +80,7 @@ TEST_F(HadoopTablesTest, CreateLoadDropRoundTrip) {
   ASSERT_FALSE(again.has_value());
   EXPECT_EQ(ErrorKind::kAlreadyExists, again.error().kind);
 
-  ASSERT_TRUE(tables_->DropTable(path, /*purge=*/false).has_value());
+  ASSERT_TRUE(tables_->DropTable(path, /*purge=*/true).has_value());
   auto exists_after = tables_->Exists(path);
   ASSERT_TRUE(exists_after.has_value());
   EXPECT_FALSE(*exists_after);
@@ -112,14 +112,16 @@ TEST_F(HadoopTablesTest, LoadMissingTableReturnsNoSuchTable) {
 }
 
 TEST_F(HadoopTablesTest, DropMissingTableReturnsNoSuchTable) {
+  // is_table check fires before the purge gate, so even with purge=false a
+  // missing-path call surfaces kNoSuchTable.
   auto res = tables_->DropTable(root_ + "/nope", /*purge=*/false);
   ASSERT_FALSE(res.has_value());
   EXPECT_EQ(ErrorKind::kNoSuchTable, res.error().kind);
 }
 
-TEST_F(HadoopTablesTest, DropTablePurgeFalsePreservesData) {
-  // Catalog::DropTable contract: purge=false must keep data files. The
-  // HadoopTables free-standing API mirrors HadoopCatalog's semantics here.
+TEST_F(HadoopTablesTest, DropTablePurgeFalseIsNotSupported) {
+  // Same rationale as HadoopCatalog::DropTablePurgeFalseIsNotSupported:
+  // leaving the data/ tree behind exposes a namespace-shaped orphan.
   const std::string path = root_ + "/preserve";
   auto schema = std::make_shared<Schema>(
       std::vector<SchemaField>{SchemaField::MakeRequired(1, "id", int64())});
@@ -128,18 +130,14 @@ TEST_F(HadoopTablesTest, DropTablePurgeFalsePreservesData) {
                            path, /*properties=*/{})
                   .has_value());
 
-  const std::string data_path = hadoop::DataDir(path) + "/sample.parquet";
-  ASSERT_TRUE(file_io_->CreateDir(hadoop::DataDir(path)).has_value());
-  ASSERT_TRUE(file_io_->WriteFile(data_path, "dummy").has_value());
+  auto res = tables_->DropTable(path, /*purge=*/false);
+  ASSERT_FALSE(res.has_value());
+  EXPECT_EQ(ErrorKind::kNotSupported, res.error().kind);
 
-  ASSERT_TRUE(tables_->DropTable(path, /*purge=*/false).has_value());
-  ICEBERG_UNWRAP_OR_FAIL(auto data_exists, file_io_->Exists(data_path));
-  EXPECT_TRUE(data_exists) << "purge=false must not delete data files";
-
-  // Catalog-managed metadata must be gone so Exists/Load report missing.
+  // Table is still intact after the refusal.
   auto exists = tables_->Exists(path);
   ASSERT_TRUE(exists.has_value());
-  EXPECT_FALSE(*exists);
+  EXPECT_TRUE(*exists);
 }
 
 TEST_F(HadoopTablesTest, DropTablePurgeTrueRemovesData) {

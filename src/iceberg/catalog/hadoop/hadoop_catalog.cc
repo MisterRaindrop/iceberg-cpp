@@ -716,14 +716,22 @@ Status HadoopCatalog::DropTable(const TableIdentifier& identifier, bool purge) {
                        table_dir);
   }
   if (!purge) {
-    // Catalog::DropTable contract: data and metadata files are deleted only
-    // when purge=true. With purge=false we unregister the table from the
-    // catalog (so TableExists turns false) but keep `data/` (and any other
-    // user-managed contents under the table directory) intact, so the
-    // operator can RegisterTable a recovered metadata file later. The
-    // "unregister" primitive is deleting the catalog-managed `metadata/`
-    // subdirectory (which contains version-hint.text and v{N}.metadata.json).
-    return file_io_->DeleteDir(hadoop::MetadataDir(table_dir), /*recursive=*/true);
+    // HadoopCatalog can't honour the Catalog::DropTable purge=false contract
+    // safely: the catalog identity of a path is the metadata/ subdirectory,
+    // so "unregister but keep data" leaves the table dir with only `data/`,
+    // which our namespace detector then exposes as a namespace -- a
+    // subsequent CreateTable at the same path would silently adopt the
+    // stranded data, and a later purge=true would destroy it. Java's
+    // HadoopCatalog avoids the trap by ignoring purge=false (always
+    // recursive-deletes), but that violates the documented contract on
+    // our side. Refusing is the only safe option without adding a
+    // tombstone format to the on-disk layout.
+    return NotSupported(
+        "HadoopCatalog::DropTable(purge=false) is not supported: the table "
+        "directory IS the catalog entry, so 'unregister but keep data' would "
+        "leave an unreachable subtree that subsequent CreateTable / "
+        "ListNamespaces calls cannot distinguish from a real namespace. Use "
+        "purge=true, or copy the data files out before dropping.");
   }
   // purge=true: recursively remove the table directory tree. For the
   // default LocationProvider (data under <table>/data/) this matches Java's

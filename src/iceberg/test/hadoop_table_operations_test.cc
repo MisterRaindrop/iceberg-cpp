@@ -304,6 +304,47 @@ TEST_F(HadoopCommitTest, CommitHonoursGzipCodec) {
   EXPECT_EQ(fresh.current_version(), 2);
 }
 
+TEST_F(HadoopCommitTest, PreviousVersionsMaxZeroPrunesEverything) {
+  // previous-versions-max=0 means "keep only the current version, drop all
+  // previous." Negative values continue to disable GC entirely. Java accepts
+  // 0 as a valid cap; treating <=0 as "disable" (the previous behaviour)
+  // silently dropped this user-facing knob and allowed unbounded history
+  // accumulation when callers expected the opposite.
+  const std::string body = SlurpResource("TableMetadataV1Valid.json");
+  SeedMetadataFile(1, MetadataCompressionCodec::kNone, body);
+  SeedVersionHint("1");
+
+  HadoopTableOperations ops(file_io_, table_dir_, lock_manager_, "owner");
+  ICEBERG_UNWRAP_OR_FAIL(auto base, ops.Refresh());
+  TableMetadata updated = *base;
+  updated.properties.Set(TableProperties::kMetadataPreviousVersionsMax, int32_t{0});
+  updated.properties.Set(TableProperties::kMetadataDeleteAfterCommitEnabled, true);
+
+  for (int i = 0; i < 3; ++i) {
+    ICEBERG_UNWRAP_OR_FAIL(auto reloaded, ops.Refresh());
+    TableMetadata next = *reloaded;
+    next.properties = updated.properties;
+    ASSERT_TRUE(ops.Commit(*reloaded, next).has_value()) << "round " << i;
+  }
+
+  // After three commits we should be at v4 with NO older versioned files
+  // left under metadata/ (only v4 plus version-hint.text).
+  EXPECT_EQ(ops.current_version(), 4);
+  ICEBERG_UNWRAP_OR_FAIL(auto entries, file_io_->ListDir(MetadataDir(table_dir_)));
+  int versioned = 0;
+  for (const auto& entry : entries) {
+    std::string_view name = entry.location;
+    auto slash = name.find_last_of('/');
+    if (slash != std::string_view::npos) {
+      name.remove_prefix(slash + 1);
+    }
+    if (ParseMetadataFileName(name).has_value()) {
+      ++versioned;
+    }
+  }
+  EXPECT_EQ(versioned, 1) << "previous-versions-max=0 must keep current only";
+}
+
 TEST_F(HadoopCommitTest, DeleteAfterCommitPrunesOldMetadata) {
   const std::string body = SlurpResource("TableMetadataV1Valid.json");
   SeedMetadataFile(1, MetadataCompressionCodec::kNone, body);
@@ -341,40 +382,65 @@ TEST_F(HadoopCommitTest, DeleteAfterCommitPrunesOldMetadata) {
   EXPECT_LE(versioned, 2);
 }
 
-TEST_F(HadoopCommitTest, OrphanMetadataFileDoesNotBlockFutureCommits) {
-  // Simulate the scenario where a previous commit crashed between writing
-  // v2.metadata.json and updating version-hint.text. With the temp-file +
-  // rename CAS protocol, subsequent commits must NOT be blocked by the
-  // dangling final-name file.
+TEST_F(HadoopCommitTest, CrashedHintUpdateRecoversOnRefresh) {
+  // Simulate a writer that successfully renamed temp -> v2.metadata.json
+  // (the protocol's CAS commit point) but crashed before updating
+  // version-hint.text. Refresh must treat the rename as the source of
+  // truth: it should pick up v2 as the current version and the next
+  // commit must produce v3 without being permanently stuck on v2's
+  // "already exists" check.
   const std::string body = SlurpResource("TableMetadataV1Valid.json");
   SeedMetadataFile(1, MetadataCompressionCodec::kNone, body);
   SeedVersionHint("1");
-  // Plant an orphan v2.metadata.json (as if a crashed writer left it).
+  // Plant v2.metadata.json as if a writer's rename succeeded but the
+  // subsequent hint update did not.
   SeedMetadataFile(2, MetadataCompressionCodec::kNone, body);
 
   HadoopTableOperations ops(file_io_, table_dir_, lock_manager_, "owner");
   ICEBERG_UNWRAP_OR_FAIL(auto base, ops.Refresh());
-  // base.version is 1 (from version-hint); orphan v2 is invisible to Refresh.
-  EXPECT_EQ(ops.current_version(), 1);
-
-  // Without the temp-file + rename fix, this Commit would hit the
-  // "target already exists" guard and return kCommitFailed in a loop.
-  // With the fix, the rename(overwrite=false) of our UUID temp file to
-  // v2.metadata.json is what fails -- but only because target exists --
-  // and that surfaces as kCommitFailed (same outcome as a real CAS race).
-  // The orphan v2 stays put; we should be able to make progress by
-  // removing it and retrying.
-  auto first = ops.Commit(*base, *base);
-  ASSERT_FALSE(first.has_value());
-  EXPECT_EQ(ErrorKind::kCommitFailed, first.error().kind);
-
-  // After the operator deletes the orphan, commit must succeed.
-  ASSERT_TRUE(file_io_
-                  ->DeleteFile(MetadataDir(table_dir_) + "/" +
-                               MetadataFileName(2, MetadataCompressionCodec::kNone))
-                  .has_value());
-  ASSERT_TRUE(ops.Commit(*base, *base).has_value());
+  // Refresh promotes v2 to current despite the lagging hint -- the rename
+  // is authoritative, not the hint. Without this fix, the next commit
+  // would target v2 again and fail forever on "AlreadyExists".
   EXPECT_EQ(ops.current_version(), 2);
+
+  // The next commit must land at v3 cleanly.
+  ASSERT_TRUE(ops.Commit(*base, *base).has_value());
+  EXPECT_EQ(ops.current_version(), 3);
+}
+
+TEST_F(HadoopCommitTest, ConcurrentCodecDifferentExtensionsRejectsSecond) {
+  // Crucial: rename(overwrite=false) alone does not give codec-independent
+  // CAS because v2.metadata.json and v2.metadata.json.gz are distinct
+  // filenames and BOTH renames would succeed. The codec-aware safety net
+  // is "any v{next}.* present" -- be it via Refresh promoting current to
+  // 2 (so the stale check fires) or via the lock-scoped duplicate scan
+  // (defense-in-depth). Either way the second writer must lose CAS.
+  const std::string body = SlurpResource("TableMetadataV1Valid.json");
+  SeedMetadataFile(1, MetadataCompressionCodec::kNone, body);
+  SeedVersionHint("1");
+
+  HadoopTableOperations ops(file_io_, table_dir_, lock_manager_, "owner");
+  ICEBERG_UNWRAP_OR_FAIL(auto base, ops.Refresh());
+  ASSERT_EQ(ops.current_version(), 1);
+
+  // Plant a gzipped v2 as if a raced writer published with a different codec.
+  SeedMetadataFile(2, MetadataCompressionCodec::kGzip, body);
+
+  // Attempt to commit with the default (uncompressed) codec from a stale
+  // v1 view. The commit must FAIL -- otherwise two writers would publish
+  // v2.metadata.json AND v2.metadata.json.gz simultaneously, losing one
+  // update.
+  auto res = ops.Commit(*base, *base);
+  ASSERT_FALSE(res.has_value());
+  EXPECT_EQ(ErrorKind::kCommitFailed, res.error().kind);
+
+  // And the raced-in gzipped file is still there: we didn't accidentally
+  // delete it as part of the rejected commit.
+  ICEBERG_UNWRAP_OR_FAIL(
+      auto still_there,
+      file_io_->Exists(MetadataDir(table_dir_) + "/" +
+                       MetadataFileName(2, MetadataCompressionCodec::kGzip)));
+  EXPECT_TRUE(still_there);
 }
 
 TEST_F(HadoopCommitTest, FileLockManagerHeartbeatPreventsStaleSteal) {

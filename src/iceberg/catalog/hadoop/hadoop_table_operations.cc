@@ -131,29 +131,37 @@ Result<ResolvedMetadataPointer> ResolveCurrentMetadata(FileIO& file_io,
   }
 
   // Read the version hint BEFORE listing. Writers publish the new
-  // `v{N+1}.metadata.json` file via atomic rename and only then update
-  // version-hint.text, so observing hint=H guarantees v{H} exists on
-  // disk. Listing first and reading the hint second can otherwise see a
-  // listing snapshot taken before the writer's rename, but a hint
-  // updated after both rename and hint write -- the reader then has
-  // hint=N+1 with no v{N+1} in its stale listing and erroneously
-  // surfaces kNoSuchTable.
+  // `v{N+1}.metadata.json` file via atomic rename and ONLY THEN update
+  // version-hint.text -- the rename IS the commit point, so observing the
+  // file is authoritative regardless of whether the subsequent hint update
+  // succeeded. Reading the hint first ensures we don't see a listing taken
+  // after a writer's rename but with a hint that's already been advanced
+  // past our snapshot.
   auto hint = ReadVersionHint(file_io, table_dir);
   ICEBERG_ASSIGN_OR_RAISE(auto versioned, ListVersionedMetadata(file_io, table_dir));
 
-  if (hint.has_value()) {
-    pointer.version = *hint;
-  } else {
-    int64_t best = -1;
-    for (const auto& entry : versioned) {
-      if (entry.version > best) {
-        best = entry.version;
-      }
+  int64_t list_max = -1;
+  for (const auto& entry : versioned) {
+    if (entry.version > list_max) {
+      list_max = entry.version;
     }
-    if (best < 0) {
+  }
+
+  if (hint.has_value()) {
+    // CRITICAL: pick max(hint, list_max). A writer that crashed between the
+    // metadata rename (the commit point) and the hint update leaves
+    // v{hint+1} on disk while the hint still reads `hint`. Trusting the
+    // hint alone would mean (a) Refresh loads stale metadata even though a
+    // newer committed version exists, and (b) the next commit's
+    // rename(temp, v{hint+1}, overwrite=false) would fail with
+    // AlreadyExists forever. The rename IS the CAS commit; trust it.
+    pointer.version = list_max > *hint ? list_max : *hint;
+    pointer.from_listdir_fallback = list_max > *hint;
+  } else {
+    if (list_max < 0) {
       return NoSuchTable("No metadata files found under '{}'.", MetadataDir(table_dir));
     }
-    pointer.version = best;
+    pointer.version = list_max;
     pointer.from_listdir_fallback = true;
   }
 
@@ -164,11 +172,11 @@ Result<ResolvedMetadataPointer> ResolveCurrentMetadata(FileIO& file_io,
     }
   }
 
-  // Hint pointed at a version not present in our listing. Either the
-  // hint races with a write that hasn't published the file yet (a
-  // protocol violation, since writers rename the metadata file before
-  // updating the hint), or our listing snapshot was taken before the
-  // metadata rename landed. Re-list once and try again -- the writer's
+  // Hint pointed at a version not present in our listing (this branch is
+  // only reachable when list_max < hint, i.e. hint is ahead of what we
+  // managed to list). Either the listing snapshot was taken before the
+  // metadata rename landed, or a different writer raced the hint update
+  // ahead of our list view. Re-list once and try again -- the writer's
   // rename has been visible by now if the hint update was.
   ICEBERG_ASSIGN_OR_RAISE(auto retry_versioned,
                           ListVersionedMetadata(file_io, table_dir));
@@ -222,7 +230,11 @@ namespace {
 // succeeded, but operators need visibility into stuck GC.
 void PruneOldMetadataFiles(FileIO& file_io, std::string_view table_dir,
                            int64_t current_version, int32_t previous_versions_max) {
-  if (previous_versions_max <= 0) {
+  // Java treats `write.metadata.previous-versions-max` as a non-negative cap
+  // and accepts 0 as a valid "keep current only" setting. Negative values
+  // are not standard but we treat them as "disable GC" so callers can opt
+  // out without dropping the delete-after-commit flag.
+  if (previous_versions_max < 0) {
     return;
   }
   auto versioned_result = ListVersionedMetadata(file_io, table_dir);
@@ -336,6 +348,23 @@ Status HadoopTableOperations::Commit(const TableMetadata& base,
   const int64_t next_version = current.version + 1;
   ICEBERG_ASSIGN_OR_RAISE(auto codec, ResolveCommitCodec(updated));
   const std::string target = MetadataFilePath(table_dir_, next_version, codec);
+
+  // (5b) Codec-independent CAS: rename(overwrite=false) alone is not enough
+  // when two concurrent writers pick different codecs -- one would publish
+  // `v{N+1}.metadata.json` and the other `v{N+1}.metadata.json.gz`, BOTH
+  // renames would succeed, and Refresh would arbitrarily pick whichever
+  // file the listing surfaces first, silently losing one commit. Under the
+  // lock we additionally reject if ANY file matching v{next_version}.*
+  // already exists, making the CAS independent of the chosen codec.
+  ICEBERG_ASSIGN_OR_RAISE(auto existing, ListVersionedMetadata(*file_io_, table_dir_));
+  for (const auto& entry : existing) {
+    if (entry.version == next_version) {
+      return CommitFailed(
+          "HadoopTableOperations::Commit: lost CAS race to v{}: a metadata file "
+          "at this version (codec-independent) already exists at '{}'.",
+          next_version, entry.location);
+    }
+  }
 
   // (6/7) Write to a UUID-named temp file first, then atomically rename to
   // the canonical `v{N}.metadata.json[.codec]`. This is the same trick that

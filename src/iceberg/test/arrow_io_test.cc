@@ -437,6 +437,30 @@ TEST_F(LocalFileIOTest, DeleteDirRespectsRecursiveFlag) {
   EXPECT_THAT(file_io_->DeleteDir(empty_dir, /*recursive=*/false), IsOk());
 }
 
+TEST_F(LocalFileIOTest, DeleteDirNonRecursiveIsAtomicEmptyCheck) {
+  // The HadoopCatalog DropNamespace path leans on DeleteDir(recursive=false)
+  // for "rmdir if empty, fail otherwise" semantics. The previous "list +
+  // recursive delete" emulation was racy: a concurrent writer populating
+  // the directory between the empty check and the delete would lose its
+  // data. On LocalFileSystem we must route directly to POSIX rmdir(2)
+  // (std::filesystem::remove) which performs both the check and the delete
+  // in one syscall.
+  const std::string root = CreateTempDirectory();
+  const std::string dir = root + "/rmdir_atomic";
+  EXPECT_THAT(file_io_->CreateDir(dir), IsOk());
+
+  // Plant a child, then call DeleteDir(non-recursive). The call must
+  // refuse and the child must survive.
+  const std::string child = dir + "/keep.txt";
+  EXPECT_THAT(file_io_->WriteFile(child, "keep me"), IsOk());
+
+  EXPECT_THAT(file_io_->DeleteDir(dir, /*recursive=*/false),
+              IsError(ErrorKind::kNotAllowed));
+  ICEBERG_UNWRAP_OR_FAIL(auto child_still_there, file_io_->Exists(child));
+  EXPECT_TRUE(child_still_there)
+      << "DeleteDir(non-recursive) must NOT touch the directory contents on refusal";
+}
+
 TEST_F(LocalFileIOTest, RenameHonoursOverwriteFlag) {
   const std::string root = CreateTempDirectory();
   const std::string src = root + "/src.txt";
