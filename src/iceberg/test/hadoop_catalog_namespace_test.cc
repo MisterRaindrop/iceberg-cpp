@@ -249,6 +249,61 @@ TEST_F(HadoopCatalogNamespaceTest, ListTablesFiltersToTableShapedDirs) {
   EXPECT_FALSE(*missing);
 }
 
+TEST_F(HadoopCatalogNamespaceTest, DropTablePurgeTrueRefusesSnapshottedTable) {
+  // Iceberg's write API lets a snapshot reference data files by absolute
+  // path. iceberg_hadoop has no manifest reader, so it cannot enumerate
+  // those files to honour Catalog::DropTable(purge=true)'s "delete all
+  // data" contract. The safe stance: refuse purge=true once a table has
+  // any committed snapshots and tell the operator to run external
+  // manifest-walk cleanup first.
+  ASSERT_TRUE(catalog_->CreateNamespace(Namespace{.levels = {"db"}}, {}).has_value());
+  TableIdentifier table{.ns = Namespace{.levels = {"db"}}, .name = "events"};
+  auto schema = std::make_shared<Schema>(
+      std::vector<SchemaField>{SchemaField::MakeRequired(1, "id", int64())});
+  ICEBERG_UNWRAP_OR_FAIL(
+      auto created, catalog_->CreateTable(table, schema, PartitionSpec::Unpartitioned(),
+                                          SortOrder::Unsorted(), "", {}));
+
+  // Inject a synthetic snapshot entry into the v1.metadata.json so the
+  // table looks "committed". Iceberg's CreateTable doesn't produce a
+  // snapshot, so we mutate the on-disk metadata directly via FileIO to
+  // simulate a writer that has committed a FastAppend.
+  const std::string metadata_path(created->metadata_file_location());
+  ICEBERG_UNWRAP_OR_FAIL(auto body, file_io_->ReadFile(metadata_path, std::nullopt));
+  const std::string empty_snap_key = "\"snapshots\":[]";
+  auto pos = body.find(empty_snap_key);
+  std::string replaced;
+  if (pos == std::string::npos) {
+    // Some serialisers emit `"snapshots": []` with a space; handle both.
+    const std::string spaced = "\"snapshots\": []";
+    pos = body.find(spaced);
+    ASSERT_NE(pos, std::string::npos)
+        << "v1 metadata JSON must contain an empty \"snapshots\" array; got: " << body;
+    replaced = body.substr(0, pos) +
+               "\"snapshots\":[{\"snapshot-id\":1,\"sequence-number\":1,"
+               "\"timestamp-ms\":0,\"manifest-list\":\"file:///fake/m.avro\","
+               "\"summary\":{\"operation\":\"append\"},\"schema-id\":0}]" +
+               body.substr(pos + spaced.size());
+  } else {
+    replaced = body.substr(0, pos) +
+               "\"snapshots\":[{\"snapshot-id\":1,\"sequence-number\":1,"
+               "\"timestamp-ms\":0,\"manifest-list\":\"file:///fake/m.avro\","
+               "\"summary\":{\"operation\":\"append\"},\"schema-id\":0}]" +
+               body.substr(pos + empty_snap_key.size());
+  }
+  ASSERT_TRUE(file_io_->DeleteFile(metadata_path).has_value());
+  ASSERT_TRUE(file_io_->WriteFile(metadata_path, replaced).has_value());
+
+  auto drop = catalog_->DropTable(table, /*purge=*/true);
+  ASSERT_FALSE(drop.has_value());
+  EXPECT_EQ(ErrorKind::kNotSupported, drop.error().kind);
+
+  // Table must remain on disk after the refusal.
+  auto still_table = catalog_->TableExists(table);
+  ASSERT_TRUE(still_table.has_value());
+  EXPECT_TRUE(*still_table);
+}
+
 TEST_F(HadoopCatalogNamespaceTest, DropTablePurgeFalseIsNotSupported) {
   // HadoopCatalog cannot honour Catalog::DropTable(purge=false) without
   // turning the leftover data/ subtree into a namespace-shaped orphan that
@@ -454,6 +509,53 @@ TEST_F(HadoopCatalogNamespaceTest, CreateTableRejectsWriteDataPath) {
                                    {{"write.data.path", "file:///elsewhere/data"}});
   ASSERT_FALSE(res.has_value());
   EXPECT_EQ(ErrorKind::kInvalidArgument, res.error().kind);
+}
+
+TEST_F(HadoopCatalogNamespaceTest, RejectsTraversalAliasesInIdentifiers) {
+  // CreateNamespace / CreateTable / NamespaceExists / DropTable must all
+  // refuse "." and ".." as a namespace level or table name -- otherwise a
+  // caller can map operations to the parent of the warehouse and read,
+  // write or recursively delete outside the catalog's scope.
+  ASSERT_TRUE(catalog_->CreateNamespace(Namespace{.levels = {"db"}}, {}).has_value());
+
+  // Namespace level == "."
+  auto ns_dot = catalog_->CreateNamespace(Namespace{.levels = {"db", "."}}, {});
+  ASSERT_FALSE(ns_dot.has_value());
+  EXPECT_EQ(ErrorKind::kInvalidArgument, ns_dot.error().kind);
+
+  // Namespace level == ".."
+  auto ns_dd = catalog_->CreateNamespace(Namespace{.levels = {".."}}, {});
+  ASSERT_FALSE(ns_dd.has_value());
+  EXPECT_EQ(ErrorKind::kInvalidArgument, ns_dd.error().kind);
+
+  // Table name == "." would point at the namespace directory.
+  auto schema = std::make_shared<Schema>(
+      std::vector<SchemaField>{SchemaField::MakeRequired(1, "id", int64())});
+  auto tbl_dot = catalog_->CreateTable(
+      TableIdentifier{.ns = Namespace{.levels = {"db"}}, .name = "."}, schema,
+      PartitionSpec::Unpartitioned(), SortOrder::Unsorted(), "", {});
+  ASSERT_FALSE(tbl_dot.has_value());
+  EXPECT_EQ(ErrorKind::kInvalidArgument, tbl_dot.error().kind);
+
+  // Table name == ".."
+  auto tbl_dd = catalog_->CreateTable(
+      TableIdentifier{.ns = Namespace{.levels = {"db"}}, .name = ".."}, schema,
+      PartitionSpec::Unpartitioned(), SortOrder::Unsorted(), "", {});
+  ASSERT_FALSE(tbl_dd.has_value());
+  EXPECT_EQ(ErrorKind::kInvalidArgument, tbl_dd.error().kind);
+
+  // ".." used as namespace level on DropTable / TableExists -- the
+  // identifier validator must run before any path is built, so we never
+  // touch <warehouse>/.. on disk.
+  auto drop_dd = catalog_->DropTable(
+      TableIdentifier{.ns = Namespace{.levels = {".."}}, .name = "victim"}, true);
+  ASSERT_FALSE(drop_dd.has_value());
+  EXPECT_EQ(ErrorKind::kInvalidArgument, drop_dd.error().kind);
+
+  auto exists_dot = catalog_->TableExists(
+      TableIdentifier{.ns = Namespace{.levels = {"db"}}, .name = "."});
+  ASSERT_FALSE(exists_dot.has_value());
+  EXPECT_EQ(ErrorKind::kInvalidArgument, exists_dot.error().kind);
 }
 
 TEST_F(HadoopCatalogNamespaceTest, CreateTableHonoursGzipCodec) {

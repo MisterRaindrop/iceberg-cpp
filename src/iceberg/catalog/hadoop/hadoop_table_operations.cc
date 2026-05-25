@@ -413,41 +413,33 @@ Status HadoopTableOperations::Commit(const TableMetadata& base,
   // delete-then-rename would leave a brief window with no hint at all, and a
   // crash there would force every subsequent Refresh into the listdir
   // fallback path.
+  //
+  // CRITICAL: the rename of `target` above IS the commit point. From that
+  // moment on `ResolveCurrentMetadata` will surface v{next_version} via
+  // its listdir-max fallback (which prefers max(hint, listdir-max) over
+  // the hint alone). Deleting `target` on a later hint failure would roll
+  // back a committed publish and break any concurrent reader that has
+  // already observed it. Treat hint failures here as soft warnings.
+  current_location_ = target;
+  current_version_ = next_version;
   const std::string hint = VersionHintPath(table_dir_);
   const std::string hint_tmp =
       std::format("{}.tmp.{}", hint, Uuid::GenerateV7().ToString());
   const std::string payload = std::format("{}\n", next_version);
   if (auto write_status = file_io_->WriteFile(hint_tmp, payload);
       !write_status.has_value()) {
-    std::ignore = file_io_->DeleteFile(target);
-    return write_status;
-  }
-
-  auto rename_status = file_io_->Rename(hint_tmp, hint, /*overwrite=*/true);
-  if (!rename_status.has_value()) {
-    // (9) Recovery: the rename reported an error but the hint may already
-    // have advanced to our version (e.g. a transient network error after
-    // a successful HDFS/S3 rename). If so, treat the commit as landed.
-    auto recheck = ResolveCurrentMetadata(*file_io_, table_dir_);
-    if (recheck.has_value() && recheck->version == next_version) {
-      std::ignore = file_io_->DeleteFile(hint_tmp);
-      current_location_ = target;
-      current_version_ = next_version;
-      return {};
-    }
-    // True failure. Clean up our v{N+1} file and the tmp hint and
-    // propagate the ORIGINAL error -- the metadata rename already
-    // committed, so this is post-CAS bookkeeping that failed for an
-    // unrelated reason (permission, NotSupported, permanent IO). Wrapping
-    // it as kCommitFailed would make Transaction retry forever against
-    // an error that won't resolve.
-    std::ignore = file_io_->DeleteFile(target);
+    LogWarning(std::format(
+        "HadoopCatalog: committed v{} at '{}' but version-hint.text write failed: "
+        "{}; Refresh will recover via listdir fallback.",
+        next_version, target, write_status.error().message));
+  } else if (auto rename_status = file_io_->Rename(hint_tmp, hint, /*overwrite=*/true);
+             !rename_status.has_value()) {
     std::ignore = file_io_->DeleteFile(hint_tmp);
-    return rename_status;
+    LogWarning(
+        std::format("HadoopCatalog: committed v{} at '{}' but version-hint.text rename "
+                    "failed: {}; Refresh will recover via listdir fallback.",
+                    next_version, target, rename_status.error().message));
   }
-
-  current_location_ = target;
-  current_version_ = next_version;
 
   // (10) Release the lock now -- the commit has landed and any subsequent
   // bookkeeping (metadata GC) is best-effort and need not block other

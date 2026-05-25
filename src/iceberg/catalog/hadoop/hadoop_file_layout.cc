@@ -110,6 +110,16 @@ Status ValidateNamespaceLevel(std::string_view level) {
   if (level.find('/') != std::string_view::npos) {
     return InvalidArgument("Namespace level '{}' must not contain '/'.", level);
   }
+  // POSIX path component traversal: `.` aliases the parent dir (so it would
+  // overlay an existing namespace with table metadata), and `..` escapes
+  // upward (allowing reads/writes/deletes outside the warehouse). Both must
+  // be rejected before the component is joined into a path.
+  if (level == "." || level == "..") {
+    return InvalidArgument(
+        "Namespace level '{}' is a path-traversal alias; '.' and '..' are not "
+        "allowed in HadoopCatalog identifiers.",
+        level);
+  }
   if (IsReservedComponent(level)) {
     return InvalidArgument(
         "Namespace level '{}' is reserved by the HadoopCatalog on-disk layout "
@@ -130,6 +140,14 @@ Status ValidateTableIdentifier(const TableIdentifier& identifier) {
   ICEBERG_RETURN_UNEXPECTED(identifier.Validate());
   if (identifier.name.find('/') != std::string::npos) {
     return InvalidArgument("Table name '{}' must not contain '/'.", identifier.name);
+  }
+  // Same path-traversal guard as ValidateNamespaceLevel: a table named "."
+  // resolves to the parent namespace dir, and ".." escapes the warehouse.
+  if (identifier.name == "." || identifier.name == "..") {
+    return InvalidArgument(
+        "Table name '{}' is a path-traversal alias; '.' and '..' are not "
+        "allowed in HadoopCatalog identifiers.",
+        identifier.name);
   }
   if (IsReservedComponent(identifier.name)) {
     return InvalidArgument(

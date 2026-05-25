@@ -26,6 +26,7 @@
 #include <nlohmann/json.hpp>
 
 #include "iceberg/catalog/hadoop/hadoop_file_layout.h"
+#include "iceberg/catalog/hadoop/hadoop_log.h"
 #include "iceberg/catalog/hadoop/hadoop_table_operations.h"
 #include "iceberg/file_io.h"
 #include "iceberg/file_io_registry.h"
@@ -86,19 +87,33 @@ Status PublishInitialMetadata(FileIO& io, const std::string& path,
     return rename;
   }
 
+  // The rename above is the v1 commit point. A subsequent hint write or
+  // rename failure must NOT delete metadata_path: that would roll back a
+  // committed publish and break any concurrent reader. Mirror
+  // HadoopCatalog::PublishV1AfterLock -- log and treat hint failure as a
+  // soft warning, since Refresh prefers max(hint, listdir-max) and will
+  // discover v1 even without the hint file.
   const std::string hint_path = hadoop::VersionHintPath(path);
   const std::string hint_tmp =
       std::format("{}.tmp.{}", hint_path, Uuid::GenerateV7().ToString());
   if (auto hint_write = io.WriteFile(hint_tmp, std::string("1\n"));
       !hint_write.has_value()) {
-    std::ignore = io.DeleteFile(metadata_path);
-    return hint_write;
+    LogWarning(std::format(
+        "HadoopTables: v1 published at '{}' but version-hint.text write failed: "
+        "{}; Refresh will recover via listdir fallback.",
+        metadata_path, hint_write.error().message));
+    out_metadata_path = metadata_path;
+    return {};
   }
   if (auto hint_rename = io.Rename(hint_tmp, hint_path, /*overwrite=*/true);
       !hint_rename.has_value()) {
     std::ignore = io.DeleteFile(hint_tmp);
-    std::ignore = io.DeleteFile(metadata_path);
-    return hint_rename;
+    LogWarning(std::format(
+        "HadoopTables: v1 published at '{}' but version-hint.text rename failed: "
+        "{}; Refresh will recover via listdir fallback.",
+        metadata_path, hint_rename.error().message));
+    out_metadata_path = metadata_path;
+    return {};
   }
   out_metadata_path = metadata_path;
   return {};
@@ -318,8 +333,19 @@ Status HadoopTables::DropTable(const std::string& path, bool purge) {
         "directory IS the catalog entry; preserving data would create a "
         "namespace-shaped orphan. Use purge=true or relocate data first.");
   }
-  // purge=true: recursive delete handles the default LocationProvider;
-  // tables with custom data paths need expire_snapshots first.
+  // Same snapshot-aware purge restriction as HadoopCatalog::DropTable: the
+  // lightweight library can't walk manifests to find externally-located
+  // data files, so we only allow purge=true when the table has no commits.
+  HadoopTableOperations ops(io, path);
+  ICEBERG_ASSIGN_OR_RAISE(auto metadata, ops.Refresh());
+  if (!metadata->snapshots.empty()) {
+    return NotSupported(
+        "HadoopTables::DropTable(purge=true) on '{}' is not supported: the "
+        "table has {} snapshot(s) and iceberg_hadoop cannot manifest-walk to "
+        "verify all data is under the table dir. Run expire_snapshots first.",
+        path, metadata->snapshots.size());
+  }
+  // No snapshots -> snapshot-less table, recursive delete is sufficient.
   return io->DeleteDir(path, /*recursive=*/true);
 }
 

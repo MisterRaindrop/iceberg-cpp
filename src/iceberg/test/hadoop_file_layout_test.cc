@@ -59,6 +59,19 @@ TEST(HadoopFileLayoutTest, NamespaceLevelValidation) {
   EXPECT_FALSE(ValidateNamespace(reserved).has_value());
 }
 
+TEST(HadoopFileLayoutTest, NamespaceLevelRejectsTraversalAliases) {
+  // POSIX path components "." and ".." would let a caller resolve to the
+  // parent namespace dir or escape the warehouse entirely. Reject them
+  // before they reach the filesystem layer.
+  EXPECT_FALSE(ValidateNamespaceLevel(".").has_value());
+  EXPECT_FALSE(ValidateNamespaceLevel("..").has_value());
+
+  Namespace dot_in_levels{.levels = {"db", "."}};
+  EXPECT_FALSE(ValidateNamespace(dot_in_levels).has_value());
+  Namespace dotdot_in_levels{.levels = {"..", "victim"}};
+  EXPECT_FALSE(ValidateNamespace(dotdot_in_levels).has_value());
+}
+
 TEST(HadoopFileLayoutTest, TableIdentifierValidation) {
   TableIdentifier good{.ns = Namespace{.levels = {"db"}}, .name = "events"};
   EXPECT_TRUE(ValidateTableIdentifier(good).has_value());
@@ -79,6 +92,16 @@ TEST(HadoopFileLayoutTest, TableIdentifierValidation) {
   TableIdentifier reserved_ns{.ns = Namespace{.levels = {"db", "metadata"}},
                               .name = "events"};
   EXPECT_FALSE(ValidateTableIdentifier(reserved_ns).has_value());
+
+  // Traversal aliases as table name (table "." would resolve to the
+  // namespace dir, ".." would escape it).
+  TableIdentifier dot{.ns = Namespace{.levels = {"db"}}, .name = "."};
+  EXPECT_FALSE(ValidateTableIdentifier(dot).has_value());
+  TableIdentifier dotdot{.ns = Namespace{.levels = {"db"}}, .name = ".."};
+  EXPECT_FALSE(ValidateTableIdentifier(dotdot).has_value());
+  // Traversal alias inside the namespace levels.
+  TableIdentifier traverse_ns{.ns = Namespace{.levels = {".."}}, .name = "events"};
+  EXPECT_FALSE(ValidateTableIdentifier(traverse_ns).has_value());
 }
 
 TEST(HadoopFileLayoutTest, NamespaceDirJoinsLevels) {

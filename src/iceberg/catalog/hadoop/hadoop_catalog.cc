@@ -522,22 +522,32 @@ Result<std::string> PublishV1AfterLock(FileIO& file_io, const std::string& table
     return std::unexpected<Error>(rename_result.error());
   }
 
-  // Write version-hint.text via UUID-suffixed temp + atomic-replace rename.
-  // The lock already serialises writers; rename(overwrite=true) keeps the
-  // protocol crash-safe (no window with no hint file present).
+  // The rename above IS the commit point for v1: from this moment on
+  // ResolveCurrentMetadata (which prefers max(hint, listdir-max)) will
+  // surface this file as authoritative. The hint update below is a
+  // best-effort fast-path; if it fails we MUST NOT delete metadata_path,
+  // since doing so would roll back a committed publish and confuse any
+  // concurrent reader that has already observed it. Log and return
+  // success with a stale hint -- Refresh handles the lag via listdir.
   const std::string hint_path = hadoop::VersionHintPath(table_dir);
   const std::string hint_tmp =
       std::format("{}.tmp.{}", hint_path, Uuid::GenerateV7().ToString());
   if (auto hint_write = file_io.WriteFile(hint_tmp, std::string("1\n"));
       !hint_write.has_value()) {
-    std::ignore = file_io.DeleteFile(metadata_path);
-    return std::unexpected<Error>(hint_write.error());
+    LogWarning(std::format(
+        "HadoopCatalog: v1 published at '{}' but version-hint.text write failed: "
+        "{}; Refresh will recover via listdir fallback.",
+        metadata_path, hint_write.error().message));
+    return metadata_path;
   }
   if (auto hint_rename = file_io.Rename(hint_tmp, hint_path, /*overwrite=*/true);
       !hint_rename.has_value()) {
     std::ignore = file_io.DeleteFile(hint_tmp);
-    std::ignore = file_io.DeleteFile(metadata_path);
-    return std::unexpected<Error>(hint_rename.error());
+    LogWarning(std::format(
+        "HadoopCatalog: v1 published at '{}' but version-hint.text rename failed: "
+        "{}; Refresh will recover via listdir fallback.",
+        metadata_path, hint_rename.error().message));
+    return metadata_path;
   }
   return metadata_path;
 }
@@ -780,19 +790,33 @@ Status HadoopCatalog::DropTable(const TableIdentifier& identifier, bool purge) {
         "ListNamespaces calls cannot distinguish from a real namespace. Use "
         "purge=true, or copy the data files out before dropping.");
   }
-  // purge=true: recursively remove the table directory tree. For the
-  // default LocationProvider (data under <table>/data/) this matches Java's
-  // `purge=true` outcome exactly. Tables with a custom LocationProvider
-  // need a manifest-walk to find data files outside the table directory;
-  // that helper lives in iceberg_bundle (Avro reader) and is out of scope
-  // for the lightweight iceberg_hadoop library, so we warn operators so
-  // the divergence from Java is visible.
-  LogWarning(std::format(
-      "HadoopCatalog::DropTable(purge=true) on '{}' deletes the table directory "
-      "tree only; data files outside it (custom LocationProvider) are NOT "
-      "manifest-walked. Run `expire_snapshots` first if your table uses a custom "
-      "location.",
-      identifier.ToString()));
+  // purge=true contract: delete ALL data and metadata files. Iceberg's
+  // write API lets a snapshot reference a DataFile by absolute path (e.g.
+  // `FastAppend::AppendDataFile(... .file_path = "file:///external/...")`),
+  // so a recursive delete of `table_dir` only honours the contract when
+  // no snapshot references files outside it. Without an Avro/manifest
+  // reader -- which lives in iceberg_bundle -- iceberg_hadoop cannot walk
+  // the manifests to verify or clean up external references. The safe
+  // fallback is therefore: only allow purge=true on a snapshot-less
+  // table (the recursive delete is then trivially complete). Tables that
+  // have been written to MUST be cleaned up via an external manifest-walk
+  // / expire_snapshots flow first.
+  hadoop::HadoopTableOperations ops(file_io_, table_dir);
+  ICEBERG_ASSIGN_OR_RAISE(auto metadata, ops.Refresh());
+  if (!metadata->snapshots.empty()) {
+    return NotSupported(
+        "HadoopCatalog::DropTable(purge=true) on '{}' is not supported: the table "
+        "has {} snapshot(s) and the lightweight iceberg_hadoop library cannot "
+        "walk manifests to enumerate data files (which Iceberg's write API may "
+        "have placed outside the table directory). Run expire_snapshots and "
+        "external manifest-walk cleanup before dropping, or drop via a catalog "
+        "that supports manifest GC.",
+        identifier.ToString(), metadata->snapshots.size());
+  }
+  // No snapshots -> no data files committed via the Iceberg write API, so
+  // a recursive delete of the table directory captures everything that
+  // could exist (the default LocationProvider writes data under
+  // <table>/data/, but for snapshot-less tables that subtree is empty).
   return file_io_->DeleteDir(table_dir, /*recursive=*/true);
 }
 
