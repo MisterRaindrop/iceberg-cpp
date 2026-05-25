@@ -292,7 +292,7 @@ TEST_F(HadoopCommitTest, CommitHonoursGzipCodec) {
 
   ASSERT_TRUE(ops.Commit(*base, updated).has_value());
   EXPECT_EQ(ops.current_version(), 2);
-  EXPECT_TRUE(ops.current_metadata_location().ends_with("v2.metadata.json.gz"))
+  EXPECT_TRUE(ops.current_metadata_location().ends_with("v2.gz.metadata.json"))
       << ops.current_metadata_location();
 
   // The new file must be valid gzip (not the raw JSON). Refresh reads it back

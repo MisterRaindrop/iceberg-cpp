@@ -123,6 +123,32 @@ if get_option('rest').enabled()
             'dependencies': [iceberg_rest_dep],
         },
     }
+endif
+
+if get_option('hadoop').enabled()
+    # Pure-helper tests can run with just iceberg_hadoop_dep. The
+    # catalog-level tests below additionally need arrow-fs (LocalFileSystem
+    # / ArrowFileSystemFileIO), which isn't wired into the meson build yet
+    # -- meson currently only depends on nanoarrow, not Arrow C++ proper.
+    # See src/iceberg/test/CMakeLists.txt for the CMake equivalents that
+    # use the iceberg_bundle target.
+    iceberg_tests += {
+        'hadoop_catalog_test': {
+            'sources': files(
+                'hadoop_catalog_properties_test.cc',
+                'hadoop_file_layout_test.cc',
+            ),
+            'dependencies': [iceberg_hadoop_dep],
+        },
+    }
+    # TODO(hadoop-meson): wire up an `arrow_fs_dep` (matching CMake's
+    # iceberg_bundle linkage) and add hadoop_catalog_namespace_test,
+    # hadoop_table_operations_test, hadoop_tables_test here. They are
+    # already registered in src/iceberg/test/CMakeLists.txt; the meson
+    # gap is purely about the arrow-fs C++ dependency.
+endif
+
+if get_option('rest').enabled()
     if get_option('rest_integration_test').enabled()
         if host_machine.system() == 'windows'
             warning('Cannot build rest integration test on Windows, skipping.')

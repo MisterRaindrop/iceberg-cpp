@@ -323,6 +323,16 @@ Status HadoopTableOperations::Commit(const TableMetadata& base,
         "under the table location.",
         TableProperties::kWriteMetadataLocation.key());
   }
+  // (2b) HadoopCatalog::DropTable(purge=true) deletes the table dir tree
+  // only, so allowing `write.data.path` would orphan the actual data on
+  // a successful purge -- a silent contract violation. Reject the property
+  // here too; CreateTable / RegisterTable enforce the same on their paths.
+  if (updated.properties.configs().contains(TableProperties::kWriteDataLocation.key())) {
+    return InvalidArgument(
+        "Hadoop path-based tables cannot set '{}'; data outside the table dir "
+        "would be orphaned by DropTable(purge=true).",
+        TableProperties::kWriteDataLocation.key());
+  }
 
   // (3) Acquire the lock.
   ICEBERG_ASSIGN_OR_RAISE(auto acquired, lock_manager_->Acquire(table_dir_, owner_id_));

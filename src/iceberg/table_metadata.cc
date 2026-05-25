@@ -420,16 +420,20 @@ Result<MetadataFileCodecType> TableMetadataUtil::Codec::FromString(
 
 Result<MetadataFileCodecType> TableMetadataUtil::Codec::FromFileName(
     std::string_view file_name) {
-  auto pos = file_name.find_last_of(kTableMetadataFileSuffix);
-  if (pos == std::string::npos) {
-    return InvalidArgument("{} is not a valid metadata file", file_name);
-  }
-
-  // We have to be backward-compatible with .metadata.json.gz files
+  // Match the legacy suffix first since it embeds the canonical one --
+  // a file like `v1.metadata.json.gz` should be classified as gzip even
+  // though `.metadata.json` appears mid-string. Use rfind on the
+  // canonical suffix substring (not find_last_of, which matches any
+  // single character in the set and gave wrong positions for names
+  // shaped `v{N}.gz.metadata.json`).
   if (file_name.ends_with(kCompGzipTableMetadataFileSuffix)) {
     return MetadataFileCodecType::kGzip;
   }
 
+  auto pos = file_name.rfind(kTableMetadataFileSuffix);
+  if (pos == std::string_view::npos) {
+    return InvalidArgument("{} is not a valid metadata file", file_name);
+  }
   std::string_view file_name_without_suffix = file_name.substr(0, pos);
   if (file_name_without_suffix.ends_with(kGzipTableMetadataFileExtension)) {
     return MetadataFileCodecType::kGzip;

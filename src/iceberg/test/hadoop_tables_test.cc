@@ -86,7 +86,13 @@ TEST_F(HadoopTablesTest, CreateLoadDropRoundTrip) {
   EXPECT_FALSE(*exists_after);
 }
 
-TEST_F(HadoopTablesTest, RegisterReusesExternalMetadata) {
+TEST_F(HadoopTablesTest, RegisterRejectsMismatchedLocation) {
+  // RegisterTable that imports metadata from a different on-disk location
+  // would silently mismatch the table's recorded `location` against the
+  // registration path. DropTable(purge=true) on the registration path
+  // would only wipe its own subtree, leaving the data referenced by the
+  // source metadata orphaned -- a Catalog::DropTable contract violation.
+  // Refuse the registration up front.
   const std::string source_path = root_ + "/source";
   const std::string registered_path = root_ + "/registered";
   auto schema = std::make_shared<Schema>(
@@ -99,10 +105,8 @@ TEST_F(HadoopTablesTest, RegisterReusesExternalMetadata) {
 
   auto registered = tables_->RegisterTable(registered_path,
                                            std::string(source->metadata_file_location()));
-  ASSERT_TRUE(registered.has_value()) << registered.error().message;
-
-  ICEBERG_UNWRAP_OR_FAIL(auto reloaded, tables_->Load(registered_path));
-  EXPECT_NE(reloaded, nullptr);
+  ASSERT_FALSE(registered.has_value());
+  EXPECT_EQ(ErrorKind::kInvalidArgument, registered.error().kind);
 }
 
 TEST_F(HadoopTablesTest, LoadMissingTableReturnsNoSuchTable) {

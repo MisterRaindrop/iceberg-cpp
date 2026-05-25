@@ -174,9 +174,15 @@ std::string MetadataFileName(int64_t version, MetadataCompressionCodec codec) {
     case MetadataCompressionCodec::kNone:
       return std::format("v{}.metadata.json", version);
     case MetadataCompressionCodec::kGzip:
-      return std::format("v{}.metadata.json.gz", version);
+      // Match TableMetadataUtil::Codec::kGzipTableMetadataFileSuffix
+      // (".gz.metadata.json") -- the canonical form per the core library.
+      // ParseMetadataFileName also accepts the legacy ".metadata.json.gz"
+      // ordering so we stay readable across writer generations.
+      return std::format("v{}.gz.metadata.json", version);
     case MetadataCompressionCodec::kZstd:
-      return std::format("v{}.metadata.json.zstd", version);
+      // Kept for codec-name resolution symmetry; the encoder returns
+      // NotSupported before any zstd file is actually emitted.
+      return std::format("v{}.zstd.metadata.json", version);
   }
   return std::format("v{}.metadata.json", version);
 }
@@ -248,21 +254,41 @@ Result<MetadataFileRef> ParseMetadataFileName(std::string_view file_name) {
         file_name);
   }
 
-  // Strip trailing codec suffix.
+  // Accept the two gzip filename shapes the core library defines:
+  //   - canonical: v{N}.gz.metadata.json (TableMetadataUtil::Codec current form)
+  //   - legacy:    v{N}.metadata.json.gz (backwards-compat)
+  // The legacy form is still emitted by older writers (including some
+  // historic Hadoop catalog releases) and must remain discoverable.
+  //
+  // zstd is deliberately NOT recognised here. The encoder side returns
+  // NotSupported for zstd, so a v{N}.metadata.json.zstd file in the
+  // metadata dir is from an unknown external writer that iceberg-cpp's
+  // reader cannot decode. Accepting it on the listing side would make
+  // TableExists return true while LoadTable failed mid-JSON-parse, which
+  // is worse than reporting "no such table" cleanly.
   std::string_view stripped = file_name;
   MetadataCompressionCodec codec = MetadataCompressionCodec::kNone;
-  if (stripped.ends_with(".gz")) {
+  // Handle the legacy gzip shape `v{N}.metadata.json.gz` by trimming the
+  // trailing `.gz` first; the canonical shape `v{N}.gz.metadata.json` is
+  // handled below by stripping `.gz` from the version segment after the
+  // `.metadata.json` suffix is removed.
+  if (stripped.ends_with(".metadata.json.gz")) {
     codec = MetadataCompressionCodec::kGzip;
-    stripped.remove_suffix(3);
-  } else if (stripped.ends_with(".zstd")) {
-    codec = MetadataCompressionCodec::kZstd;
-    stripped.remove_suffix(5);
+    stripped.remove_suffix(std::string_view(".gz").size());
   }
   if (!stripped.ends_with(kJsonSuffix)) {
     return InvalidArgument("Metadata filename '{}' does not end with '.metadata.json'.",
                            file_name);
   }
   stripped.remove_suffix(kJsonSuffix.size());
+
+  // Canonical gzip form puts the `.gz` between the version and
+  // `.metadata.json`; pick it up if we haven't already locked codec from
+  // the legacy shape.
+  if (codec == MetadataCompressionCodec::kNone && stripped.ends_with(".gz")) {
+    codec = MetadataCompressionCodec::kGzip;
+    stripped.remove_suffix(std::string_view(".gz").size());
+  }
 
   // Remaining piece must be `v<digits>`.
   std::string_view version_str = stripped;

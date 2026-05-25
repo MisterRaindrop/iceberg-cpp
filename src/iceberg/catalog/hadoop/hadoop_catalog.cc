@@ -39,6 +39,7 @@
 #include "iceberg/table_update.h"
 #include "iceberg/util/checked_cast.h"
 #include "iceberg/util/gzip_internal.h"
+#include "iceberg/util/location_util.h"
 #include "iceberg/util/macros.h"
 #include "iceberg/util/uuid.h"
 
@@ -102,6 +103,40 @@ bool SuppressedPermissionError(const HadoopCatalogProperties& config, const Erro
     return true;
   }
   return false;
+}
+
+// HadoopCatalog::DropTable(purge=true) must satisfy Catalog::DropTable's
+// contract -- delete all data files. Without manifest-walking the only way
+// to ensure that is to require all data to live under the
+// identifier-derived `table_dir`. The checks below enforce that invariant
+// at every entry that can stamp a table's effective data location.
+Status RejectCustomLocation(std::string_view table_dir, std::string_view location,
+                            std::string_view source) {
+  if (location.empty()) {
+    return {};
+  }
+  if (LocationUtil::StripTrailingSlash(location) ==
+      LocationUtil::StripTrailingSlash(table_dir)) {
+    return {};
+  }
+  return InvalidArgument(
+      "{}: explicit table location '{}' must match the warehouse-derived path "
+      "'{}' so DropTable(purge=true) can delete the data tree. Pass an empty "
+      "string to fall back to the derived path.",
+      source, location, table_dir);
+}
+
+Status RejectExternalDataPathProperty(
+    const std::unordered_map<std::string, std::string>& properties,
+    std::string_view source) {
+  if (properties.contains(std::string(TableProperties::kWriteDataLocation.key()))) {
+    return InvalidArgument(
+        "{}: HadoopCatalog forbids '{}' because data outside the table directory "
+        "cannot be reached by purge=true without manifest walking. Drop the "
+        "property or use a catalog that supports external data paths.",
+        source, TableProperties::kWriteDataLocation.key());
+  }
+  return {};
 }
 
 }  // namespace
@@ -523,6 +558,14 @@ Result<std::string> HadoopCatalog::WriteInitialTableLocked(
         "under the table location.",
         TableProperties::kWriteMetadataLocation.key());
   }
+  // Same rationale for `write.data.path`: data outside the table dir
+  // escapes DropTable(purge=true)'s recursive delete.
+  ICEBERG_RETURN_UNEXPECTED(RejectExternalDataPathProperty(
+      metadata.properties.configs(), "HadoopCatalog::WriteInitialTableLocked"));
+  // The metadata's `location` field is what data writers actually consult;
+  // make sure it matches the warehouse-derived table directory.
+  ICEBERG_RETURN_UNEXPECTED(RejectCustomLocation(
+      table_dir, metadata.location, "HadoopCatalog::WriteInitialTableLocked"));
   ICEBERG_ASSIGN_OR_RAISE(auto codec, hadoop::ResolveCommitCodec(metadata));
   ICEBERG_ASSIGN_OR_RAISE(auto bytes, hadoop::EncodeMetadataWithCodec(metadata, codec));
   return WriteInitialBytesLocked(table_dir, bytes, codec, owner_prefix);
@@ -576,6 +619,10 @@ Result<std::shared_ptr<Table>> HadoopCatalog::CreateTable(
         "HadoopCatalog::CreateTable requires non-null schema, spec, and order.");
   }
   ICEBERG_ASSIGN_OR_RAISE(auto table_dir, hadoop::TableDir(warehouse_, identifier));
+  ICEBERG_RETURN_UNEXPECTED(
+      RejectCustomLocation(table_dir, location, "HadoopCatalog::CreateTable"));
+  ICEBERG_RETURN_UNEXPECTED(
+      RejectExternalDataPathProperty(properties, "HadoopCatalog::CreateTable"));
 
   // Java's HadoopCatalog rejects creation when the table directory already
   // looks like an Iceberg table. The check is repeated under the lock inside
@@ -788,12 +835,16 @@ Result<std::shared_ptr<Table>> HadoopCatalog::RegisterTable(
   }
 
   // Detect codec from the source filename so a gzipped source produces a
-  // gzipped local copy.
+  // gzipped local copy. Accept BOTH the canonical core form
+  // (`.gz.metadata.json`) and the legacy Hadoop form (`.metadata.json.gz`)
+  // so an external Spark/Trino writer's output is registerable either way.
   const std::string_view file_name = hadoop::Basename(metadata_file_location);
   hadoop::MetadataCompressionCodec codec = hadoop::MetadataCompressionCodec::kNone;
-  if (file_name.ends_with(".metadata.json.gz")) {
+  if (file_name.ends_with(".metadata.json.gz") ||
+      file_name.ends_with(".gz.metadata.json")) {
     codec = hadoop::MetadataCompressionCodec::kGzip;
-  } else if (file_name.ends_with(".metadata.json.zstd")) {
+  } else if (file_name.ends_with(".metadata.json.zstd") ||
+             file_name.ends_with(".zstd.metadata.json")) {
     codec = hadoop::MetadataCompressionCodec::kZstd;
   }
 
@@ -824,6 +875,11 @@ Result<std::shared_ptr<Table>> HadoopCatalog::RegisterTable(
         "path-based tables do not support.",
         TableProperties::kWriteMetadataLocation.key());
   }
+  // Data must stay under table_dir so DropTable(purge=true) can reach it.
+  ICEBERG_RETURN_UNEXPECTED(RejectExternalDataPathProperty(
+      metadata->properties.configs(), "HadoopCatalog::RegisterTable"));
+  ICEBERG_RETURN_UNEXPECTED(RejectCustomLocation(table_dir, metadata->location,
+                                                 "HadoopCatalog::RegisterTable"));
 
   // Publish via the same lock + UUID-temp + atomic-rename path as CreateTable
   // so concurrent register/create attempts cannot overwrite each other.

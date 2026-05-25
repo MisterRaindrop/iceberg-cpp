@@ -121,30 +121,42 @@ TEST(HadoopFileLayoutTest, MetadataAndAuxiliaryPaths) {
   EXPECT_EQ("file:///tmp/wh/db/events/data", DataDir(table));
   EXPECT_EQ("file:///tmp/wh/db/events/metadata/v1.metadata.json",
             MetadataFilePath(table, 1, MetadataCompressionCodec::kNone));
-  EXPECT_EQ("file:///tmp/wh/db/events/metadata/v17.metadata.json.gz",
+  // Core canonical gzip shape (matches
+  // TableMetadataUtil::Codec::kGzipTableMetadataFileSuffix).
+  EXPECT_EQ("file:///tmp/wh/db/events/metadata/v17.gz.metadata.json",
             MetadataFilePath(table, 17, MetadataCompressionCodec::kGzip));
-  EXPECT_EQ("file:///tmp/wh/db/events/metadata/v17.metadata.json.zstd",
-            MetadataFilePath(table, 17, MetadataCompressionCodec::kZstd));
   EXPECT_EQ("file:///tmp/wh/db/events/metadata/version-hint.text",
             VersionHintPath(table));
   EXPECT_EQ("file:///tmp/wh/db/events/metadata/_lock", LockFilePath(table));
 }
 
-TEST(HadoopFileLayoutTest, ParseMetadataFileNameAcceptsAllCodecs) {
+TEST(HadoopFileLayoutTest, ParseMetadataFileNameAcceptsBothGzipShapes) {
   auto plain = ParseMetadataFileName("v3.metadata.json");
   ASSERT_TRUE(plain.has_value());
   EXPECT_EQ(3, plain->version);
   EXPECT_EQ(MetadataCompressionCodec::kNone, plain->codec);
 
-  auto gzipped = ParseMetadataFileName("v42.metadata.json.gz");
-  ASSERT_TRUE(gzipped.has_value());
-  EXPECT_EQ(42, gzipped->version);
-  EXPECT_EQ(MetadataCompressionCodec::kGzip, gzipped->codec);
+  // Legacy Hadoop writers emit ".metadata.json.gz" -- still accepted.
+  auto legacy = ParseMetadataFileName("v42.metadata.json.gz");
+  ASSERT_TRUE(legacy.has_value());
+  EXPECT_EQ(42, legacy->version);
+  EXPECT_EQ(MetadataCompressionCodec::kGzip, legacy->codec);
 
-  auto zstd = ParseMetadataFileName("v0.metadata.json.zstd");
-  ASSERT_TRUE(zstd.has_value());
-  EXPECT_EQ(0, zstd->version);
-  EXPECT_EQ(MetadataCompressionCodec::kZstd, zstd->codec);
+  // Core canonical: ".gz.metadata.json".
+  auto canonical = ParseMetadataFileName("v42.gz.metadata.json");
+  ASSERT_TRUE(canonical.has_value());
+  EXPECT_EQ(42, canonical->version);
+  EXPECT_EQ(MetadataCompressionCodec::kGzip, canonical->codec);
+}
+
+TEST(HadoopFileLayoutTest, ParseMetadataFileNameRejectsZstd) {
+  // zstd files MUST NOT be classified as readable metadata: the decoder
+  // returns NotSupported, so accepting them on the listing side would
+  // produce TableExists=true / LoadTable=JSON parse error.
+  auto zstd_legacy = ParseMetadataFileName("v0.metadata.json.zstd");
+  EXPECT_FALSE(zstd_legacy.has_value());
+  auto zstd_canonical = ParseMetadataFileName("v0.zstd.metadata.json");
+  EXPECT_FALSE(zstd_canonical.has_value());
 }
 
 TEST(HadoopFileLayoutTest, ParseMetadataFileNameRejectsNonHadoopNames) {

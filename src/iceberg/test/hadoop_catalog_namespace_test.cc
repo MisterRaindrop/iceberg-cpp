@@ -379,7 +379,13 @@ TEST_F(HadoopCatalogNamespaceTest, CreateTableRejectsPopulatedNamespace) {
   EXPECT_TRUE(*exists);
 }
 
-TEST_F(HadoopCatalogNamespaceTest, RegisterExistingMetadataBecomesTable) {
+TEST_F(HadoopCatalogNamespaceTest, RegisterRejectsMismatchedLocation) {
+  // RegisterTable that imports metadata from another table's path would
+  // leave the new table's recorded `location` pointing at the OTHER
+  // table's data directory. DropTable(purge=true) on the new identifier
+  // then deletes only its own subtree, orphaning the actually-referenced
+  // data files. Refuse the registration to keep Catalog::DropTable's
+  // contract intact.
   ASSERT_TRUE(catalog_->CreateNamespace(Namespace{.levels = {"db"}}, {}).has_value());
   TableIdentifier source_id{.ns = Namespace{.levels = {"db"}}, .name = "source"};
   auto schema = std::make_shared<Schema>(
@@ -389,18 +395,11 @@ TEST_F(HadoopCatalogNamespaceTest, RegisterExistingMetadataBecomesTable) {
       catalog_->CreateTable(source_id, schema, PartitionSpec::Unpartitioned(),
                             SortOrder::Unsorted(), "", {}));
 
-  // Register a fresh table pointing at the same metadata file.
   TableIdentifier registered_id{.ns = Namespace{.levels = {"db"}}, .name = "registered"};
   auto registered = catalog_->RegisterTable(
       registered_id, std::string(source->metadata_file_location()));
-  ASSERT_TRUE(registered.has_value()) << registered.error().message;
-  EXPECT_EQ((*registered)->name(), registered_id);
-
-  // Re-registering must fail with kAlreadyExists.
-  auto again = catalog_->RegisterTable(registered_id,
-                                       std::string(source->metadata_file_location()));
-  ASSERT_FALSE(again.has_value());
-  EXPECT_EQ(ErrorKind::kAlreadyExists, again.error().kind);
+  ASSERT_FALSE(registered.has_value());
+  EXPECT_EQ(ErrorKind::kInvalidArgument, registered.error().kind);
 }
 
 TEST_F(HadoopCatalogNamespaceTest, CreateThenLoadTableRoundTrip) {
@@ -425,9 +424,42 @@ TEST_F(HadoopCatalogNamespaceTest, CreateThenLoadTableRoundTrip) {
   EXPECT_EQ(ErrorKind::kAlreadyExists, again.error().kind);
 }
 
+TEST_F(HadoopCatalogNamespaceTest, CreateTableRejectsExternalLocation) {
+  // Catalog::DropTable(purge=true) deletes the warehouse-derived table
+  // directory only; allowing a custom location would leave the actual data
+  // unreachable to purge. The catalog refuses up front so the contract
+  // can't be silently violated.
+  ASSERT_TRUE(catalog_->CreateNamespace(Namespace{.levels = {"db"}}, {}).has_value());
+  TableIdentifier id{.ns = Namespace{.levels = {"db"}}, .name = "elsewhere"};
+  auto schema = std::make_shared<Schema>(
+      std::vector<SchemaField>{SchemaField::MakeRequired(1, "id", int64())});
+
+  auto res = catalog_->CreateTable(id, schema, PartitionSpec::Unpartitioned(),
+                                   SortOrder::Unsorted(),
+                                   /*location=*/"file:///some/other/place", {});
+  ASSERT_FALSE(res.has_value());
+  EXPECT_EQ(ErrorKind::kInvalidArgument, res.error().kind);
+}
+
+TEST_F(HadoopCatalogNamespaceTest, CreateTableRejectsWriteDataPath) {
+  // `write.data.path` would direct data files outside the table dir, which
+  // makes DropTable(purge=true) lose them silently. Refuse the property.
+  ASSERT_TRUE(catalog_->CreateNamespace(Namespace{.levels = {"db"}}, {}).has_value());
+  TableIdentifier id{.ns = Namespace{.levels = {"db"}}, .name = "redirected"};
+  auto schema = std::make_shared<Schema>(
+      std::vector<SchemaField>{SchemaField::MakeRequired(1, "id", int64())});
+
+  auto res = catalog_->CreateTable(id, schema, PartitionSpec::Unpartitioned(),
+                                   SortOrder::Unsorted(), /*location=*/"",
+                                   {{"write.data.path", "file:///elsewhere/data"}});
+  ASSERT_FALSE(res.has_value());
+  EXPECT_EQ(ErrorKind::kInvalidArgument, res.error().kind);
+}
+
 TEST_F(HadoopCatalogNamespaceTest, CreateTableHonoursGzipCodec) {
   // Round-2 fix: the initial v1 publish honours write.metadata.compression-codec,
-  // not just commits. A gzipped CreateTable should land at v1.metadata.json.gz.
+  // not just commits. A gzipped CreateTable should land at the canonical
+  // v1.gz.metadata.json (core form).
   ASSERT_TRUE(catalog_->CreateNamespace(Namespace{.levels = {"db"}}, {}).has_value());
   TableIdentifier id{.ns = Namespace{.levels = {"db"}}, .name = "compressed"};
   auto schema = std::make_shared<Schema>(
@@ -437,7 +469,7 @@ TEST_F(HadoopCatalogNamespaceTest, CreateTableHonoursGzipCodec) {
       auto created, catalog_->CreateTable(
                         id, schema, PartitionSpec::Unpartitioned(), SortOrder::Unsorted(),
                         /*location=*/"", {{"write.metadata.compression-codec", "gzip"}}));
-  EXPECT_TRUE(created->metadata_file_location().ends_with("v1.metadata.json.gz"));
+  EXPECT_TRUE(created->metadata_file_location().ends_with("v1.gz.metadata.json"));
 
   // Round-trip: LoadTable must decode the gzipped v1 transparently.
   ICEBERG_UNWRAP_OR_FAIL(auto loaded, catalog_->LoadTable(id));

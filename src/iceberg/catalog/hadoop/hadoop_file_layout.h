@@ -44,9 +44,13 @@ namespace iceberg::hadoop {
 
 /// \brief Metadata file compression codec recognised by HadoopCatalog.
 ///
-/// `kNone` writes `v{N}.metadata.json`; `kGzip` writes `v{N}.metadata.json.gz`;
-/// `kZstd` writes `v{N}.metadata.json.zstd`. Java's table property
-/// `write.metadata.compression-codec` selects between these on commit.
+/// `kNone` writes `v{N}.metadata.json`; `kGzip` writes the core-canonical
+/// `v{N}.gz.metadata.json` (`TableMetadataUtil::Codec::kGzipTableMetadataFileSuffix`).
+/// `kZstd` is reachable as a codec name but the encoder side returns
+/// `kNotSupported`; the file shape never lands on disk via this catalog.
+/// Java's table property `write.metadata.compression-codec` selects between
+/// these on commit. Parser accepts the legacy `v{N}.metadata.json.gz`
+/// shape for compatibility with older writers.
 enum class MetadataCompressionCodec : uint8_t { kNone, kGzip, kZstd };
 
 /// \brief Parse a codec name as recognised by the Java table property
@@ -102,7 +106,7 @@ ICEBERG_HADOOP_EXPORT std::string MetadataDir(std::string_view table_dir);
 ICEBERG_HADOOP_EXPORT std::string DataDir(std::string_view table_dir);
 
 /// \brief Return the bare metadata file name for a given version + codec
-/// (e.g. `v3.metadata.json.gz`).
+/// (e.g. `v3.gz.metadata.json`).
 ICEBERG_HADOOP_EXPORT std::string MetadataFileName(int64_t version,
                                                    MetadataCompressionCodec codec);
 
@@ -124,9 +128,20 @@ struct MetadataFileRef {
 };
 
 /// \brief Parse a metadata file name produced by HadoopTableOperations.
-/// Accepts: `v{N}.metadata.json`, `v{N}.metadata.json.gz`,
-/// `v{N}.metadata.json.zstd`. Returns `kInvalidArgument` for anything else
-/// (e.g. UUID-prefixed temp files left behind by a partial commit).
+///
+/// Accepts the three shapes iceberg-cpp can read:
+///   - `v{N}.metadata.json`           (uncompressed)
+///   - `v{N}.gz.metadata.json`        (gzip, core-canonical)
+///   - `v{N}.metadata.json.gz`        (gzip, legacy Hadoop writers)
+///
+/// zstd-suffixed files are DELIBERATELY rejected: the encoder side returns
+/// `kNotSupported` for zstd, so a `v{N}...zstd` file in the metadata dir is
+/// from an external writer iceberg-cpp's reader cannot decode. Accepting it
+/// here would make `TableExists` true while `LoadTable` later failed mid
+/// JSON parse -- worse than reporting "no such table" cleanly.
+///
+/// Returns `kInvalidArgument` for anything else (e.g. UUID-prefixed temp
+/// files left behind by a partial commit).
 ICEBERG_HADOOP_EXPORT Result<MetadataFileRef> ParseMetadataFileName(
     std::string_view file_name);
 

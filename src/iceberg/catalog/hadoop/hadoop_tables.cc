@@ -37,6 +37,7 @@
 #include "iceberg/table_metadata.h"
 #include "iceberg/table_properties.h"
 #include "iceberg/util/gzip_internal.h"
+#include "iceberg/util/location_util.h"
 #include "iceberg/util/macros.h"
 #include "iceberg/util/uuid.h"
 
@@ -272,6 +273,15 @@ Result<std::shared_ptr<Table>> HadoopTables::Create(
         "the metadata directory is fixed under the table location.",
         TableProperties::kWriteMetadataLocation.key());
   }
+  // Same rationale for `write.data.path`: DropTable(purge=true) only
+  // recursively deletes `path`, so any data written outside it would be
+  // orphaned -- silently violating the Catalog::DropTable contract.
+  if (properties.contains(std::string(TableProperties::kWriteDataLocation.key()))) {
+    return InvalidArgument(
+        "HadoopTables::Create: path-based Hadoop tables cannot set '{}'; data "
+        "outside the table dir would be orphaned by DropTable(purge=true).",
+        TableProperties::kWriteDataLocation.key());
+  }
 
   ICEBERG_ASSIGN_OR_RAISE(auto metadata,
                           TableMetadata::Make(*schema, *spec, *order, path, properties));
@@ -329,11 +339,15 @@ Result<std::shared_ptr<Table>> HadoopTables::RegisterTable(
     return AlreadyExists("Table already exists at '{}'.", path);
   }
 
+  // Match HadoopCatalog::RegisterTable: accept both gzip suffix shapes
+  // (core canonical `.gz.metadata.json` AND legacy `.metadata.json.gz`).
   const std::string_view file_name = Basename(metadata_file_location);
   MetadataCompressionCodec codec = MetadataCompressionCodec::kNone;
-  if (file_name.ends_with(".metadata.json.gz")) {
+  if (file_name.ends_with(".metadata.json.gz") ||
+      file_name.ends_with(".gz.metadata.json")) {
     codec = MetadataCompressionCodec::kGzip;
-  } else if (file_name.ends_with(".metadata.json.zstd")) {
+  } else if (file_name.ends_with(".metadata.json.zstd") ||
+             file_name.ends_with(".zstd.metadata.json")) {
     codec = MetadataCompressionCodec::kZstd;
   }
 
@@ -360,6 +374,24 @@ Result<std::shared_ptr<Table>> HadoopTables::RegisterTable(
         "HadoopTables::RegisterTable: source metadata sets '{}', which "
         "path-based Hadoop tables do not support.",
         TableProperties::kWriteMetadataLocation.key());
+  }
+  if (metadata->properties.configs().contains(
+          TableProperties::kWriteDataLocation.key())) {
+    return InvalidArgument(
+        "HadoopTables::RegisterTable: source metadata sets '{}', which "
+        "path-based Hadoop tables do not support (data would be orphaned by "
+        "DropTable(purge=true)).",
+        TableProperties::kWriteDataLocation.key());
+  }
+  // The registered metadata's `location` field must match the warehouse
+  // path -- otherwise DropTable(purge=true) on this path would silently
+  // leave behind whatever lives at metadata->location.
+  if (LocationUtil::StripTrailingSlash(metadata->location) !=
+      LocationUtil::StripTrailingSlash(path)) {
+    return InvalidArgument(
+        "HadoopTables::RegisterTable: source metadata location '{}' must match "
+        "the registration path '{}'.",
+        metadata->location, path);
   }
 
   std::string target;
