@@ -34,6 +34,7 @@
 #include "iceberg/partition_spec.h"
 #include "iceberg/schema.h"
 #include "iceberg/sort_order.h"
+#include "iceberg/statistics_file.h"
 #include "iceberg/table.h"
 #include "iceberg/table_metadata.h"
 #include "iceberg/table_properties.h"
@@ -333,19 +334,46 @@ Status HadoopTables::DropTable(const std::string& path, bool purge) {
         "directory IS the catalog entry; preserving data would create a "
         "namespace-shaped orphan. Use purge=true or relocate data first.");
   }
-  // Same snapshot-aware purge restriction as HadoopCatalog::DropTable: the
-  // lightweight library can't walk manifests to find externally-located
-  // data files, so we only allow purge=true when the table has no commits.
+  // Same snapshot-aware purge restriction as HadoopCatalog::DropTable.
+  // CAVEAT: HadoopTables has no LockManager, so the Refresh() + delete
+  // sequence below is NOT atomic against concurrent commits. Callers
+  // that need cross-process correctness for purge must use HadoopCatalog
+  // (which serialises drop with commits via the catalog lock manager).
   HadoopTableOperations ops(io, path);
   ICEBERG_ASSIGN_OR_RAISE(auto metadata, ops.Refresh());
   if (!metadata->snapshots.empty()) {
     return NotSupported(
         "HadoopTables::DropTable(purge=true) on '{}' is not supported: the "
         "table has {} snapshot(s) and iceberg_hadoop cannot manifest-walk to "
-        "verify all data is under the table dir. Run expire_snapshots first.",
+        "verify all data is under the table dir. Drop via a catalog that "
+        "supports manifest GC; ExpireSnapshots is not enough (it cannot expire "
+        "the current snapshot whose data files are exactly what must be "
+        "enumerated).",
         path, metadata->snapshots.size());
   }
-  // No snapshots -> snapshot-less table, recursive delete is sufficient.
+  // Snapshot-less tables can still carry external statistics references
+  // (UpdateStatistics doesn't require a snapshot). Refuse if any stat path
+  // lies outside the table directory.
+  const std::string_view dir_view = LocationUtil::StripTrailingSlash(path);
+  auto is_external = [&dir_view](std::string_view p) {
+    return !LocationUtil::StripTrailingSlash(p).starts_with(dir_view);
+  };
+  for (const auto& stat : metadata->statistics) {
+    if (stat && is_external(stat->path)) {
+      return NotSupported(
+          "HadoopTables::DropTable(purge=true) on '{}' refused: statistics file "
+          "'{}' lies outside the table directory.",
+          path, stat->path);
+    }
+  }
+  for (const auto& stat : metadata->partition_statistics) {
+    if (stat && is_external(stat->path)) {
+      return NotSupported(
+          "HadoopTables::DropTable(purge=true) on '{}' refused: partition "
+          "statistics file '{}' lies outside the table directory.",
+          path, stat->path);
+    }
+  }
   return io->DeleteDir(path, /*recursive=*/true);
 }
 

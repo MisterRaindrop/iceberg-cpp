@@ -32,6 +32,7 @@
 #include "iceberg/file_io.h"
 #include "iceberg/file_io_registry.h"
 #include "iceberg/json_serde_internal.h"
+#include "iceberg/statistics_file.h"
 #include "iceberg/table.h"
 #include "iceberg/table_metadata.h"
 #include "iceberg/table_properties.h"
@@ -790,17 +791,24 @@ Status HadoopCatalog::DropTable(const TableIdentifier& identifier, bool purge) {
         "ListNamespaces calls cannot distinguish from a real namespace. Use "
         "purge=true, or copy the data files out before dropping.");
   }
-  // purge=true contract: delete ALL data and metadata files. Iceberg's
-  // write API lets a snapshot reference a DataFile by absolute path (e.g.
-  // `FastAppend::AppendDataFile(... .file_path = "file:///external/...")`),
-  // so a recursive delete of `table_dir` only honours the contract when
-  // no snapshot references files outside it. Without an Avro/manifest
-  // reader -- which lives in iceberg_bundle -- iceberg_hadoop cannot walk
-  // the manifests to verify or clean up external references. The safe
-  // fallback is therefore: only allow purge=true on a snapshot-less
-  // table (the recursive delete is then trivially complete). Tables that
-  // have been written to MUST be cleaned up via an external manifest-walk
-  // / expire_snapshots flow first.
+  // purge=true contract: delete ALL data and metadata files. Without an
+  // Avro/manifest reader (lives in iceberg_bundle), iceberg_hadoop cannot
+  // walk manifests to enumerate data files which Iceberg's write API can
+  // place outside the table directory. We refuse purge in any state that
+  // could leave external files behind, and we do the verification under
+  // the same table lock as Commit so a concurrent writer cannot land a
+  // new snapshot between our check and the delete.
+  const std::string owner =
+      name_ + ":drop:" + identifier.ToString() + ":" + Uuid::GenerateV7().ToString();
+  ICEBERG_ASSIGN_OR_RAISE(auto acquired, lock_manager_->Acquire(table_dir, owner));
+  if (!acquired) {
+    return CommitFailed(
+        "HadoopCatalog::DropTable: failed to acquire table lock for '{}' within "
+        "the configured timeout; a concurrent writer is committing.",
+        table_dir);
+  }
+  hadoop::LockReleaseGuard guard(lock_manager_.get(), table_dir, owner);
+
   hadoop::HadoopTableOperations ops(file_io_, table_dir);
   ICEBERG_ASSIGN_OR_RAISE(auto metadata, ops.Refresh());
   if (!metadata->snapshots.empty()) {
@@ -808,15 +816,42 @@ Status HadoopCatalog::DropTable(const TableIdentifier& identifier, bool purge) {
         "HadoopCatalog::DropTable(purge=true) on '{}' is not supported: the table "
         "has {} snapshot(s) and the lightweight iceberg_hadoop library cannot "
         "walk manifests to enumerate data files (which Iceberg's write API may "
-        "have placed outside the table directory). Run expire_snapshots and "
-        "external manifest-walk cleanup before dropping, or drop via a catalog "
-        "that supports manifest GC.",
+        "have placed outside the table directory). Drop via a catalog that "
+        "supports manifest GC, or run an external manifest-walk to delete "
+        "referenced data files first. NOTE: ExpireSnapshots alone is not enough "
+        "-- it cannot expire the current snapshot, and the current snapshot's "
+        "data files are exactly what we need to enumerate.",
         identifier.ToString(), metadata->snapshots.size());
   }
-  // No snapshots -> no data files committed via the Iceberg write API, so
-  // a recursive delete of the table directory captures everything that
-  // could exist (the default LocationProvider writes data under
-  // <table>/data/, but for snapshot-less tables that subtree is empty).
+  // Iceberg's UpdateStatistics API does not require a snapshot to exist
+  // and accepts arbitrary paths, so a snapshot-less table can still
+  // reference external `.puffin` / partition-statistics files. Refuse if
+  // any statistic path lies outside table_dir.
+  const std::string_view dir_view = LocationUtil::StripTrailingSlash(table_dir);
+  auto is_external = [&dir_view](std::string_view path) {
+    return !LocationUtil::StripTrailingSlash(path).starts_with(dir_view);
+  };
+  for (const auto& stat : metadata->statistics) {
+    if (stat && is_external(stat->path)) {
+      return NotSupported(
+          "HadoopCatalog::DropTable(purge=true) on '{}' refused: statistics file "
+          "'{}' lies outside the table directory '{}' and iceberg_hadoop cannot "
+          "delete it. Remove or relocate the statistic, or drop via a catalog "
+          "that owns the external location.",
+          identifier.ToString(), stat->path, table_dir);
+    }
+  }
+  for (const auto& stat : metadata->partition_statistics) {
+    if (stat && is_external(stat->path)) {
+      return NotSupported(
+          "HadoopCatalog::DropTable(purge=true) on '{}' refused: partition "
+          "statistics file '{}' lies outside the table directory '{}'.",
+          identifier.ToString(), stat->path, table_dir);
+    }
+  }
+  // No snapshots and no external statistic references: every file we could
+  // be responsible for is under table_dir, so a recursive delete is a
+  // complete purge.
   return file_io_->DeleteDir(table_dir, /*recursive=*/true);
 }
 

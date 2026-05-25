@@ -209,6 +209,37 @@ when a single process is the only writer, or layer an external
 coordination service (DynamoDB lock manager, S3 conditional PUT, etc.)
 on top -- iceberg-cpp does not wire one up automatically.
 
+### Codec-mismatched concurrent commits across catalog instances
+
+The commit protocol's `Rename(overwrite=false)` CAS is **filename-keyed**:
+`v{N+1}.metadata.json` and `v{N+1}.gz.metadata.json` are distinct
+filenames, so two iceberg-cpp `HadoopCatalog` instances on different
+processes that pick different `write.metadata.compression-codec` values
+will BOTH win their respective renames -- ending up with two metadata
+files at version `N+1`, one of which a subsequent reader will silently
+discard. The lock-time codec-independent scan we run before the rename
+only helps within a single `LockManager` instance; the default
+`in-memory` lock does not synchronise across processes.
+
+To stay safe across iceberg-cpp instances, choose ONE of:
+
+- Use `lock-impl=file` so all writers (on `file://`) serialise on the
+  same `<table>/metadata/_lock` file. The lock-time scan then catches
+  the duplicate-version case.
+- Pin `write.metadata.compression-codec` to a single value at table
+  creation time and never change it across writers.
+- Layer an external coordinator (the same DynamoDB/REST/Nessie option
+  that handles HDFS/S3 atomicity).
+
+Cross-tool concurrent writers (Spark / Trino / iceberg-cpp) using
+different codecs are out of scope here and require the same external
+coordination.
+
+`HadoopTables` does not have a lock manager at all; cross-process or
+even cross-instance correctness on `HadoopTables::Create` / `RegisterTable`
+/ `DropTable` requires the operator to ensure a single writer per table
+path. Use `HadoopCatalog` for any shared workload.
+
 **Stale-lock reclamation is not performed inline by `Acquire`.** A
 `read body -> rename source aside` snatch is unsafe without a "verify
 body THEN unlink source" primitive (it can race a third party that just
@@ -279,7 +310,11 @@ same operations:
 | `write.metadata.compression-codec=gzip` (on commit AND initial create) | ✅ | ✅ |
 | `write.metadata.compression-codec=zstd` | ✅ | ❌ (`kNotSupported`; iceberg-cpp metadata reader has no zstd path) |
 | `write.metadata.previous-versions-max` / `write.metadata.delete-after-commit.enabled` | ✅ | ✅ |
-| `DropTable(purge=true)` snapshot data cleanup via manifest walk | ✅ | ⚠ recursive directory delete only; `LogWarning` flags the divergence |
+| `DropTable(purge=false)` (preserve data) | ⚠ (Java ignores flag, always recursive) | ❌ (`kNotSupported`; leftover `data/` would re-appear as a namespace) |
+| `DropTable(purge=true)` on a snapshot-less table | ✅ | ✅ (recursive delete is complete; statistics paths must also be under the table dir) |
+| `DropTable(purge=true)` on a snapshotted table (manifest walk) | ✅ | ❌ (`kNotSupported`; iceberg-cpp has no Avro/manifest reader. ExpireSnapshots is **not** enough — it cannot expire the current snapshot. Use external manifest-walk tooling or a catalog with manifest GC.) |
+| `DropTable(purge=true)` atomic w.r.t. concurrent commits (HadoopCatalog) | ✅ | ✅ (held under the same table lock as Commit) |
+| `DropTable(purge=true)` atomic w.r.t. concurrent commits (HadoopTables) | n/a | ⚠ no lock — use HadoopCatalog for cross-process correctness |
 | `suppress-permission-error` | ✅ | ✅ (covers `kForbidden`, `kNotAuthorized`, and arrow `kIOError` with permission messages) |
 | `HadoopTables` single-table API | ✅ | ✅ |
 | HDFS via Arrow `HadoopFileSystem` (libhdfs JNI) | n/a (Java is native) | ✅ (build with `ICEBERG_HDFS=ON`) |

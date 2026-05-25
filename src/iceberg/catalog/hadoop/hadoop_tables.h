@@ -81,8 +81,32 @@ class ICEBERG_HADOOP_EXPORT HadoopTables {
 
   /// \brief Drop the table at `path`.
   ///
-  /// Both purge values currently recursively delete the table directory tree
-  /// (see HadoopCatalog::DropTable for the rationale).
+  /// `purge=false` is **not supported**: HadoopCatalog cannot separate
+  /// "unregister" from "preserve data" without inventing a tombstone
+  /// format -- a leftover `data/` directory would re-appear as a
+  /// namespace on the next listing and be silently adopted by a
+  /// subsequent CreateTable. Returns `kNotSupported`.
+  ///
+  /// `purge=true` honours Catalog::DropTable's "delete all data and
+  /// metadata files" contract only when the metadata cannot reference
+  /// files outside the table directory:
+  ///   - The table has zero snapshots (no commits via the Iceberg
+  ///     write API have happened, so no DataFile paths exist), AND
+  ///   - All `statistics` / `partition_statistics` entries (if any)
+  ///     have paths under the table directory.
+  /// Otherwise `kNotSupported` is returned -- the lightweight library
+  /// has no Avro/manifest reader, so it cannot walk manifests to find
+  /// data files. Drop via a catalog that owns manifest GC, or run an
+  /// external manifest-walk cleanup first. ExpireSnapshots is **not
+  /// enough** because it cannot expire the current snapshot, whose
+  /// data files are exactly the ones we'd need to enumerate.
+  ///
+  /// NOTE: this entry point performs the snapshot/statistics check
+  /// without acquiring any lock (HadoopTables is stateless and has no
+  /// LockManager), so a concurrent writer can land a snapshot between
+  /// the check and the recursive delete. Callers that need cross-process
+  /// correctness for purge should use HadoopCatalog instead, which
+  /// serialises drop with commits via the catalog lock manager.
   Status DropTable(const std::string& path, bool purge);
 
   /// \brief Register an externally-written `metadata_file_location` as a

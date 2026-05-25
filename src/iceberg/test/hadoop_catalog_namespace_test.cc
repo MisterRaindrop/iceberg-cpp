@@ -304,6 +304,51 @@ TEST_F(HadoopCatalogNamespaceTest, DropTablePurgeTrueRefusesSnapshottedTable) {
   EXPECT_TRUE(*still_table);
 }
 
+TEST_F(HadoopCatalogNamespaceTest, DropTablePurgeTrueRefusesExternalStatistics) {
+  // Snapshot-less tables can still reference external `.puffin` paths via
+  // UpdateStatistics, so DropTable(purge=true) must inspect statistics too,
+  // not just snapshots, before recursively deleting -- otherwise the
+  // external file is silently orphaned despite the operation reporting
+  // success.
+  ASSERT_TRUE(catalog_->CreateNamespace(Namespace{.levels = {"db"}}, {}).has_value());
+  TableIdentifier table{.ns = Namespace{.levels = {"db"}}, .name = "stats"};
+  auto schema = std::make_shared<Schema>(
+      std::vector<SchemaField>{SchemaField::MakeRequired(1, "id", int64())});
+  ICEBERG_UNWRAP_OR_FAIL(
+      auto created, catalog_->CreateTable(table, schema, PartitionSpec::Unpartitioned(),
+                                          SortOrder::Unsorted(), "", {}));
+
+  // Inject a single statistics entry whose path is outside the table dir.
+  const std::string metadata_path(created->metadata_file_location());
+  ICEBERG_UNWRAP_OR_FAIL(auto body, file_io_->ReadFile(metadata_path, std::nullopt));
+  const std::string empty_stats_compact = "\"statistics\":[]";
+  const std::string empty_stats_spaced = "\"statistics\": []";
+  auto pos = body.find(empty_stats_compact);
+  size_t replaced_len = empty_stats_compact.size();
+  if (pos == std::string::npos) {
+    pos = body.find(empty_stats_spaced);
+    replaced_len = empty_stats_spaced.size();
+  }
+  ASSERT_NE(pos, std::string::npos)
+      << "v1 metadata JSON must contain an empty \"statistics\" array; got: " << body;
+  const std::string seeded =
+      "\"statistics\":[{\"snapshot-id\":1,\"statistics-path\":\"file:///external/"
+      "x.puffin\",\"file-size-in-bytes\":1,\"file-footer-size-in-bytes\":1,"
+      "\"blob-metadata\":[]}]";
+  std::string mutated = body.substr(0, pos) + seeded + body.substr(pos + replaced_len);
+  ASSERT_TRUE(file_io_->DeleteFile(metadata_path).has_value());
+  ASSERT_TRUE(file_io_->WriteFile(metadata_path, mutated).has_value());
+
+  auto drop = catalog_->DropTable(table, /*purge=*/true);
+  ASSERT_FALSE(drop.has_value());
+  EXPECT_EQ(ErrorKind::kNotSupported, drop.error().kind);
+
+  // The table directory is still intact -- we did not partially delete it.
+  auto still_there = catalog_->TableExists(table);
+  ASSERT_TRUE(still_there.has_value());
+  EXPECT_TRUE(*still_there);
+}
+
 TEST_F(HadoopCatalogNamespaceTest, DropTablePurgeFalseIsNotSupported) {
   // HadoopCatalog cannot honour Catalog::DropTable(purge=false) without
   // turning the leftover data/ subtree into a namespace-shaped orphan that
