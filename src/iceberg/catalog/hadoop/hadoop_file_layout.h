@@ -172,6 +172,34 @@ ICEBERG_HADOOP_EXPORT Result<bool> IsHadoopTableDir(FileIO& file_io,
 ICEBERG_HADOOP_EXPORT bool IsPathInside(std::string_view path,
                                         std::string_view parent_dir);
 
+/// \brief Like `IsPathInside`, but conservatively rejects paths that
+/// contain traversal aliases or percent-encoded equivalents.
+///
+/// Used to check externally-sourced paths (e.g. `metadata.statistics[].path`,
+/// `metadata.metadata_log[].metadata_file`) that come out of registered
+/// metadata files. Such paths may contain `..` or `%2e%2e` segments that
+/// the OS / Arrow URI parser would normalise BEFORE the IO call -- so
+/// `file:///wh/db/t/../outside/x.puffin` and
+/// `file:///wh/db/t/%2e%2e/outside/x.puffin` both resolve to
+/// `file:///wh/db/outside/x.puffin` at IO time even though `IsPathInside`
+/// would happily classify them as "inside `/wh/db/t`".
+///
+/// The check:
+///   1. percent-decodes any `%HH` sequences in `path` (decoding any
+///      hex pair -- not just `%2e`/`%2f` -- so re-encoded `..` survives);
+///   2. rejects (returns false) any segment that resolves to `.` or `..`
+///      (i.e. refuses to even try to canonicalise traversal-bearing
+///      paths -- we expect statistics / metadata-log paths emitted by
+///      well-behaved writers to be in canonical form already);
+///   3. runs `IsPathInside(decoded_path, parent_dir)` for the final
+///      descendant decision.
+///
+/// `parent_dir` is taken as-is (it is built internally from the warehouse
+/// and validated identifiers and therefore contains no traversal aliases
+/// or percent-encoding -- the identifier validator rejects `%`).
+ICEBERG_HADOOP_EXPORT bool IsPathInsideNormalized(std::string_view path,
+                                                  std::string_view parent_dir);
+
 /// \brief True iff `dir_location` exists as a directory and contains a child
 /// entry whose leaf name is not in `{"metadata", "data"}`.
 ///

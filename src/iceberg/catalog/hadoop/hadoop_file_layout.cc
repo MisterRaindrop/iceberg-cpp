@@ -109,16 +109,19 @@ namespace {
 // arrow's URI parser. A `%` in the component would be parsed as the start
 // of a percent-encoded sequence -- e.g. `%2e%2e` decodes to `..` and
 // escapes the warehouse. We do not need percent-encoding for catalog
-// identifiers (Iceberg does not), so reject the marker outright. While
-// here also reject `\\` (Windows separator) and any non-printable byte;
-// they have no legitimate use in identifiers and would only show up in
-// constructed bypasses.
+// identifiers (Iceberg does not), so reject the marker outright. Same
+// rationale for `\\` (Windows path separator) and ASCII control bytes
+// (NUL would truncate a path; 0x01-0x1f and 0x7f have no legitimate use
+// in identifiers). Bytes 0x80+ are kept allowed so legitimate UTF-8
+// names like `客户.订单` continue to load -- the percent-encoding gate
+// above already blocks the traversal vector and Java HadoopCatalog
+// accepts Unicode identifiers.
 Status RejectUnsafeIdentifierChars(std::string_view component, std::string_view kind) {
   for (unsigned char c : component) {
-    if (c < 0x20 || c > 0x7e) {
+    if (c < 0x20 || c == 0x7f) {
       return InvalidArgument(
-          "{} '{}' contains a non-printable or non-ASCII byte (0x{:02x}); "
-          "only printable ASCII is allowed.",
+          "{} '{}' contains a control byte (0x{:02x}); control bytes are not "
+          "allowed in identifiers.",
           kind, component, static_cast<int>(c));
     }
     if (c == '%') {
@@ -274,6 +277,81 @@ bool IsPathInside(std::string_view path, std::string_view parent_dir) {
   // `/wh/db/stats` but the byte after the prefix is `_`, not `/`, so it
   // is a sibling, not a descendant.
   return stripped_path[stripped_parent.size()] == '/';
+}
+
+namespace {
+
+// Percent-decode every `%HH` sequence in `s` into a fresh string. Returns
+// false on malformed input (lone `%` or non-hex pair).
+bool PercentDecode(std::string_view s, std::string& out) {
+  auto hex_value = [](char c, int& v) {
+    if (c >= '0' && c <= '9') {
+      v = c - '0';
+      return true;
+    }
+    if (c >= 'a' && c <= 'f') {
+      v = c - 'a' + 10;
+      return true;
+    }
+    if (c >= 'A' && c <= 'F') {
+      v = c - 'A' + 10;
+      return true;
+    }
+    return false;
+  };
+  out.clear();
+  out.reserve(s.size());
+  for (size_t i = 0; i < s.size();) {
+    if (s[i] == '%') {
+      if (i + 2 >= s.size()) {
+        return false;
+      }
+      int hi = 0;
+      int lo = 0;
+      if (!hex_value(s[i + 1], hi) || !hex_value(s[i + 2], lo)) {
+        return false;
+      }
+      out.push_back(static_cast<char>((hi << 4) | lo));
+      i += 3;
+    } else {
+      out.push_back(s[i]);
+      ++i;
+    }
+  }
+  return true;
+}
+
+// True if any slash-separated segment of `path` equals "." or "..". The
+// path is scanned in its already-decoded form; callers run PercentDecode
+// first if they want to catch encoded traversal aliases.
+bool ContainsTraversalSegment(std::string_view path) {
+  size_t i = 0;
+  while (i < path.size()) {
+    const size_t next = path.find('/', i);
+    const std::string_view seg =
+        next == std::string_view::npos ? path.substr(i) : path.substr(i, next - i);
+    if (seg == "." || seg == "..") {
+      return true;
+    }
+    if (next == std::string_view::npos) {
+      break;
+    }
+    i = next + 1;
+  }
+  return false;
+}
+
+}  // namespace
+
+bool IsPathInsideNormalized(std::string_view path, std::string_view parent_dir) {
+  std::string decoded;
+  if (!PercentDecode(path, decoded)) {
+    return false;  // malformed percent encoding -- refuse
+  }
+  if (ContainsTraversalSegment(decoded)) {
+    return false;  // contains `.` or `..` segment after decoding
+  }
+  return IsPathInside(decoded, parent_dir);
 }
 
 Result<bool> HasNonTableInternalChildren(FileIO& file_io, std::string_view dir_location) {

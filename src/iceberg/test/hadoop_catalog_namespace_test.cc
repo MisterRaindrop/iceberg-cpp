@@ -304,6 +304,48 @@ TEST_F(HadoopCatalogNamespaceTest, DropTablePurgeTrueRefusesSnapshottedTable) {
   EXPECT_TRUE(*still_table);
 }
 
+TEST_F(HadoopCatalogNamespaceTest, FileLockDropAcrossInstancesRoundTrip) {
+  // Two HadoopCatalog instances sharing the same warehouse and
+  // lock-impl=file. Instance A drops a table; instance B creates a
+  // table at the same path right after. The drop must NOT corrupt
+  // instance B's create even though _lock briefly co-existed with
+  // instance B's first Acquire attempt. Regression for the case where
+  // DropTable used to recursive-delete the table dir (and _lock) while
+  // holding the lock -- with the new ordering, _lock is removed only
+  // by Release after everything else has been cleared, so instance B's
+  // Acquire after that point starts from a clean slate.
+  auto make_catalog = [&](std::string_view name) {
+    auto props = HadoopCatalogProperties::FromMap({
+        {"warehouse", warehouse_},
+        {"name", std::string(name)},
+        {"lock-impl", "file"},
+        {"lock.acquire-timeout-ms", "2000"},
+    });
+    return HadoopCatalog::Make(name, file_io_, std::move(props));
+  };
+  ICEBERG_UNWRAP_OR_FAIL(auto cat_a, make_catalog("inst_a"));
+  ICEBERG_UNWRAP_OR_FAIL(auto cat_b, make_catalog("inst_b"));
+  ASSERT_TRUE(cat_a->CreateNamespace(Namespace{.levels = {"db"}}, {}).has_value());
+
+  TableIdentifier id{.ns = Namespace{.levels = {"db"}}, .name = "shared"};
+  auto schema = std::make_shared<Schema>(
+      std::vector<SchemaField>{SchemaField::MakeRequired(1, "id", int64())});
+  ASSERT_TRUE(cat_a
+                  ->CreateTable(id, schema, PartitionSpec::Unpartitioned(),
+                                SortOrder::Unsorted(), "", {})
+                  .has_value());
+
+  // Instance A drops, instance B re-creates -- must both succeed and
+  // produce a usable table.
+  ASSERT_TRUE(cat_a->DropTable(id, /*purge=*/true).has_value());
+  ASSERT_TRUE(cat_b
+                  ->CreateTable(id, schema, PartitionSpec::Unpartitioned(),
+                                SortOrder::Unsorted(), "", {})
+                  .has_value());
+  ICEBERG_UNWRAP_OR_FAIL(auto loaded, cat_b->LoadTable(id));
+  EXPECT_EQ(loaded->name(), id);
+}
+
 TEST_F(HadoopCatalogNamespaceTest, FileLockCreateDropCreateRoundTrip) {
   // Regression for the case where DropTable recursively deletes the table
   // dir while still holding the lock (which lives at
@@ -368,6 +410,54 @@ TEST_F(HadoopCatalogNamespaceTest, UpdateTableAccumulatesMetadataLog) {
   ASSERT_FALSE(updated->metadata()->metadata_log.empty())
       << "post-commit metadata_log must record the previous version";
   EXPECT_EQ(updated->metadata()->metadata_log.back().metadata_file, v1_location);
+}
+
+TEST_F(HadoopCatalogNamespaceTest, DropTablePurgeRefusesTraversalInStatistic) {
+  // External statistics paths that contain literal `..` or
+  // percent-encoded `%2e%2e` segments resolve to OUTSIDE the table
+  // directory once Arrow normalises the URI. The naive `IsPathInside`
+  // string-prefix check used to accept them as "inside" because the
+  // literal prefix matched. The normalized check must refuse.
+  ASSERT_TRUE(catalog_->CreateNamespace(Namespace{.levels = {"db"}}, {}).has_value());
+  TableIdentifier table{.ns = Namespace{.levels = {"db"}}, .name = "trav"};
+  auto schema = std::make_shared<Schema>(
+      std::vector<SchemaField>{SchemaField::MakeRequired(1, "id", int64())});
+  ICEBERG_UNWRAP_OR_FAIL(
+      auto created, catalog_->CreateTable(table, schema, PartitionSpec::Unpartitioned(),
+                                          SortOrder::Unsorted(), "", {}));
+  ICEBERG_UNWRAP_OR_FAIL(auto table_dir, hadoop::TableDir(warehouse_, table));
+
+  auto inject_stat_path = [&](const std::string& stat_path) {
+    const std::string metadata_path(created->metadata_file_location());
+    ICEBERG_UNWRAP_OR_FAIL(auto body, file_io_->ReadFile(metadata_path, std::nullopt));
+    const std::string empty_compact = "\"statistics\":[]";
+    const std::string empty_spaced = "\"statistics\": []";
+    auto pos = body.find(empty_compact);
+    size_t replaced_len = empty_compact.size();
+    if (pos == std::string::npos) {
+      pos = body.find(empty_spaced);
+      replaced_len = empty_spaced.size();
+    }
+    ASSERT_NE(pos, std::string::npos);
+    const std::string seeded = std::format(
+        "\"statistics\":[{{\"snapshot-id\":1,\"statistics-path\":\"{}\","
+        "\"file-size-in-bytes\":1,\"file-footer-size-in-bytes\":1,"
+        "\"blob-metadata\":[]}}]",
+        stat_path);
+    const std::string mutated =
+        body.substr(0, pos) + seeded + body.substr(pos + replaced_len);
+    ASSERT_TRUE(file_io_->DeleteFile(metadata_path).has_value());
+    ASSERT_TRUE(file_io_->WriteFile(metadata_path, mutated).has_value());
+  };
+
+  // Literal `..` segment that resolves outside the table dir. The
+  // percent-encoded `%2e%2e` variant is covered by the unit test
+  // `IsPathInsideNormalizedRejectsTraversal` in hadoop_file_layout_test;
+  // the catalog-side wiring is identical for both.
+  inject_stat_path(table_dir + "/../outside/x.puffin");
+  auto drop_raw = catalog_->DropTable(table, /*purge=*/true);
+  ASSERT_FALSE(drop_raw.has_value());
+  EXPECT_EQ(ErrorKind::kNotSupported, drop_raw.error().kind);
 }
 
 TEST_F(HadoopCatalogNamespaceTest, DropTablePurgeIgnoresSiblingPrefix) {

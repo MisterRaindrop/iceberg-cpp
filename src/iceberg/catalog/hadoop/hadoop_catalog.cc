@@ -835,10 +835,10 @@ Status HadoopCatalog::DropTable(const TableIdentifier& identifier, bool purge) {
   // and accepts arbitrary paths, so a snapshot-less table can still
   // reference external `.puffin` / partition-statistics / metadata-log
   // files. Refuse if any such path is not a descendant of table_dir.
-  // Use the component-aware hadoop::IsPathInside so that a sibling like
+  // Use the component-aware hadoop::IsPathInsideNormalized so that a sibling like
   // `/wh/db/stats_backup` cannot pass as inside `/wh/db/stats`.
   auto is_external = [&table_dir](std::string_view path) {
-    return !hadoop::IsPathInside(path, table_dir);
+    return !hadoop::IsPathInsideNormalized(path, table_dir);
   };
   for (const auto& stat : metadata->statistics) {
     if (stat && is_external(stat->path)) {
@@ -871,9 +871,74 @@ Status HadoopCatalog::DropTable(const TableIdentifier& identifier, bool purge) {
     }
   }
   // No snapshots and no external statistic / metadata-log references:
-  // every file we could be responsible for is under table_dir, so a
-  // recursive delete is a complete purge.
-  return file_io_->DeleteDir(table_dir, /*recursive=*/true);
+  // every file we could be responsible for is under table_dir. We now
+  // need to delete the table directory in an order that does NOT remove
+  // the lock file (which is held by `guard`) before we are done, since
+  // another catalog instance could otherwise Acquire-and-publish a new
+  // table at the same path while our recursive delete continues and
+  // wipe their just-published files.
+  //
+  // Strategy:
+  //   1. Delete every child of <table_dir> EXCEPT `metadata/` (which
+  //      still contains our held `_lock`).
+  //   2. Delete every child of <table_dir>/metadata/ EXCEPT `_lock`.
+  //   3. Release the lock (this deletes `_lock` and stops the heartbeat;
+  //      Dismiss the RAII guard so we don't double-release).
+  //   4. Best-effort remove the now-empty <table_dir>/metadata and
+  //      <table_dir>. If a concurrent CreateTable raced in between
+  //      step 3 and step 4 and recreated files there, the non-recursive
+  //      rmdir naturally fails and we leave their files alone -- the
+  //      drop semantically succeeded (our old data is gone, the new
+  //      writer is responsible for their own publish).
+  const std::string md_dir = hadoop::MetadataDir(table_dir);
+  ICEBERG_ASSIGN_OR_RAISE(auto root_entries, file_io_->ListDir(table_dir));
+  for (const auto& entry : root_entries) {
+    if (hadoop::Basename(entry.location) == "metadata") {
+      continue;  // skip the dir that holds our lock
+    }
+    if (entry.is_directory) {
+      ICEBERG_RETURN_UNEXPECTED(file_io_->DeleteDir(entry.location, /*recursive=*/true));
+    } else {
+      ICEBERG_RETURN_UNEXPECTED(file_io_->DeleteFile(entry.location));
+    }
+  }
+  ICEBERG_ASSIGN_OR_RAISE(auto md_entries, file_io_->ListDir(md_dir));
+  for (const auto& entry : md_entries) {
+    if (hadoop::Basename(entry.location) == "_lock") {
+      continue;  // we still hold this; Release will remove it below
+    }
+    if (entry.is_directory) {
+      ICEBERG_RETURN_UNEXPECTED(file_io_->DeleteDir(entry.location, /*recursive=*/true));
+    } else {
+      ICEBERG_RETURN_UNEXPECTED(file_io_->DeleteFile(entry.location));
+    }
+  }
+  // Release the lock now (deletes _lock + stops heartbeat) and tell the
+  // RAII guard not to re-release.
+  if (auto rel = lock_manager_->Release(table_dir, owner); !rel.has_value()) {
+    LogWarning(std::format("HadoopCatalog::DropTable: lock release for '{}' failed: {}",
+                           table_dir, rel.error().message));
+  }
+  guard.Dismiss();
+  // Tear down the now-empty metadata/ and table dir. If a concurrent
+  // CreateTable Acquired in the gap, these become non-empty and the
+  // rmdir is a graceful no-op; log a warning rather than failing the
+  // already-successful drop.
+  if (auto rm_md = file_io_->DeleteDir(md_dir, /*recursive=*/false); !rm_md.has_value()) {
+    LogWarning(std::format(
+        "HadoopCatalog::DropTable: metadata dir rmdir for '{}' failed (possibly a "
+        "concurrent CreateTable raced after lock release): {}",
+        md_dir, rm_md.error().message));
+    return {};
+  }
+  if (auto rm_tbl = file_io_->DeleteDir(table_dir, /*recursive=*/false);
+      !rm_tbl.has_value()) {
+    LogWarning(std::format(
+        "HadoopCatalog::DropTable: table dir rmdir for '{}' failed (possibly a "
+        "concurrent CreateTable raced after lock release): {}",
+        table_dir, rm_tbl.error().message));
+  }
+  return {};
 }
 
 Status HadoopCatalog::RenameTable(const TableIdentifier& /*from*/,
@@ -967,7 +1032,7 @@ Result<std::shared_ptr<Table>> HadoopCatalog::RegisterTable(
   // points outside, instead of silently producing a table that purge
   // cannot honour.
   for (const auto& stat : metadata->statistics) {
-    if (stat && !hadoop::IsPathInside(stat->path, table_dir)) {
+    if (stat && !hadoop::IsPathInsideNormalized(stat->path, table_dir)) {
       return InvalidArgument(
           "HadoopCatalog::RegisterTable: statistics file '{}' is outside the "
           "table dir '{}'; DropTable(purge=true) could not clean it.",
@@ -975,7 +1040,7 @@ Result<std::shared_ptr<Table>> HadoopCatalog::RegisterTable(
     }
   }
   for (const auto& stat : metadata->partition_statistics) {
-    if (stat && !hadoop::IsPathInside(stat->path, table_dir)) {
+    if (stat && !hadoop::IsPathInsideNormalized(stat->path, table_dir)) {
       return InvalidArgument(
           "HadoopCatalog::RegisterTable: partition statistics file '{}' is "
           "outside the table dir '{}'.",
@@ -983,7 +1048,7 @@ Result<std::shared_ptr<Table>> HadoopCatalog::RegisterTable(
     }
   }
   for (const auto& entry : metadata->metadata_log) {
-    if (!hadoop::IsPathInside(entry.metadata_file, table_dir)) {
+    if (!hadoop::IsPathInsideNormalized(entry.metadata_file, table_dir)) {
       return InvalidArgument(
           "HadoopCatalog::RegisterTable: metadata-log entry '{}' is outside "
           "the table dir '{}'; DropTable(purge=true) could not clean it.",

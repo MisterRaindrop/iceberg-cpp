@@ -356,7 +356,7 @@ Status HadoopTables::DropTable(const std::string& path, bool purge) {
   // so a sibling directory like `/wh/db/stats_backup` is NOT classified
   // as a child of `/wh/db/stats`.
   auto is_external = [&path](std::string_view p) {
-    return !hadoop::IsPathInside(p, path);
+    return !hadoop::IsPathInsideNormalized(p, path);
   };
   for (const auto& stat : metadata->statistics) {
     if (stat && is_external(stat->path)) {
@@ -461,7 +461,7 @@ Result<std::shared_ptr<Table>> HadoopTables::RegisterTable(
   // contract: refuse the registration up front instead of producing a
   // table that cannot be safely deleted.
   for (const auto& stat : metadata->statistics) {
-    if (stat && !hadoop::IsPathInside(stat->path, path)) {
+    if (stat && !hadoop::IsPathInsideNormalized(stat->path, path)) {
       return InvalidArgument(
           "HadoopTables::RegisterTable: statistics file '{}' lies outside the "
           "registration path '{}'.",
@@ -469,7 +469,7 @@ Result<std::shared_ptr<Table>> HadoopTables::RegisterTable(
     }
   }
   for (const auto& stat : metadata->partition_statistics) {
-    if (stat && !hadoop::IsPathInside(stat->path, path)) {
+    if (stat && !hadoop::IsPathInsideNormalized(stat->path, path)) {
       return InvalidArgument(
           "HadoopTables::RegisterTable: partition statistics file '{}' lies "
           "outside the registration path '{}'.",
@@ -477,7 +477,7 @@ Result<std::shared_ptr<Table>> HadoopTables::RegisterTable(
     }
   }
   for (const auto& entry : metadata->metadata_log) {
-    if (!hadoop::IsPathInside(entry.metadata_file, path)) {
+    if (!hadoop::IsPathInsideNormalized(entry.metadata_file, path)) {
       return InvalidArgument(
           "HadoopTables::RegisterTable: metadata-log entry '{}' lies outside "
           "the registration path '{}'.",

@@ -59,6 +59,43 @@ TEST(HadoopFileLayoutTest, NamespaceLevelValidation) {
   EXPECT_FALSE(ValidateNamespace(reserved).has_value());
 }
 
+TEST(HadoopFileLayoutTest, IdentifierAllowsUtf8) {
+  // Java HadoopCatalog accepts Unicode identifiers. We must not reject
+  // valid UTF-8 byte sequences (>= 0x80) wholesale; only control bytes,
+  // 0x7f, '%' and '\\' are off-limits. Regression for the previous round
+  // which rejected anything > 0x7e and broke `客户.订单`-style names.
+  EXPECT_TRUE(ValidateNamespaceLevel("客户").has_value());
+  EXPECT_TRUE(ValidateNamespaceLevel("\xe5\xae\xa2\xe6\x88\xb7").has_value());  // 客户
+  TableIdentifier utf8{.ns = Namespace{.levels = {"db"}}, .name = "订单"};
+  EXPECT_TRUE(ValidateTableIdentifier(utf8).has_value());
+}
+
+TEST(HadoopFileLayoutTest, IsPathInsideNormalizedRejectsTraversal) {
+  // Raw `..` and percent-encoded `%2e%2e` segments must both fall out
+  // of the descendant check, even when the literal string prefix looks
+  // contained. arrow's URI parser percent-decodes these before issuing
+  // the IO, so trusting a naive prefix test would let
+  // `file:///wh/db/t/../outside/x.puffin` slip past as "inside `<table>`".
+  EXPECT_FALSE(
+      IsPathInsideNormalized("file:///wh/db/t/../outside/x.puffin", "file:///wh/db/t"));
+  EXPECT_FALSE(IsPathInsideNormalized("file:///wh/db/t/%2e%2e/outside/x.puffin",
+                                      "file:///wh/db/t"));
+  EXPECT_FALSE(IsPathInsideNormalized("file:///wh/db/t/%2E%2E/outside/x.puffin",
+                                      "file:///wh/db/t"));
+  // `.` segments are also rejected (a path containing `.` is not
+  // canonical; well-behaved writers should not emit them).
+  EXPECT_FALSE(IsPathInsideNormalized("file:///wh/db/t/./x.puffin", "file:///wh/db/t"));
+  // Legitimate descendants still pass.
+  EXPECT_TRUE(IsPathInsideNormalized("file:///wh/db/t/x.puffin", "file:///wh/db/t"));
+  EXPECT_TRUE(
+      IsPathInsideNormalized("file:///wh/db/t/data/0/x.parquet", "file:///wh/db/t"));
+  // Component-aware sibling check inherited from IsPathInside.
+  EXPECT_FALSE(
+      IsPathInsideNormalized("file:///wh/db/t_backup/x.puffin", "file:///wh/db/t"));
+  // Malformed percent encoding is conservatively refused.
+  EXPECT_FALSE(IsPathInsideNormalized("file:///wh/db/t/%2", "file:///wh/db/t"));
+}
+
 TEST(HadoopFileLayoutTest, NamespaceLevelRejectsPercentEncoding) {
   // arrow's URI parser percent-decodes path components, so `%2e%2e` would
   // resolve to `..` and escape the warehouse. Reject the '%' marker
