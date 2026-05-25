@@ -141,4 +141,19 @@ ICEBERG_HADOOP_EXPORT Result<MetadataFileRef> ParseMetadataFileName(
 ICEBERG_HADOOP_EXPORT Result<bool> IsHadoopTableDir(FileIO& file_io,
                                                     std::string_view dir_location);
 
+/// \brief True iff `dir_location` exists as a directory and contains a child
+/// entry whose leaf name is not in `{"metadata", "data"}`.
+///
+/// HadoopCatalog uses this to refuse creating a table at a path that already
+/// hosts a namespace -- a namespace's children are sub-namespaces or other
+/// tables, so any unexpected leaf indicates the path is "occupied". Children
+/// named `metadata` / `data` are tolerated so that a half-created table or a
+/// table with the standard layout under the path is not flagged here (the
+/// caller already runs IsHadoopTableDir to detect a completed table and the
+/// locked recheck distinguishes "in-progress create" inside Commit).
+///
+/// Returns `false` when the directory does not exist or is not a directory.
+ICEBERG_HADOOP_EXPORT Result<bool> HasNonTableInternalChildren(
+    FileIO& file_io, std::string_view dir_location);
+
 }  // namespace iceberg::hadoop

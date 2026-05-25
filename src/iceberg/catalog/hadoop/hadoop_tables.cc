@@ -251,6 +251,17 @@ Result<std::shared_ptr<Table>> HadoopTables::Create(
   if (already_table) {
     return AlreadyExists("Table already exists at '{}'.", path);
   }
+  // Refuse to create a table under a directory that already holds children
+  // outside the standard table layout -- prevents shadowing a namespace
+  // built by HadoopCatalog at the same path.
+  ICEBERG_ASSIGN_OR_RAISE(auto path_occupied,
+                          hadoop::HasNonTableInternalChildren(*io, path));
+  if (path_occupied) {
+    return InvalidArgument(
+        "HadoopTables::Create: path '{}' is occupied (contains non-table-internal "
+        "children); refusing to bury a namespace or unrelated data under a table.",
+        path);
+  }
 
   // Path-based Hadoop tables cannot redirect their metadata directory.
   // Mirror the same check HadoopCatalog::WriteInitialTableLocked applies
@@ -280,7 +291,7 @@ Result<std::shared_ptr<Table>> HadoopTables::Create(
   return std::shared_ptr<Table>(static_table);
 }
 
-Status HadoopTables::DropTable(const std::string& path, bool /*purge*/) {
+Status HadoopTables::DropTable(const std::string& path, bool purge) {
   if (path.empty()) {
     return InvalidArgument("HadoopTables::DropTable requires a non-empty path.");
   }
@@ -289,9 +300,14 @@ Status HadoopTables::DropTable(const std::string& path, bool /*purge*/) {
   if (!is_table) {
     return NoSuchTable("Table '{}' does not exist.", path);
   }
-  // Same rationale as HadoopCatalog::DropTable -- recursive delete handles
-  // the default LocationProvider; tables with custom data paths need
-  // expire_snapshots first.
+  if (!purge) {
+    // Mirror Catalog::DropTable's contract (see HadoopCatalog::DropTable):
+    // purge=false unregisters the table from the catalog without removing
+    // user data. We delete only the catalog-owned `metadata/` subtree.
+    return io->DeleteDir(hadoop::MetadataDir(path), /*recursive=*/true);
+  }
+  // purge=true: recursive delete handles the default LocationProvider;
+  // tables with custom data paths need expire_snapshots first.
   return io->DeleteDir(path, /*recursive=*/true);
 }
 

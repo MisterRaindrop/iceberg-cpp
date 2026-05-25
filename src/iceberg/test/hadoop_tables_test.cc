@@ -27,6 +27,7 @@
 
 #include "iceberg/arrow/arrow_io_internal.h"
 #include "iceberg/arrow/arrow_io_register.h"
+#include "iceberg/catalog/hadoop/hadoop_file_layout.h"
 #include "iceberg/partition_spec.h"
 #include "iceberg/schema.h"
 #include "iceberg/schema_field.h"
@@ -43,12 +44,13 @@ class HadoopTablesTest : public ::iceberg::TempFileTestBase {
   void SetUp() override {
     ::iceberg::TempFileTestBase::SetUp();
     root_ = "file://" + CreateTempDirectory();
-    auto file_io = std::make_shared<::iceberg::arrow::ArrowFileSystemFileIO>(
+    file_io_ = std::make_shared<::iceberg::arrow::ArrowFileSystemFileIO>(
         std::make_shared<::arrow::fs::LocalFileSystem>());
-    tables_ = std::make_shared<HadoopTables>(std::move(file_io));
+    tables_ = std::make_shared<HadoopTables>(file_io_);
   }
 
   std::string root_;
+  std::shared_ptr<FileIO> file_io_;
   std::shared_ptr<HadoopTables> tables_;
 };
 
@@ -113,6 +115,64 @@ TEST_F(HadoopTablesTest, DropMissingTableReturnsNoSuchTable) {
   auto res = tables_->DropTable(root_ + "/nope", /*purge=*/false);
   ASSERT_FALSE(res.has_value());
   EXPECT_EQ(ErrorKind::kNoSuchTable, res.error().kind);
+}
+
+TEST_F(HadoopTablesTest, DropTablePurgeFalsePreservesData) {
+  // Catalog::DropTable contract: purge=false must keep data files. The
+  // HadoopTables free-standing API mirrors HadoopCatalog's semantics here.
+  const std::string path = root_ + "/preserve";
+  auto schema = std::make_shared<Schema>(
+      std::vector<SchemaField>{SchemaField::MakeRequired(1, "id", int64())});
+  ASSERT_TRUE(tables_
+                  ->Create(schema, PartitionSpec::Unpartitioned(), SortOrder::Unsorted(),
+                           path, /*properties=*/{})
+                  .has_value());
+
+  const std::string data_path = hadoop::DataDir(path) + "/sample.parquet";
+  ASSERT_TRUE(file_io_->CreateDir(hadoop::DataDir(path)).has_value());
+  ASSERT_TRUE(file_io_->WriteFile(data_path, "dummy").has_value());
+
+  ASSERT_TRUE(tables_->DropTable(path, /*purge=*/false).has_value());
+  ICEBERG_UNWRAP_OR_FAIL(auto data_exists, file_io_->Exists(data_path));
+  EXPECT_TRUE(data_exists) << "purge=false must not delete data files";
+
+  // Catalog-managed metadata must be gone so Exists/Load report missing.
+  auto exists = tables_->Exists(path);
+  ASSERT_TRUE(exists.has_value());
+  EXPECT_FALSE(*exists);
+}
+
+TEST_F(HadoopTablesTest, DropTablePurgeTrueRemovesData) {
+  const std::string path = root_ + "/purge";
+  auto schema = std::make_shared<Schema>(
+      std::vector<SchemaField>{SchemaField::MakeRequired(1, "id", int64())});
+  ASSERT_TRUE(tables_
+                  ->Create(schema, PartitionSpec::Unpartitioned(), SortOrder::Unsorted(),
+                           path, /*properties=*/{})
+                  .has_value());
+
+  const std::string data_path = hadoop::DataDir(path) + "/sample.parquet";
+  ASSERT_TRUE(file_io_->CreateDir(hadoop::DataDir(path)).has_value());
+  ASSERT_TRUE(file_io_->WriteFile(data_path, "dummy").has_value());
+
+  ASSERT_TRUE(tables_->DropTable(path, /*purge=*/true).has_value());
+  ICEBERG_UNWRAP_OR_FAIL(auto data_exists, file_io_->Exists(data_path));
+  EXPECT_FALSE(data_exists) << "purge=true must delete data files";
+}
+
+TEST_F(HadoopTablesTest, CreateRejectsPopulatedPath) {
+  // If the target path already contains unrelated content (e.g. a namespace
+  // populated by HadoopCatalog), Create must refuse rather than burying the
+  // existing tree under a new metadata/.
+  const std::string path = root_ + "/occupied";
+  ASSERT_TRUE(file_io_->CreateDir(path + "/child").has_value());
+
+  auto schema = std::make_shared<Schema>(
+      std::vector<SchemaField>{SchemaField::MakeRequired(1, "id", int64())});
+  auto res = tables_->Create(schema, PartitionSpec::Unpartitioned(),
+                             SortOrder::Unsorted(), path, /*properties=*/{});
+  ASSERT_FALSE(res.has_value());
+  EXPECT_EQ(ErrorKind::kInvalidArgument, res.error().kind);
 }
 
 TEST_F(HadoopTablesTest, AutoDetectRejectsMixedSchemes) {

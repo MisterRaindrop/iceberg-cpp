@@ -159,6 +159,27 @@ std::string LockFilePath(std::string_view table_dir) {
   return JoinUnderRoot(MetadataDir(table_dir), "_lock");
 }
 
+Result<bool> HasNonTableInternalChildren(FileIO& file_io, std::string_view dir_location) {
+  const std::string dir{dir_location};
+  ICEBERG_ASSIGN_OR_RAISE(auto exists, file_io.Exists(dir));
+  if (!exists) {
+    return false;
+  }
+  ICEBERG_ASSIGN_OR_RAISE(auto is_dir, file_io.IsDirectory(dir));
+  if (!is_dir) {
+    return false;
+  }
+  ICEBERG_ASSIGN_OR_RAISE(auto entries, file_io.ListDir(dir));
+  for (const auto& entry : entries) {
+    const std::string_view leaf = Basename(entry.location);
+    if (leaf.empty() || leaf == "metadata" || leaf == "data") {
+      continue;
+    }
+    return true;
+  }
+  return false;
+}
+
 Result<bool> IsHadoopTableDir(FileIO& file_io, std::string_view dir_location) {
   // A HadoopCatalog table contains a metadata/ subdirectory with at least one
   // v{N}.metadata.json[.codec] file. We probe the metadata dir first and only

@@ -249,8 +249,11 @@ TEST_F(HadoopCatalogNamespaceTest, ListTablesFiltersToTableShapedDirs) {
   EXPECT_FALSE(*missing);
 }
 
-TEST_F(HadoopCatalogNamespaceTest,
-       DropTableRemovesEverythingAndReturnsNoSuchOnSecondTry) {
+TEST_F(HadoopCatalogNamespaceTest, DropTablePurgeFalsePreservesData) {
+  // Catalog::DropTable contract: only purge=true is allowed to remove data
+  // files. With purge=false, HadoopCatalog must merely unregister the table
+  // (delete catalog-managed metadata) and leave any data files in place so
+  // operators can recover them via RegisterTable later.
   ASSERT_TRUE(catalog_->CreateNamespace(Namespace{.levels = {"db"}}, {}).has_value());
   TableIdentifier table{.ns = Namespace{.levels = {"db"}}, .name = "events"};
   auto schema = std::make_shared<Schema>(
@@ -260,14 +263,131 @@ TEST_F(HadoopCatalogNamespaceTest,
                                 SortOrder::Unsorted(), "", {})
                   .has_value());
 
+  // Seed a synthetic data file so we can prove it survives DropTable(purge=false).
+  ICEBERG_UNWRAP_OR_FAIL(auto table_dir, hadoop::TableDir(warehouse_, table));
+  const std::string data_path = hadoop::DataDir(table_dir) + "/sample.parquet";
+  ASSERT_TRUE(file_io_->CreateDir(hadoop::DataDir(table_dir)).has_value());
+  ASSERT_TRUE(file_io_->WriteFile(data_path, "dummy").has_value());
+
   EXPECT_TRUE(catalog_->DropTable(table, /*purge=*/false).has_value());
+
+  // Table is unregistered (TableExists is false), but the data file remains.
   auto exists_after = catalog_->TableExists(table);
   ASSERT_TRUE(exists_after.has_value());
   EXPECT_FALSE(*exists_after);
+  ICEBERG_UNWRAP_OR_FAIL(auto data_exists, file_io_->Exists(data_path));
+  EXPECT_TRUE(data_exists) << "purge=false must not delete data files";
 
-  auto again = catalog_->DropTable(table, false);
+  // Idempotency: second drop returns kNoSuchTable.
+  auto again = catalog_->DropTable(table, /*purge=*/false);
   ASSERT_FALSE(again.has_value());
   EXPECT_EQ(ErrorKind::kNoSuchTable, again.error().kind);
+}
+
+TEST_F(HadoopCatalogNamespaceTest, DropTablePurgeTrueRemovesData) {
+  // The companion of DropTablePurgeFalsePreservesData: purge=true must
+  // actually remove the data files under the table directory.
+  ASSERT_TRUE(catalog_->CreateNamespace(Namespace{.levels = {"db"}}, {}).has_value());
+  TableIdentifier table{.ns = Namespace{.levels = {"db"}}, .name = "events_purge"};
+  auto schema = std::make_shared<Schema>(
+      std::vector<SchemaField>{SchemaField::MakeRequired(1, "id", int64())});
+  ASSERT_TRUE(catalog_
+                  ->CreateTable(table, schema, PartitionSpec::Unpartitioned(),
+                                SortOrder::Unsorted(), "", {})
+                  .has_value());
+
+  ICEBERG_UNWRAP_OR_FAIL(auto table_dir, hadoop::TableDir(warehouse_, table));
+  const std::string data_path = hadoop::DataDir(table_dir) + "/sample.parquet";
+  ASSERT_TRUE(file_io_->CreateDir(hadoop::DataDir(table_dir)).has_value());
+  ASSERT_TRUE(file_io_->WriteFile(data_path, "dummy").has_value());
+
+  EXPECT_TRUE(catalog_->DropTable(table, /*purge=*/true).has_value());
+  ICEBERG_UNWRAP_OR_FAIL(auto data_exists, file_io_->Exists(data_path));
+  EXPECT_FALSE(data_exists) << "purge=true must delete data files";
+}
+
+TEST_F(HadoopCatalogNamespaceTest, CreateNamespaceRejectsTablePath) {
+  // Symmetric guard with NamespaceExists/ListNamespaces: once a path is a
+  // table, CreateNamespace at that exact path must refuse instead of
+  // returning the generic "already exists" used for plain directories --
+  // the conflict is with a table, not a sibling namespace.
+  ASSERT_TRUE(catalog_->CreateNamespace(Namespace{.levels = {"db"}}, {}).has_value());
+  TableIdentifier table{.ns = Namespace{.levels = {"db"}}, .name = "events"};
+  auto schema = std::make_shared<Schema>(
+      std::vector<SchemaField>{SchemaField::MakeRequired(1, "id", int64())});
+  ASSERT_TRUE(catalog_
+                  ->CreateTable(table, schema, PartitionSpec::Unpartitioned(),
+                                SortOrder::Unsorted(), "", {})
+                  .has_value());
+
+  auto res = catalog_->CreateNamespace(Namespace{.levels = {"db", "events"}}, {});
+  ASSERT_FALSE(res.has_value());
+  EXPECT_EQ(ErrorKind::kAlreadyExists, res.error().kind);
+}
+
+TEST_F(HadoopCatalogNamespaceTest, GetNamespacePropertiesRejectsTablePath) {
+  // GetNamespaceProperties must not silently surface a table directory as
+  // a namespace; doing so would let users mutate it via UpdateNamespace*
+  // (NotSupported) and break the listing/load symmetry users rely on.
+  ASSERT_TRUE(catalog_->CreateNamespace(Namespace{.levels = {"db"}}, {}).has_value());
+  TableIdentifier table{.ns = Namespace{.levels = {"db"}}, .name = "events"};
+  auto schema = std::make_shared<Schema>(
+      std::vector<SchemaField>{SchemaField::MakeRequired(1, "id", int64())});
+  ASSERT_TRUE(catalog_
+                  ->CreateTable(table, schema, PartitionSpec::Unpartitioned(),
+                                SortOrder::Unsorted(), "", {})
+                  .has_value());
+
+  auto res = catalog_->GetNamespaceProperties(Namespace{.levels = {"db", "events"}});
+  ASSERT_FALSE(res.has_value());
+  EXPECT_EQ(ErrorKind::kNoSuchNamespace, res.error().kind);
+}
+
+TEST_F(HadoopCatalogNamespaceTest, DropNamespaceRejectsTablePath) {
+  // Crucial: DropNamespace on a table directory must NOT silently
+  // recursively delete the table's metadata and data. Surface NoSuchNamespace
+  // so the operator routes through DropTable (which honours purge).
+  ASSERT_TRUE(catalog_->CreateNamespace(Namespace{.levels = {"db"}}, {}).has_value());
+  TableIdentifier table{.ns = Namespace{.levels = {"db"}}, .name = "events"};
+  auto schema = std::make_shared<Schema>(
+      std::vector<SchemaField>{SchemaField::MakeRequired(1, "id", int64())});
+  ASSERT_TRUE(catalog_
+                  ->CreateTable(table, schema, PartitionSpec::Unpartitioned(),
+                                SortOrder::Unsorted(), "", {})
+                  .has_value());
+
+  auto res = catalog_->DropNamespace(Namespace{.levels = {"db", "events"}});
+  ASSERT_FALSE(res.has_value());
+  EXPECT_EQ(ErrorKind::kNoSuchNamespace, res.error().kind);
+
+  // Table must still be intact afterwards.
+  auto still_table = catalog_->TableExists(table);
+  ASSERT_TRUE(still_table.has_value());
+  EXPECT_TRUE(*still_table);
+}
+
+TEST_F(HadoopCatalogNamespaceTest, CreateTableRejectsPopulatedNamespace) {
+  // Refuse to bury an existing namespace (and its child tables/namespaces)
+  // under a new table. The check sees a child entry whose name is not
+  // metadata/data and refuses the create.
+  ASSERT_TRUE(catalog_->CreateNamespace(Namespace{.levels = {"db"}}, {}).has_value());
+  ASSERT_TRUE(
+      catalog_->CreateNamespace(Namespace{.levels = {"db", "team"}}, {}).has_value());
+  ASSERT_TRUE(catalog_->CreateNamespace(Namespace{.levels = {"db", "team", "proj"}}, {})
+                  .has_value());
+
+  TableIdentifier conflict{.ns = Namespace{.levels = {"db"}}, .name = "team"};
+  auto schema = std::make_shared<Schema>(
+      std::vector<SchemaField>{SchemaField::MakeRequired(1, "id", int64())});
+  auto res = catalog_->CreateTable(conflict, schema, PartitionSpec::Unpartitioned(),
+                                   SortOrder::Unsorted(), "", {});
+  ASSERT_FALSE(res.has_value());
+  EXPECT_EQ(ErrorKind::kInvalidArgument, res.error().kind);
+
+  // The pre-existing namespace must still be intact and listable.
+  auto exists = catalog_->NamespaceExists(Namespace{.levels = {"db", "team"}});
+  ASSERT_TRUE(exists.has_value());
+  EXPECT_TRUE(*exists);
 }
 
 TEST_F(HadoopCatalogNamespaceTest, RegisterExistingMetadataBecomesTable) {

@@ -231,6 +231,14 @@ Status HadoopCatalog::CreateNamespace(
 
   ICEBERG_ASSIGN_OR_RAISE(auto already, file_io_->Exists(ns_dir));
   if (already) {
+    // Path may have been claimed by a table. Surface the conflict rather
+    // than silently treating the table as a namespace.
+    ICEBERG_ASSIGN_OR_RAISE(auto is_table, hadoop::IsHadoopTableDir(*file_io_, ns_dir));
+    if (is_table) {
+      return AlreadyExists(
+          "Cannot create namespace '{}' at {}: a table already occupies that path.",
+          ns.ToString(), ns_dir);
+    }
     return AlreadyExists("Namespace '{}' already exists at {}.", ns.ToString(), ns_dir);
   }
   ICEBERG_RETURN_UNEXPECTED(file_io_->CreateDir(ns_dir));
@@ -316,6 +324,15 @@ HadoopCatalog::GetNamespaceProperties(const Namespace& ns) const {
   if (!*exists_result) {
     return NoSuchNamespace("Namespace '{}' does not exist.", ns.ToString());
   }
+  // A directory that looks like a HadoopCatalog table is not a namespace --
+  // surfacing it as one would lie to ListNamespaces/NamespaceExists and
+  // potentially shadow a real catalog table.
+  ICEBERG_ASSIGN_OR_RAISE(auto is_table, hadoop::IsHadoopTableDir(*file_io_, ns_dir));
+  if (is_table) {
+    return NoSuchNamespace(
+        "Namespace '{}' does not exist (path is occupied by a table at {}).",
+        ns.ToString(), ns_dir);
+  }
   // Java HadoopCatalog returns a single-entry map keyed by "location". We
   // mirror that behaviour exactly.
   return std::unordered_map<std::string, std::string>{{"location", ns_dir}};
@@ -330,6 +347,16 @@ Status HadoopCatalog::DropNamespace(const Namespace& ns) {
   ICEBERG_ASSIGN_OR_RAISE(auto exists, file_io_->Exists(ns_dir));
   if (!exists) {
     return NoSuchNamespace("Namespace '{}' does not exist.", ns.ToString());
+  }
+  // Defensive symmetric guard with GetNamespaceProperties/NamespaceExists:
+  // if the path is actually a table, DropNamespace must not silently delete
+  // the table directory. Surface it as "not a namespace" instead.
+  ICEBERG_ASSIGN_OR_RAISE(auto is_table, hadoop::IsHadoopTableDir(*file_io_, ns_dir));
+  if (is_table) {
+    return NoSuchNamespace(
+        "Namespace '{}' does not exist (path is occupied by a table at {}); "
+        "use DropTable to remove it.",
+        ns.ToString(), ns_dir);
   }
   ICEBERG_ASSIGN_OR_RAISE(auto entries, file_io_->ListDir(ns_dir));
   if (!entries.empty()) {
@@ -521,6 +548,19 @@ Result<std::string> HadoopCatalog::WriteInitialBytesLocked(
   if (recheck) {
     return AlreadyExists("Table already exists at {}.", table_dir);
   }
+  // Also re-check the namespace-occupation invariant under the lock: a
+  // concurrent CreateNamespace could have populated this path between the
+  // pre-check and Acquire. Without this guard a CreateTable would either
+  // bury the namespace's children under a new metadata/ or fight a parallel
+  // create at a different leaf inside the namespace.
+  ICEBERG_ASSIGN_OR_RAISE(auto occupied,
+                          hadoop::HasNonTableInternalChildren(*file_io_, table_dir));
+  if (occupied) {
+    return InvalidArgument(
+        "Cannot create table at {}: path is occupied by a namespace (it already "
+        "contains child entries other than metadata/ and data/).",
+        table_dir);
+  }
 
   return PublishV1AfterLock(*file_io_, table_dir, codec, raw_bytes);
 }
@@ -546,6 +586,18 @@ Result<std::shared_ptr<Table>> HadoopCatalog::CreateTable(
   if (already_table) {
     return AlreadyExists("Table '{}' already exists at {}.", identifier.ToString(),
                          table_dir);
+  }
+  // Refuse to create a table under a directory that already holds namespace
+  // children -- otherwise ListNamespaces / NamespaceExists would start
+  // hiding the path (it now passes IsHadoopTableDir) while its sub-entries
+  // remain on disk in a half-reachable state. The same check runs again
+  // under the lock for race safety; this is the cheap path.
+  ICEBERG_ASSIGN_OR_RAISE(auto path_occupied,
+                          hadoop::HasNonTableInternalChildren(*file_io_, table_dir));
+  if (path_occupied) {
+    return InvalidArgument(
+        "Cannot create table '{}' at {}: path is occupied by a namespace.",
+        identifier.ToString(), table_dir);
   }
 
   const std::string base_location = location.empty() ? table_dir : location;
@@ -582,6 +634,15 @@ Result<std::shared_ptr<Table>> HadoopCatalog::UpdateTable(
     if (already_table) {
       return AlreadyExists("Table '{}' already exists at {}.", identifier.ToString(),
                            table_dir);
+    }
+    // Same namespace-occupation guard as CreateTable; the lock-time recheck
+    // inside WriteInitialTableLocked covers the race window.
+    ICEBERG_ASSIGN_OR_RAISE(auto path_occupied,
+                            hadoop::HasNonTableInternalChildren(*file_io_, table_dir));
+    if (path_occupied) {
+      return InvalidArgument(
+          "Cannot create table '{}' at {}: path is occupied by a namespace.",
+          identifier.ToString(), table_dir);
     }
     int8_t format_version = TableMetadata::kDefaultTableFormatVersion;
     for (const auto& update : updates) {
@@ -654,22 +715,29 @@ Status HadoopCatalog::DropTable(const TableIdentifier& identifier, bool purge) {
     return NoSuchTable("Table '{}' does not exist at {}.", identifier.ToString(),
                        table_dir);
   }
-  // Both purge values map onto the same primitive: recursively remove the
-  // table directory tree. For the default LocationProvider (data under
-  // <table>/data/) this matches Java's `purge=true` outcome exactly. Tables
-  // with a custom LocationProvider need a manifest-walk to find data files
-  // outside the table directory; that helper lives in iceberg_bundle (Avro
-  // reader) and is out of scope for the lightweight iceberg_hadoop library,
-  // so we warn operators when they ask for purge=true so the divergence
-  // from Java is visible.
-  if (purge) {
-    LogWarning(std::format(
-        "HadoopCatalog::DropTable(purge=true) on '{}' deletes the table directory "
-        "tree only; data files outside it (custom LocationProvider) are NOT "
-        "manifest-walked. Run `expire_snapshots` first if your table uses a custom "
-        "location.",
-        identifier.ToString()));
+  if (!purge) {
+    // Catalog::DropTable contract: data and metadata files are deleted only
+    // when purge=true. With purge=false we unregister the table from the
+    // catalog (so TableExists turns false) but keep `data/` (and any other
+    // user-managed contents under the table directory) intact, so the
+    // operator can RegisterTable a recovered metadata file later. The
+    // "unregister" primitive is deleting the catalog-managed `metadata/`
+    // subdirectory (which contains version-hint.text and v{N}.metadata.json).
+    return file_io_->DeleteDir(hadoop::MetadataDir(table_dir), /*recursive=*/true);
   }
+  // purge=true: recursively remove the table directory tree. For the
+  // default LocationProvider (data under <table>/data/) this matches Java's
+  // `purge=true` outcome exactly. Tables with a custom LocationProvider
+  // need a manifest-walk to find data files outside the table directory;
+  // that helper lives in iceberg_bundle (Avro reader) and is out of scope
+  // for the lightweight iceberg_hadoop library, so we warn operators so
+  // the divergence from Java is visible.
+  LogWarning(std::format(
+      "HadoopCatalog::DropTable(purge=true) on '{}' deletes the table directory "
+      "tree only; data files outside it (custom LocationProvider) are NOT "
+      "manifest-walked. Run `expire_snapshots` first if your table uses a custom "
+      "location.",
+      identifier.ToString()));
   return file_io_->DeleteDir(table_dir, /*recursive=*/true);
 }
 
