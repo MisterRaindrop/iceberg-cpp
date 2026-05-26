@@ -59,6 +59,49 @@ TEST(HadoopFileLayoutTest, NamespaceLevelValidation) {
   EXPECT_FALSE(ValidateNamespace(reserved).has_value());
 }
 
+TEST(HadoopFileLayoutTest, IdentifierRejectsUriSeparators) {
+  // `?` and `#` are URI reserved separators -- arrow's URI parser would
+  // strip them and everything after, so `db?use_mmap` would resolve to
+  // the SAME directory as `db` and let one identifier hijack another's
+  // data. Reject at the validator before the component is ever joined
+  // into a URI.
+  EXPECT_FALSE(ValidateNamespaceLevel("db?use_mmap").has_value());
+  EXPECT_FALSE(ValidateNamespaceLevel("db#anchor").has_value());
+  TableIdentifier qmark{.ns = Namespace{.levels = {"db"}}, .name = "events?x=1"};
+  EXPECT_FALSE(ValidateTableIdentifier(qmark).has_value());
+  TableIdentifier hash{.ns = Namespace{.levels = {"db"}}, .name = "evts#anchor"};
+  EXPECT_FALSE(ValidateTableIdentifier(hash).has_value());
+}
+
+TEST(HadoopFileLayoutTest, CanonicalizeWarehouseCollapsesUriAliases) {
+  // Percent-encoded URI form decodes to the canonical version; literal
+  // POSIX paths are preserved (their `%` bytes are literal filename
+  // bytes). Trailing slashes are stripped so `file:///wh` and
+  // `file:///wh/` collapse together.
+  auto encoded = CanonicalizeWarehouse("file:///tmp/my%20wh");
+  auto decoded = CanonicalizeWarehouse("file:///tmp/my wh");
+  ASSERT_TRUE(encoded.has_value());
+  ASSERT_TRUE(decoded.has_value());
+  EXPECT_EQ(*encoded, *decoded);
+  EXPECT_EQ(*encoded, "file:///tmp/my wh");
+
+  auto with_slash = CanonicalizeWarehouse("file:///wh/");
+  auto without_slash = CanonicalizeWarehouse("file:///wh");
+  ASSERT_TRUE(with_slash.has_value());
+  ASSERT_TRUE(without_slash.has_value());
+  EXPECT_EQ(*with_slash, *without_slash);
+
+  // Literal local paths are NOT decoded; `%20` is a literal filename byte.
+  auto literal = CanonicalizeWarehouse("/tmp/my%20wh");
+  ASSERT_TRUE(literal.has_value());
+  EXPECT_EQ(*literal, "/tmp/my%20wh");
+
+  // Malformed percent encoding in a URI surfaces as InvalidArgument.
+  auto bad = CanonicalizeWarehouse("file:///tmp/wh%2");
+  ASSERT_FALSE(bad.has_value());
+  EXPECT_EQ(ErrorKind::kInvalidArgument, bad.error().kind);
+}
+
 TEST(HadoopFileLayoutTest, IdentifierAllowsUtf8) {
   // Java HadoopCatalog accepts Unicode identifiers. We must not reject
   // valid UTF-8 byte sequences (>= 0x80) wholesale; only control bytes,

@@ -42,7 +42,32 @@ std::string JoinUnderRoot(std::string_view root, std::string_view child) {
   return base;
 }
 
+// Forward declarations -- defined further down (PercentDecode and
+// LooksLikeUri live near IsPathInsideNormalized). CanonicalizeWarehouse
+// needs them at top-of-file.
+bool PercentDecode(std::string_view s, std::string& out);
+bool LooksLikeUri(std::string_view path);
+
 }  // namespace
+
+Result<std::string> CanonicalizeWarehouse(std::string_view warehouse) {
+  std::string canonical;
+  if (LooksLikeUri(warehouse)) {
+    if (!PercentDecode(warehouse, canonical)) {
+      return InvalidArgument(
+          "Warehouse '{}' has malformed percent encoding (lone '%' or non-hex "
+          "pair); supply a canonical URI.",
+          warehouse);
+    }
+  } else {
+    canonical.assign(warehouse);
+  }
+  // Strip a trailing '/' so `file:///wh` and `file:///wh/` collapse.
+  while (canonical.size() > 1 && canonical.back() == '/') {
+    canonical.pop_back();
+  }
+  return canonical;
+}
 
 bool IsS3Scheme(std::string_view location) {
   return location.starts_with("s3://") || location.starts_with("s3a://") ||
@@ -136,6 +161,18 @@ Status RejectUnsafeIdentifierChars(std::string_view component, std::string_view 
           "{} '{}' contains '\\' which is the Windows path separator; "
           "use '/' (forbidden separately) or rename.",
           kind, component);
+    }
+    if (c == '?' || c == '#') {
+      // URI reserved separators (`?` starts the query, `#` the fragment).
+      // arrow's URI parser splits at them, so a name like `db?use_mmap`
+      // would resolve to the SAME physical directory as `db` -- letting
+      // a caller delete or overwrite another logical identifier's data.
+      // Reject these characters at the validator.
+      return InvalidArgument(
+          "{} '{}' contains '{}' which is a URI reserved separator and would "
+          "be stripped from the path at IO time, aliasing two distinct "
+          "identifiers to the same directory.",
+          kind, component, static_cast<char>(c));
     }
   }
   return {};

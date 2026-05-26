@@ -177,8 +177,10 @@ struct FileLockManager::HeartbeatState {
 };
 
 FileLockManager::FileLockManager(std::shared_ptr<FileIO> file_io,
-                                 const HadoopCatalogProperties& config)
+                                 const HadoopCatalogProperties& config,
+                                 std::string lock_root)
     : file_io_(std::move(file_io)),
+      lock_root_(std::move(lock_root)),
       acquire_timeout_(std::chrono::milliseconds(
           config.Get(HadoopCatalogProperties::kLockAcquireTimeoutMs))),
       acquire_interval_(std::chrono::milliseconds(
@@ -187,6 +189,48 @@ FileLockManager::FileLockManager(std::shared_ptr<FileIO> file_io,
           config.Get(HadoopCatalogProperties::kLockHeartbeatIntervalMs))),
       heartbeat_timeout_(std::chrono::milliseconds(
           config.Get(HadoopCatalogProperties::kLockHeartbeatTimeoutMs))) {}
+
+namespace {
+
+// Map `entity_id` to a single filesystem-safe filename. We pick a FNV-1a
+// 64-bit hash + hex digest because URL-percent-encoding the raw
+// entity_id (which is itself a `file://` URI) would survive a single
+// arrow URI parse only to be DECODED at IO time -- the result would
+// then be a different native path, defeating the lock. A fixed-width
+// hex digest contains only `[0-9a-f]`, has no URI-special characters,
+// fits comfortably under NAME_MAX (well below 255 bytes) and gives
+// deterministic naming across processes (FNV-1a is data-dependent
+// only). Collision risk is negligible for a single warehouse's table
+// space.
+std::string EncodeEntityIdAsFilename(std::string_view entity_id) {
+  // FNV-1a 64-bit.
+  constexpr std::uint64_t kFnvOffset = 0xcbf29ce484222325ULL;
+  constexpr std::uint64_t kFnvPrime = 0x100000001b3ULL;
+  std::uint64_t h = kFnvOffset;
+  for (unsigned char c : entity_id) {
+    h ^= static_cast<std::uint64_t>(c);
+    h *= kFnvPrime;
+  }
+  static constexpr std::string_view kHex = "0123456789abcdef";
+  std::string out(16, '0');
+  for (int i = 15; i >= 0; --i) {
+    out[i] = kHex[h & 0xF];
+    h >>= 4;
+  }
+  return out;
+}
+
+}  // namespace
+
+std::string FileLockManager::LockFilePathFor(std::string_view entity_id) const {
+  std::string p = lock_root_;
+  if (!p.empty() && p.back() != '/') {
+    p.push_back('/');
+  }
+  p.append(EncodeEntityIdAsFilename(entity_id));
+  p.append(".lock");
+  return p;
+}
 
 FileLockManager::~FileLockManager() {
   // Wake any acquirers parked in the Acquire retry loop and then drain held
@@ -265,12 +309,14 @@ Result<bool> FileLockManager::Acquire(const std::string& entity_id,
   if (file_io_ == nullptr) {
     return InvalidArgument("FileLockManager: FileIO is null.");
   }
-  const std::string lock_path = LockFilePath(entity_id);
-  const std::string lock_dir = MetadataDir(entity_id);
-  // CreateDir is idempotent ("mkdir -p" semantics). Failures here mean the
-  // FileIO can't even create the metadata directory -- there is no point
-  // retrying in the Acquire loop, so propagate.
-  if (auto create = file_io_->CreateDir(lock_dir); !create.has_value()) {
+  const std::string lock_path = LockFilePathFor(entity_id);
+  // CreateDir is idempotent ("mkdir -p" semantics). The lock root lives
+  // OUTSIDE every entity's own directory so a peer's DropTable on
+  // `<entity_id>` can recursive-delete that subtree without affecting
+  // lock state at all -- this is the property that lets DropTable hold
+  // the lock through its entire delete sequence (no rmdir-after-Release
+  // race with concurrent CreateTable).
+  if (auto create = file_io_->CreateDir(lock_root_); !create.has_value()) {
     return std::unexpected<Error>(create.error());
   }
 
@@ -284,7 +330,7 @@ Result<bool> FileLockManager::Acquire(const std::string& entity_id,
     // which is TOCTOU, so we deliberately do NOT use it here.
     const std::string body = EncodeLockBody(owner_id, MillisSinceEpoch());
     const std::string tmp_path =
-        std::format("{}/_lock.tmp.{}", lock_dir, Uuid::GenerateV7().ToString());
+        std::format("{}/_lock.tmp.{}", lock_root_, Uuid::GenerateV7().ToString());
     auto write_status = file_io_->WriteFile(tmp_path, body);
     if (!write_status.has_value()) {
       // Real infrastructure error -- propagate rather than spin waiting
@@ -404,7 +450,7 @@ Status FileLockManager::Release(const std::string& entity_id,
   if (file_io_ == nullptr) {
     return InvalidArgument("FileLockManager: FileIO is null.");
   }
-  const std::string lock_path = LockFilePath(entity_id);
+  const std::string lock_path = LockFilePathFor(entity_id);
 
   // Verify ownership FIRST. A misrouted Release(entity, wrong_owner) used
   // to stop the real holder's heartbeat before returning kNotAllowed --
@@ -522,7 +568,19 @@ Result<std::unique_ptr<LockManager>> MakeLockManagerWithIO(
           "commit.lock-impl=file requires a FileIO; use MakeLockManagerWithIO from "
           "HadoopCatalog::Make.");
     }
-    return std::make_unique<FileLockManager>(std::move(file_io), config);
+    // Lock files live in a dedicated subdirectory of the warehouse, NOT
+    // under any table's own directory tree. This lets DropTable recursive-
+    // delete a table while still holding the lock (the lock is at a
+    // sibling path) and closes the rmdir-after-Release race the previous
+    // in-table-dir layout suffered.
+    ICEBERG_ASSIGN_OR_RAISE(auto warehouse, config.Warehouse());
+    std::string lock_root(warehouse);
+    while (!lock_root.empty() && lock_root.back() == '/') {
+      lock_root.pop_back();
+    }
+    lock_root.append("/_iceberg_catalog_locks");
+    return std::make_unique<FileLockManager>(std::move(file_io), config,
+                                             std::move(lock_root));
   }
   return InvalidArgument("Unknown commit.lock-impl '{}'; expected 'in-memory' or 'file'.",
                          impl);

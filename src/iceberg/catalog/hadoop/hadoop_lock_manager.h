@@ -146,12 +146,25 @@ class ICEBERG_HADOOP_EXPORT InMemoryLockManager : public LockManager {
 /// Acquire-time rename CAS plus the commit-time metadata rename CAS.
 class ICEBERG_HADOOP_EXPORT FileLockManager : public LockManager {
  public:
-  FileLockManager(std::shared_ptr<FileIO> file_io, const HadoopCatalogProperties& config);
+  /// \param file_io  FileIO backing the warehouse.
+  /// \param config   Catalog config (timeouts).
+  /// \param lock_root Directory where _lock files live. Lock files are
+  ///   placed at `<lock_root>/<encoded(entity_id)>.lock` -- crucially
+  ///   OUTSIDE the table directory the lock guards, so DropTable can
+  ///   recursively delete the table dir without removing the lock file
+  ///   (and without racing peers between Release and rmdir).
+  FileLockManager(std::shared_ptr<FileIO> file_io, const HadoopCatalogProperties& config,
+                  std::string lock_root);
   ~FileLockManager() override;
 
   Result<bool> Acquire(const std::string& entity_id,
                        const std::string& owner_id) override;
   Status Release(const std::string& entity_id, const std::string& owner_id) override;
+
+  /// \brief Return the on-disk lock file path for `entity_id`. Public so
+  /// tests (and HadoopCatalog DropTable) can introspect without
+  /// duplicating the encoder.
+  std::string LockFilePathFor(std::string_view entity_id) const;
 
  private:
   struct HeartbeatState;
@@ -159,6 +172,7 @@ class ICEBERG_HADOOP_EXPORT FileLockManager : public LockManager {
   void StopHeartbeat(std::unique_ptr<HeartbeatState> state);
 
   std::shared_ptr<FileIO> file_io_;
+  std::string lock_root_;
   std::chrono::milliseconds acquire_timeout_;
   std::chrono::milliseconds acquire_interval_;
   std::chrono::milliseconds heartbeat_interval_;

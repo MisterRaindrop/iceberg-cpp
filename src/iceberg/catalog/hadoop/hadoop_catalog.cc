@@ -153,10 +153,17 @@ Result<std::shared_ptr<HadoopCatalog>> HadoopCatalog::Make(
   ICEBERG_ASSIGN_OR_RAISE(auto warehouse, config.Warehouse());
   ICEBERG_RETURN_UNEXPECTED(config.Validate());
   MaybeWarnNonAtomicWarehouse(warehouse);
+  // Canonicalise the warehouse string so two HadoopCatalog instances
+  // configured with different SURFACE representations of the same
+  // physical location (e.g. `file:///tmp/my%20wh` and
+  // `file:///tmp/my wh`) produce the same `table_dir` strings -- which
+  // are also the in-memory lock keys. Without this, peer catalogs
+  // would publish to the same directory while holding distinct locks,
+  // re-opening the codec-mismatch CAS race the lock is meant to close.
+  ICEBERG_ASSIGN_OR_RAISE(auto warehouse_str, hadoop::CanonicalizeWarehouse(warehouse));
   ICEBERG_ASSIGN_OR_RAISE(auto lock_manager,
                           hadoop::MakeLockManagerWithIO(config, file_io));
 
-  std::string warehouse_str(warehouse);
   return std::shared_ptr<HadoopCatalog>(new HadoopCatalog(
       std::string(name), std::move(file_io), std::move(config),
       std::shared_ptr<LockManager>(std::move(lock_manager)), std::move(warehouse_str)));
@@ -272,6 +279,24 @@ Status HadoopCatalog::CreateNamespace(
   ICEBERG_RETURN_UNEXPECTED(
       hadoop::RejectAncestorIsTable(*file_io_, warehouse_, ns, /*last_inclusive=*/false));
 
+  // Serialize against concurrent CreateTable at any ancestor path -- the
+  // ancestor check above is racy on its own because CreateTable uses a
+  // DIFFERENT per-table lock (keyed at its own table_dir). Without the
+  // lock + post-create recheck, a concurrent CreateTable(db.parent)
+  // could publish while we're between the ancestor scan and CreateDir,
+  // and the resulting db.parent.sub namespace would live INSIDE a
+  // table that DropTable(purge=true) recursively wipes.
+  const std::string owner =
+      name_ + ":create-ns:" + ns.ToString() + ":" + Uuid::GenerateV7().ToString();
+  ICEBERG_ASSIGN_OR_RAISE(auto acquired, lock_manager_->Acquire(ns_dir, owner));
+  if (!acquired) {
+    return CommitFailed(
+        "HadoopCatalog::CreateNamespace: failed to acquire lock for '{}' within "
+        "the configured timeout.",
+        ns_dir);
+  }
+  LockReleaseGuard guard(lock_manager_.get(), ns_dir, owner);
+
   ICEBERG_ASSIGN_OR_RAISE(auto already, file_io_->Exists(ns_dir));
   if (already) {
     // Path may have been claimed by a table. Surface the conflict rather
@@ -285,6 +310,17 @@ Status HadoopCatalog::CreateNamespace(
     return AlreadyExists("Namespace '{}' already exists at {}.", ns.ToString(), ns_dir);
   }
   ICEBERG_RETURN_UNEXPECTED(file_io_->CreateDir(ns_dir));
+  // Post-create recheck: a concurrent CreateTable at an ancestor may
+  // have published while we were holding only the leaf-namespace lock.
+  // If so, our just-created dir lives INSIDE a table -- rollback so
+  // DropTable(purge=true) of the ancestor table cannot wipe stranded
+  // catalog state.
+  if (auto check = hadoop::RejectAncestorIsTable(*file_io_, warehouse_, ns,
+                                                 /*last_inclusive=*/false);
+      !check.has_value()) {
+    std::ignore = file_io_->DeleteDir(ns_dir, /*recursive=*/false);
+    return std::unexpected<Error>(check.error());
+  }
   return {};
 }
 
@@ -309,6 +345,19 @@ Result<std::vector<Namespace>> HadoopCatalog::ListNamespaces(const Namespace& ns
   ICEBERG_ASSIGN_OR_RAISE(auto is_dir, file_io_->IsDirectory(parent_dir));
   if (!is_dir) {
     return NoSuchNamespace("Namespace '{}' is not a directory.", ns.ToString());
+  }
+  // The path itself must not be a table -- enumerating a table's
+  // internal subdirs would surface `metadata/` as a fake child
+  // namespace (and the result `db.events.metadata` then fails the
+  // validator because `metadata` is reserved).
+  if (!ns.levels.empty()) {
+    ICEBERG_ASSIGN_OR_RAISE(auto is_table,
+                            hadoop::IsHadoopTableDir(*file_io_, parent_dir));
+    if (is_table) {
+      return NoSuchNamespace(
+          "Namespace '{}' does not exist (path is a Hadoop table at {}).", ns.ToString(),
+          parent_dir);
+    }
   }
 
   auto entries_result = file_io_->ListDir(parent_dir);
@@ -457,6 +506,17 @@ Result<std::vector<TableIdentifier>> HadoopCatalog::ListTables(
       return std::vector<TableIdentifier>{};
     }
     return NoSuchNamespace("Namespace '{}' does not exist.", ns.ToString());
+  }
+  // Refuse to enumerate "tables" under a path that is itself a table --
+  // otherwise we'd report its `metadata/` / `data/` subdirs as if they
+  // were sibling tables. Same guard ListNamespaces has.
+  if (!ns.levels.empty()) {
+    ICEBERG_ASSIGN_OR_RAISE(auto is_table, hadoop::IsHadoopTableDir(*file_io_, ns_dir));
+    if (is_table) {
+      return NoSuchNamespace(
+          "Namespace '{}' does not exist (path is a Hadoop table at {}).", ns.ToString(),
+          ns_dir);
+    }
   }
 
   auto entries_result = file_io_->ListDir(ns_dir);
@@ -959,73 +1019,13 @@ Status HadoopCatalog::DropTable(const TableIdentifier& identifier, bool purge) {
     }
   }
   // No snapshots and no external statistic / metadata-log references:
-  // every file we could be responsible for is under table_dir. We now
-  // need to delete the table directory in an order that does NOT remove
-  // the lock file (which is held by `guard`) before we are done, since
-  // another catalog instance could otherwise Acquire-and-publish a new
-  // table at the same path while our recursive delete continues and
-  // wipe their just-published files.
-  //
-  // Strategy:
-  //   1. Delete every child of <table_dir> EXCEPT `metadata/` (which
-  //      still contains our held `_lock`).
-  //   2. Delete every child of <table_dir>/metadata/ EXCEPT `_lock`.
-  //   3. Release the lock (this deletes `_lock` and stops the heartbeat;
-  //      Dismiss the RAII guard so we don't double-release).
-  //   4. Best-effort remove the now-empty <table_dir>/metadata and
-  //      <table_dir>. If a concurrent CreateTable raced in between
-  //      step 3 and step 4 and recreated files there, the non-recursive
-  //      rmdir naturally fails and we leave their files alone -- the
-  //      drop semantically succeeded (our old data is gone, the new
-  //      writer is responsible for their own publish).
-  const std::string md_dir = hadoop::MetadataDir(table_dir);
-  ICEBERG_ASSIGN_OR_RAISE(auto root_entries, file_io_->ListDir(table_dir));
-  for (const auto& entry : root_entries) {
-    if (hadoop::Basename(entry.location) == "metadata") {
-      continue;  // skip the dir that holds our lock
-    }
-    if (entry.is_directory) {
-      ICEBERG_RETURN_UNEXPECTED(file_io_->DeleteDir(entry.location, /*recursive=*/true));
-    } else {
-      ICEBERG_RETURN_UNEXPECTED(file_io_->DeleteFile(entry.location));
-    }
-  }
-  ICEBERG_ASSIGN_OR_RAISE(auto md_entries, file_io_->ListDir(md_dir));
-  for (const auto& entry : md_entries) {
-    if (hadoop::Basename(entry.location) == "_lock") {
-      continue;  // we still hold this; Release will remove it below
-    }
-    if (entry.is_directory) {
-      ICEBERG_RETURN_UNEXPECTED(file_io_->DeleteDir(entry.location, /*recursive=*/true));
-    } else {
-      ICEBERG_RETURN_UNEXPECTED(file_io_->DeleteFile(entry.location));
-    }
-  }
-  // Release the lock now (deletes _lock + stops heartbeat) and tell the
-  // RAII guard not to re-release.
-  if (auto rel = lock_manager_->Release(table_dir, owner); !rel.has_value()) {
-    LogWarning(std::format("HadoopCatalog::DropTable: lock release for '{}' failed: {}",
-                           table_dir, rel.error().message));
-  }
-  guard.Dismiss();
-  // Tear down the now-empty metadata/ and table dir. If a concurrent
-  // CreateTable Acquired in the gap, these become non-empty and the
-  // rmdir is a graceful no-op; log a warning rather than failing the
-  // already-successful drop.
-  if (auto rm_md = file_io_->DeleteDir(md_dir, /*recursive=*/false); !rm_md.has_value()) {
-    LogWarning(std::format(
-        "HadoopCatalog::DropTable: metadata dir rmdir for '{}' failed (possibly a "
-        "concurrent CreateTable raced after lock release): {}",
-        md_dir, rm_md.error().message));
-    return {};
-  }
-  if (auto rm_tbl = file_io_->DeleteDir(table_dir, /*recursive=*/false);
-      !rm_tbl.has_value()) {
-    LogWarning(std::format(
-        "HadoopCatalog::DropTable: table dir rmdir for '{}' failed (possibly a "
-        "concurrent CreateTable raced after lock release): {}",
-        table_dir, rm_tbl.error().message));
-  }
+  // every file we could be responsible for is under table_dir. Since
+  // the lock file (for lock-impl=file) lives OUTSIDE table_dir (in
+  // <warehouse>/_iceberg_catalog_locks/), we can simply recursive-
+  // delete table_dir while still holding the lock -- no rmdir-after-
+  // Release race with a concurrent CreateTable, since CreateTable
+  // would block on Acquire until our Release.
+  ICEBERG_RETURN_UNEXPECTED(file_io_->DeleteDir(table_dir, /*recursive=*/true));
   return {};
 }
 

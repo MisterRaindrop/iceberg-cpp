@@ -250,6 +250,12 @@ TEST_F(HadoopCommitTest, FileLockManagerAcquiresAndDetectsStale) {
       {"lock.heartbeat-timeout-ms", "10000"},
   });
   ICEBERG_UNWRAP_OR_FAIL(auto raw, MakeLockManagerWithIO(props, file_io_));
+  // Need the FileLockManager-specific accessor `LockFilePathFor` so we can
+  // hand-seed a stale lock file at the actual on-disk location (the lock
+  // root now lives in `<warehouse>/_iceberg_catalog_locks/`, NOT under
+  // the table dir).
+  auto* file_lock_raw = dynamic_cast<FileLockManager*>(raw.get());
+  ASSERT_NE(file_lock_raw, nullptr);
   auto file_lock = std::shared_ptr<LockManager>(std::move(raw));
 
   ICEBERG_UNWRAP_OR_FAIL(auto first, file_lock->Acquire(table_dir_, "first"));
@@ -265,14 +271,15 @@ TEST_F(HadoopCommitTest, FileLockManagerAcquiresAndDetectsStale) {
   // place and surface a warning. Operators (or an external reaper) must
   // remove the stale lock; once removed, Acquire succeeds normally.
   ASSERT_TRUE(file_lock->Release(table_dir_, "first").has_value());
-  ASSERT_TRUE(file_io_->WriteFile(LockFilePath(table_dir_), "ghost|0\n").has_value());
+  const std::string lock_path = file_lock_raw->LockFilePathFor(table_dir_);
+  ASSERT_TRUE(file_io_->WriteFile(lock_path, "ghost|0\n").has_value());
   ICEBERG_UNWRAP_OR_FAIL(auto stale_blocked, file_lock->Acquire(table_dir_, "newcomer"));
   EXPECT_FALSE(stale_blocked)
       << "stale on-disk lock must not be auto-reclaimed by Acquire";
 
   // External reaper removes the stale file; the next Acquire then wins via
   // the normal Rename-CAS publish path.
-  ASSERT_TRUE(file_io_->DeleteFile(LockFilePath(table_dir_)).has_value());
+  ASSERT_TRUE(file_io_->DeleteFile(lock_path).has_value());
   ICEBERG_UNWRAP_OR_FAIL(auto after_reap, file_lock->Acquire(table_dir_, "newcomer"));
   EXPECT_TRUE(after_reap);
   EXPECT_TRUE(file_lock->Release(table_dir_, "newcomer").has_value());
