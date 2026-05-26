@@ -592,10 +592,17 @@ Result<std::string> HadoopCatalog::WriteInitialTableLocked(
 Result<std::string> HadoopCatalog::WriteInitialBytesLocked(
     const std::string& table_dir, std::string_view raw_bytes,
     MetadataCompressionCodec codec, const std::string& owner_prefix) {
-  ICEBERG_RETURN_UNEXPECTED(file_io_->CreateDir(hadoop::MetadataDir(table_dir)));
-
   const std::string owner =
       name_ + ":" + owner_prefix + ":" + Uuid::GenerateV7().ToString();
+  // Acquire BEFORE creating the metadata directory: a concurrent
+  // DropTable on the same path can be in its post-Release rmdir(metadata)
+  // window. If we CreateDir(metadata) first and then block on Acquire,
+  // the drop's rmdir can wipe our freshly-created dir before our
+  // Acquire even gets a chance, and the later WriteFile fails for
+  // missing parent. Acquiring first serialises us against the drop:
+  // with the file-lock backend, Acquire itself CreateDir's metadata
+  // (idempotent) while writing the lock body; with the in-memory
+  // backend, we do the CreateDir below under our held lock.
   ICEBERG_ASSIGN_OR_RAISE(auto acquired, lock_manager_->Acquire(table_dir, owner));
   if (!acquired) {
     return CommitFailed(
@@ -604,6 +611,10 @@ Result<std::string> HadoopCatalog::WriteInitialBytesLocked(
         table_dir);
   }
   LockReleaseGuard guard(lock_manager_.get(), table_dir, owner);
+  // Idempotent under file-lock (Acquire already created the dir);
+  // required under in-memory-lock where Acquire has no on-disk side
+  // effects.
+  ICEBERG_RETURN_UNEXPECTED(file_io_->CreateDir(hadoop::MetadataDir(table_dir)));
 
   ICEBERG_ASSIGN_OR_RAISE(auto recheck, hadoop::IsHadoopTableDir(*file_io_, table_dir));
   if (recheck) {
@@ -623,7 +634,68 @@ Result<std::string> HadoopCatalog::WriteInitialBytesLocked(
         table_dir);
   }
 
-  return PublishV1AfterLock(*file_io_, table_dir, codec, raw_bytes);
+  ICEBERG_ASSIGN_OR_RAISE(auto published,
+                          PublishV1AfterLock(*file_io_, table_dir, codec, raw_bytes));
+
+  // Post-publish hierarchy recheck. The per-table lock we hold only
+  // serializes operations on THIS table_dir; a concurrent CreateTable
+  // at an ancestor (e.g. our parent namespace) or descendant of our
+  // path uses a DIFFERENT lock and may have passed its own pre-publish
+  // ancestor scan while we did the same. By rechecking the hierarchy
+  // immediately after our v1 lands, BOTH writers in a parent/child
+  // race observe the conflict and both rollback -- the caller then
+  // retries, and only one survives the second pass. Without this step
+  // a concurrent CreateTable(db.team) + CreateTable(db.team.sub.child)
+  // could leave the catalog in a state where DropTable(db.team,
+  // purge=true) silently wipes the child.
+  ICEBERG_ASSIGN_OR_RAISE(auto descendant_occupied,
+                          hadoop::HasNonTableInternalChildren(*file_io_, table_dir));
+  bool conflict = descendant_occupied;
+  std::string conflict_msg;
+  if (descendant_occupied) {
+    conflict_msg = std::format(
+        "post-publish recheck: '{}' acquired a non-table-internal child during "
+        "our publish window (concurrent descendant CreateTable / "
+        "CreateNamespace).",
+        table_dir);
+  }
+  if (!conflict) {
+    // Walk parents of table_dir up to the warehouse and refuse if any
+    // ancestor became a Hadoop table during our publish window. Strip
+    // the warehouse prefix and walk the remaining ancestor segments.
+    const std::string_view warehouse_view = LocationUtil::StripTrailingSlash(warehouse_);
+    const std::string_view table_view = LocationUtil::StripTrailingSlash(table_dir);
+    if (table_view.starts_with(warehouse_view) &&
+        table_view.size() > warehouse_view.size() + 1) {
+      std::string_view rel = table_view.substr(warehouse_view.size() + 1);
+      // Walk every proper prefix of `rel`.
+      size_t cursor = rel.find('/');
+      while (cursor != std::string_view::npos) {
+        const std::string ancestor =
+            std::string(warehouse_view) + "/" + std::string(rel.substr(0, cursor));
+        auto is_table = hadoop::IsHadoopTableDir(*file_io_, ancestor);
+        if (is_table.has_value() && *is_table) {
+          conflict = true;
+          conflict_msg = std::format(
+              "post-publish recheck: ancestor '{}' became a Hadoop table during "
+              "our publish window (concurrent ancestor CreateTable).",
+              ancestor);
+          break;
+        }
+        cursor = rel.find('/', cursor + 1);
+      }
+    }
+  }
+  if (conflict) {
+    // Rollback: best-effort delete of the just-published v1 and the
+    // version-hint we wrote. Both writers in the race do this; the
+    // caller sees CommitFailed and retries -- only one of them then
+    // re-publishes cleanly.
+    std::ignore = file_io_->DeleteFile(published);
+    std::ignore = file_io_->DeleteFile(hadoop::VersionHintPath(table_dir));
+    return CommitFailed("{}", conflict_msg);
+  }
+  return published;
 }
 
 Result<std::shared_ptr<Table>> HadoopCatalog::CreateTable(

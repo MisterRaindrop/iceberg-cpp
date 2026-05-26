@@ -348,7 +348,60 @@ bool ContainsTraversalSegment(std::string_view path) {
 
 }  // namespace
 
+namespace {
+
+// Detect whether `path` is a URI (has a `scheme://` prefix) or a bare
+// filesystem path. ArrowFileSystemFileIO percent-decodes only the URI
+// form; bare paths are passed to the OS literally. The descendant check
+// must mirror that behaviour, otherwise a stats path like
+// `/tmp/table%2Foutside/x.puffin` would be decoded by us into
+// `/tmp/table/outside/x.puffin` and classified as "inside `/tmp/table`",
+// while the literal access actually lands in the sibling directory
+// `/tmp/table%2Foutside/`. Treat a leading `<scheme>://` as a URI; any
+// other shape (including absolute POSIX paths and Windows drive paths)
+// is literal.
+bool LooksLikeUri(std::string_view path) {
+  const auto colon = path.find(':');
+  if (colon == std::string_view::npos || colon == 0) {
+    return false;
+  }
+  // The substring before `:` must be a scheme: ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )
+  for (size_t i = 0; i < colon; ++i) {
+    const char c = path[i];
+    const bool ok =
+        (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+        (i > 0 && ((c >= '0' && c <= '9') || c == '+' || c == '-' || c == '.'));
+    if (!ok) {
+      return false;
+    }
+  }
+  return path.size() > colon + 2 && path[colon + 1] == '/' && path[colon + 2] == '/';
+}
+
+}  // namespace
+
 bool IsPathInsideNormalized(std::string_view path, std::string_view parent_dir) {
+  // Only percent-decode if both inputs are URIs. ArrowFileSystemFileIO
+  // only decodes the URI form; literal paths are passed through to the
+  // OS unchanged, so decoding here would let `/tmp/t%2Foutside/x.puffin`
+  // appear inside `/tmp/t` while the file actually lives in a sibling
+  // directory `/tmp/t%2Foutside/`. If shapes differ between the two
+  // inputs we conservatively refuse rather than guess; the caller is
+  // expected to keep statistics/log paths in the same shape as the
+  // table directory it stamped into the metadata.
+  const bool path_is_uri = LooksLikeUri(path);
+  const bool parent_is_uri = LooksLikeUri(parent_dir);
+  if (path_is_uri != parent_is_uri) {
+    return false;
+  }
+  if (!path_is_uri) {
+    // Literal paths. Reject only obvious traversal aliases, never
+    // percent-decode.
+    if (ContainsTraversalSegment(path)) {
+      return false;
+    }
+    return IsPathInside(path, parent_dir);
+  }
   std::string decoded_path;
   if (!PercentDecode(path, decoded_path)) {
     return false;  // malformed percent encoding -- refuse

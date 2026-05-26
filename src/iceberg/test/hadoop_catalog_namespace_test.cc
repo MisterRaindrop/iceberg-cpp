@@ -18,8 +18,11 @@
  */
 
 #include <algorithm>
+#include <atomic>
+#include <latch>
 #include <memory>
 #include <string>
+#include <thread>
 
 #include <arrow/filesystem/localfs.h>
 #include <gtest/gtest.h>
@@ -302,6 +305,90 @@ TEST_F(HadoopCatalogNamespaceTest, DropTablePurgeTrueRefusesSnapshottedTable) {
   auto still_table = catalog_->TableExists(table);
   ASSERT_TRUE(still_table.has_value());
   EXPECT_TRUE(*still_table);
+}
+
+TEST_F(HadoopCatalogNamespaceTest, InMemoryLockSerialisesAcrossCatalogInstances) {
+  // Two HadoopCatalog instances sharing the same warehouse with default
+  // lock-impl=in-memory. Earlier the lock map was per-instance, so peer
+  // catalogs in the same process were NOT serialised; codec-different
+  // concurrent commits could both win their renames. With the
+  // process-global InMemoryLockManager state, peers Acquire on the same
+  // entity_id key and a second peer must wait.
+  auto make = [&](std::string_view name) {
+    auto props = HadoopCatalogProperties::FromMap({
+        {"warehouse", warehouse_},
+        {"name", std::string(name)},
+        {"lock.acquire-timeout-ms", "200"},
+    });
+    return HadoopCatalog::Make(name, file_io_, std::move(props));
+  };
+  ICEBERG_UNWRAP_OR_FAIL(auto cat_a, make("a"));
+  ICEBERG_UNWRAP_OR_FAIL(auto cat_b, make("b"));
+  ASSERT_TRUE(cat_a->CreateNamespace(Namespace{.levels = {"db"}}, {}).has_value());
+  TableIdentifier id{.ns = Namespace{.levels = {"db"}}, .name = "shared"};
+  auto schema = std::make_shared<Schema>(
+      std::vector<SchemaField>{SchemaField::MakeRequired(1, "id", int64())});
+
+  // First create from `cat_a` succeeds; the second from `cat_b` must see
+  // the already-published table (via the shared lock + post-Acquire
+  // recheck) and surface kAlreadyExists -- not a silent overwrite.
+  ASSERT_TRUE(cat_a
+                  ->CreateTable(id, schema, PartitionSpec::Unpartitioned(),
+                                SortOrder::Unsorted(), "", {})
+                  .has_value());
+  auto second = cat_b->CreateTable(id, schema, PartitionSpec::Unpartitioned(),
+                                   SortOrder::Unsorted(), "", {});
+  ASSERT_FALSE(second.has_value());
+  EXPECT_EQ(ErrorKind::kAlreadyExists, second.error().kind);
+}
+
+TEST_F(HadoopCatalogNamespaceTest, ConcurrentParentChildCreateOneSurvives) {
+  // Cross-instance race: HadoopCatalog A creates `db.parent`, B creates
+  // `db.parent.sub.child`. Their per-table locks are at different paths
+  // so neither blocks the other. Without the post-publish hierarchy
+  // recheck both could land and DropTable(db.parent, purge=true) would
+  // recursively wipe the nested child. The new post-publish recheck
+  // makes at least one of them fail; after retry only one can survive
+  // (the surviving topology is unambiguously consistent).
+  auto make = [&](std::string_view name) {
+    auto props = HadoopCatalogProperties::FromMap({
+        {"warehouse", warehouse_},
+        {"name", std::string(name)},
+        {"lock.acquire-timeout-ms", "1000"},
+    });
+    return HadoopCatalog::Make(name, file_io_, std::move(props));
+  };
+  ICEBERG_UNWRAP_OR_FAIL(auto cat_a, make("a"));
+  ICEBERG_UNWRAP_OR_FAIL(auto cat_b, make("b"));
+  ASSERT_TRUE(cat_a->CreateNamespace(Namespace{.levels = {"db"}}, {}).has_value());
+  auto schema = std::make_shared<Schema>(
+      std::vector<SchemaField>{SchemaField::MakeRequired(1, "id", int64())});
+
+  TableIdentifier parent_id{.ns = Namespace{.levels = {"db"}}, .name = "parent"};
+  TableIdentifier child_id{.ns = Namespace{.levels = {"db", "parent", "sub"}},
+                           .name = "child"};
+
+  std::latch barrier(2);
+  std::atomic<int> successes{0};
+  auto tally = [&](const std::shared_ptr<HadoopCatalog>& cat, const TableIdentifier& id) {
+    barrier.arrive_and_wait();
+    auto res = cat->CreateTable(id, schema, PartitionSpec::Unpartitioned(),
+                                SortOrder::Unsorted(), "", {});
+    if (res.has_value()) {
+      successes.fetch_add(1);
+    }
+  };
+  std::thread t1([&] { tally(cat_a, parent_id); });
+  std::thread t2([&] { tally(cat_b, child_id); });
+  t1.join();
+  t2.join();
+
+  // At least one of the two attempts must have failed -- otherwise the
+  // catalog ends in a state where DropTable(parent, purge=true) would
+  // wipe the child. (Both failing is also acceptable: the race detector
+  // works conservatively and the caller can retry.)
+  EXPECT_LE(successes.load(), 1)
+      << "concurrent parent+child create must NOT both succeed";
 }
 
 TEST_F(HadoopCatalogNamespaceTest, RejectsNestingInsideExistingTable) {

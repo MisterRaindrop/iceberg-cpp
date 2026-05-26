@@ -82,6 +82,23 @@ TEST(HadoopFileLayoutTest, IsPathInsideNormalizedDecodesParent) {
                                      "file:///tmp/my%20wh/db/t"));
 }
 
+TEST(HadoopFileLayoutTest, IsPathInsideNormalizedDoesNotDecodeLiteralPaths) {
+  // FileIO percent-decodes only the URI form. Literal local paths pass
+  // through to the OS unchanged. The descendant check must match that
+  // behaviour: decoding a literal `/tmp/t%2Foutside/x.puffin` to
+  // `/tmp/t/outside/x.puffin` would falsely classify it as inside
+  // `/tmp/t`, while the real file lives at the sibling
+  // `/tmp/t%2Foutside/` directory.
+  EXPECT_FALSE(IsPathInsideNormalized("/tmp/table%2Foutside/x.puffin", "/tmp/table"));
+  EXPECT_FALSE(IsPathInsideNormalized("/tmp/table%2F%2E%2E/x.puffin", "/tmp/table"));
+  // Literal `/tmp/table/x.puffin` IS inside `/tmp/table` -- no decode happens
+  // and the path-component-aware check passes.
+  EXPECT_TRUE(IsPathInsideNormalized("/tmp/table/x.puffin", "/tmp/table"));
+  // Mixed shape (URI vs literal) -- conservatively refuse.
+  EXPECT_FALSE(IsPathInsideNormalized("file:///tmp/table/x.puffin", "/tmp/table"));
+  EXPECT_FALSE(IsPathInsideNormalized("/tmp/table/x.puffin", "file:///tmp/table"));
+}
+
 TEST(HadoopFileLayoutTest, IsPathInsideNormalizedRejectsBackslash) {
   // Backslash is a directory separator on Windows. `\\..\\` (or
   // %5c..%5c) between `<table>` and the rest of the path would resolve

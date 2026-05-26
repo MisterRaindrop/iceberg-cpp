@@ -48,9 +48,27 @@ struct InMemoryLockManager::Impl {
     bool held = false;
   };
 
-  std::mutex map_mutex;
-  std::condition_variable cv;
-  std::unordered_map<std::string, Entry> entries;
+  // PROCESS-GLOBAL lock table. Earlier revisions held entries in a
+  // per-instance map, which meant two `HadoopCatalog` instances in the
+  // same process pointing at the same warehouse (each constructed by
+  // its own `Make`) did NOT serialise against each other -- the
+  // docstring's "per-process" claim was a lie. Keeping the map static
+  // gives the in-memory lock true single-process exclusivity regardless
+  // of how many catalog instances exist; lifetime matches the process
+  // (acceptable -- the map only retains entries while held and erases
+  // on Release).
+  static std::mutex& shared_mutex() {
+    static std::mutex m;
+    return m;
+  }
+  static std::condition_variable& shared_cv() {
+    static std::condition_variable cv;
+    return cv;
+  }
+  static std::unordered_map<std::string, Entry>& shared_entries() {
+    static std::unordered_map<std::string, Entry> e;
+    return e;
+  }
 };
 
 InMemoryLockManager::InMemoryLockManager(const HadoopCatalogProperties& config)
@@ -64,11 +82,11 @@ InMemoryLockManager::~InMemoryLockManager() = default;
 
 Result<bool> InMemoryLockManager::Acquire(const std::string& entity_id,
                                           const std::string& owner_id) {
-  std::unique_lock lock(impl_->map_mutex);
+  std::unique_lock lock(Impl::shared_mutex());
   const auto deadline = std::chrono::steady_clock::now() + acquire_timeout_;
 
   auto try_take = [&]() -> bool {
-    auto& entry = impl_->entries[entity_id];
+    auto& entry = Impl::shared_entries()[entity_id];
     if (!entry.held) {
       entry.held = true;
       entry.owner = owner_id;
@@ -90,15 +108,16 @@ Result<bool> InMemoryLockManager::Acquire(const std::string& entity_id,
     auto wait = std::min<std::chrono::steady_clock::duration>(
         remaining, std::chrono::duration_cast<std::chrono::steady_clock::duration>(
                        acquire_interval_));
-    impl_->cv.wait_for(lock, wait);
+    Impl::shared_cv().wait_for(lock, wait);
   }
 }
 
 Status InMemoryLockManager::Release(const std::string& entity_id,
                                     const std::string& owner_id) {
-  std::lock_guard lock(impl_->map_mutex);
-  auto it = impl_->entries.find(entity_id);
-  if (it == impl_->entries.end() || !it->second.held) {
+  std::lock_guard lock(Impl::shared_mutex());
+  auto& entries = Impl::shared_entries();
+  auto it = entries.find(entity_id);
+  if (it == entries.end() || !it->second.held) {
     return NotAllowed("InMemoryLockManager: '{}' is not held; cannot release.",
                       entity_id);
   }
@@ -109,8 +128,8 @@ Status InMemoryLockManager::Release(const std::string& entity_id,
   }
   // Erase the entry rather than mark it free; otherwise a long-running process
   // that touches many distinct tables grows the map unboundedly.
-  impl_->entries.erase(it);
-  impl_->cv.notify_all();
+  entries.erase(it);
+  Impl::shared_cv().notify_all();
   return {};
 }
 
