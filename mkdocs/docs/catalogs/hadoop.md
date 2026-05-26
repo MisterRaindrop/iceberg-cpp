@@ -240,6 +240,31 @@ even cross-instance correctness on `HadoopTables::Create` / `RegisterTable`
 / `DropTable` requires the operator to ensure a single writer per table
 path. Use `HadoopCatalog` for any shared workload.
 
+### DropTable cleanup race with concurrent CreateTable
+
+`HadoopCatalog::DropTable(purge=true)` holds the table lock through the
+file walk and the lock-removing `Release` call. After `Release`, two
+non-recursive `rmdir` calls clean up the now-empty `metadata/` and
+`<table_dir>` directories.
+
+That post-`Release` window is unsynchronised: a peer that uses the
+**same** `lock-impl=file` does NOT see the lock anymore (we just deleted
+it), so it can `Acquire` and start `CreateTable`. With `lock-impl=in-memory`
+the situation is worse -- the in-memory lock is per-process, so a peer
+on another process never blocked on our `Acquire` in the first place.
+
+Possible races:
+- Peer's `CreateDir(<table>/metadata)` lands BEFORE our `rmdir(metadata)`;
+  our rmdir sees an empty directory and removes it, undoing the peer's
+  setup -- the peer's subsequent `WriteFile(metadata/...tmp)` fails.
+- Peer's `WriteFile(metadata/v1.metadata.json.tmp)` lands; our rmdir
+  sees a non-empty directory and gracefully skips (the drop is
+  semantically complete; the peer owns the path going forward).
+
+Mitigation: for multi-process workloads, use `lock-impl=file` AND
+serialize drop/create operations at the application level if you cannot
+tolerate the brief in-between window.
+
 **Stale-lock reclamation is not performed inline by `Acquire`.** A
 `read body -> rename source aside` snatch is unsafe without a "verify
 body THEN unlink source" primitive (it can race a third party that just

@@ -265,6 +265,13 @@ Status HadoopCatalog::CreateNamespace(
   }
   ICEBERG_ASSIGN_OR_RAISE(auto ns_dir, hadoop::NamespaceDir(warehouse_, ns));
 
+  // Reject if any proper ancestor of `ns` is already a Hadoop table.
+  // Creating a namespace inside an existing table would let a later
+  // DropTable(purge=true) of that table wipe the namespace and any
+  // nested tables along with it.
+  ICEBERG_RETURN_UNEXPECTED(
+      hadoop::RejectAncestorIsTable(*file_io_, warehouse_, ns, /*last_inclusive=*/false));
+
   ICEBERG_ASSIGN_OR_RAISE(auto already, file_io_->Exists(ns_dir));
   if (already) {
     // Path may have been claimed by a table. Surface the conflict rather
@@ -634,6 +641,12 @@ Result<std::shared_ptr<Table>> HadoopCatalog::CreateTable(
       RejectCustomLocation(table_dir, location, "HadoopCatalog::CreateTable"));
   ICEBERG_RETURN_UNEXPECTED(
       RejectExternalDataPathProperty(properties, "HadoopCatalog::CreateTable"));
+  // Refuse to nest a table inside an existing table directory --
+  // DropTable(purge=true) on the outer table would recursively wipe
+  // this one. The leaf (table_dir itself) is checked separately below
+  // via IsHadoopTableDir.
+  ICEBERG_RETURN_UNEXPECTED(hadoop::RejectAncestorIsTable(
+      *file_io_, warehouse_, identifier.ns, /*last_inclusive=*/true));
 
   // Java's HadoopCatalog rejects creation when the table directory already
   // looks like an Iceberg table. The check is repeated under the lock inside
@@ -693,6 +706,9 @@ Result<std::shared_ptr<Table>> HadoopCatalog::UpdateTable(
       return AlreadyExists("Table '{}' already exists at {}.", identifier.ToString(),
                            table_dir);
     }
+    // Reject nesting inside an existing table.
+    ICEBERG_RETURN_UNEXPECTED(hadoop::RejectAncestorIsTable(
+        *file_io_, warehouse_, identifier.ns, /*last_inclusive=*/true));
     // Same namespace-occupation guard as CreateTable; the lock-time recheck
     // inside WriteInitialTableLocked covers the race window.
     ICEBERG_ASSIGN_OR_RAISE(auto path_occupied,
@@ -978,6 +994,10 @@ Result<std::shared_ptr<Table>> HadoopCatalog::RegisterTable(
     return AlreadyExists("Table '{}' already exists at {}.", identifier.ToString(),
                          table_dir);
   }
+  // Refuse to register a table inside an existing table -- a later
+  // DropTable(purge=true) on the outer table would wipe the inner one.
+  ICEBERG_RETURN_UNEXPECTED(hadoop::RejectAncestorIsTable(
+      *file_io_, warehouse_, identifier.ns, /*last_inclusive=*/true));
 
   // Detect codec from the source filename so a gzipped source produces a
   // gzipped local copy. Accept BOTH the canonical core form

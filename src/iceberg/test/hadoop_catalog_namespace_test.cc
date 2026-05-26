@@ -304,6 +304,36 @@ TEST_F(HadoopCatalogNamespaceTest, DropTablePurgeTrueRefusesSnapshottedTable) {
   EXPECT_TRUE(*still_table);
 }
 
+TEST_F(HadoopCatalogNamespaceTest, RejectsNestingInsideExistingTable) {
+  // Once `db.team` is a table, creating a namespace or table beneath it
+  // would let `DropTable(db.team, purge=true)` recursively wipe the
+  // descendants. Refuse both creates up front.
+  ASSERT_TRUE(catalog_->CreateNamespace(Namespace{.levels = {"db"}}, {}).has_value());
+  TableIdentifier parent_id{.ns = Namespace{.levels = {"db"}}, .name = "team"};
+  auto schema = std::make_shared<Schema>(
+      std::vector<SchemaField>{SchemaField::MakeRequired(1, "id", int64())});
+  ASSERT_TRUE(catalog_
+                  ->CreateTable(parent_id, schema, PartitionSpec::Unpartitioned(),
+                                SortOrder::Unsorted(), "", {})
+                  .has_value());
+
+  // CreateNamespace beneath the table must be rejected.
+  auto ns_under_table =
+      catalog_->CreateNamespace(Namespace{.levels = {"db", "team", "proj"}}, {});
+  ASSERT_FALSE(ns_under_table.has_value());
+  EXPECT_EQ(ErrorKind::kInvalidArgument, ns_under_table.error().kind);
+
+  // CreateTable beneath the table (in a notional sub-namespace whose
+  // first level happens to be the existing table dir) must also be
+  // rejected.
+  TableIdentifier nested_id{.ns = Namespace{.levels = {"db", "team", "sub"}},
+                            .name = "child"};
+  auto tbl_under_table = catalog_->CreateTable(
+      nested_id, schema, PartitionSpec::Unpartitioned(), SortOrder::Unsorted(), "", {});
+  ASSERT_FALSE(tbl_under_table.has_value());
+  EXPECT_EQ(ErrorKind::kInvalidArgument, tbl_under_table.error().kind);
+}
+
 TEST_F(HadoopCatalogNamespaceTest, FileLockDropAcrossInstancesRoundTrip) {
   // Two HadoopCatalog instances sharing the same warehouse and
   // lock-impl=file. Instance A drops a table; instance B creates a

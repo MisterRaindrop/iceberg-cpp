@@ -441,27 +441,27 @@ Status HadoopTableOperations::Commit(const TableMetadata& base,
                     next_version, target, rename_status.error().message));
   }
 
-  // (10) Release the lock now -- the commit has landed and any subsequent
-  // bookkeeping (metadata GC) is best-effort and need not block other
-  // writers waiting on the lock.
-  guard.Dismiss();
-  if (auto rel = lock_manager_->Release(table_dir_, owner_id_); !rel.has_value()) {
-    LogWarning(std::format("HadoopCatalog: lock release failed for '{}': {}", table_dir_,
-                           rel.error().message));
-  }
-
-  // (11) Commit-time stale metadata cleanup, honouring the Java table
+  // (10) Commit-time stale metadata cleanup, honouring the Java table
   // properties `write.metadata.delete-after-commit.enabled` (default false)
-  // and `write.metadata.previous-versions-max` (default 100). Runs outside
-  // the lock so a long delete loop on a deep history does not stall other
-  // writers; failures are logged because the commit itself already
-  // succeeded.
+  // and `write.metadata.previous-versions-max` (default 100). Runs UNDER
+  // THE COMMIT LOCK so a concurrent DropTable + CreateTable on this path
+  // (a different "generation" of the table) cannot land its own files
+  // before our GC scans the directory. If we released early, a drop +
+  // recreate sequence would let GC delete the new generation's v1
+  // metadata as if it were an old version of our committed table.
   const bool delete_after_commit =
       updated.properties.Get(TableProperties::kMetadataDeleteAfterCommitEnabled);
   if (delete_after_commit) {
     const int32_t previous_versions_max =
         updated.properties.Get(TableProperties::kMetadataPreviousVersionsMax);
     PruneOldMetadataFiles(*file_io_, table_dir_, next_version, previous_versions_max);
+  }
+  // (11) Release the lock now that GC is done; failures here are
+  // post-CAS bookkeeping (logged, not propagated -- the commit landed).
+  guard.Dismiss();
+  if (auto rel = lock_manager_->Release(table_dir_, owner_id_); !rel.has_value()) {
+    LogWarning(std::format("HadoopCatalog: lock release failed for '{}': {}", table_dir_,
+                           rel.error().message));
   }
   return {};
 }

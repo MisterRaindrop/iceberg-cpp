@@ -200,6 +200,23 @@ ICEBERG_HADOOP_EXPORT bool IsPathInside(std::string_view path,
 ICEBERG_HADOOP_EXPORT bool IsPathInsideNormalized(std::string_view path,
                                                   std::string_view parent_dir);
 
+/// \brief Walk every proper prefix of `ns` (inclusive) and check that
+/// the resulting directory is NOT a Hadoop table. Returns an error if
+/// any ancestor is a table -- such a namespace/table would live INSIDE
+/// an existing table's directory tree, and a later
+/// `DropTable(purge=true)` on the ancestor table would recursively wipe
+/// the descendant catalog entry.
+///
+/// `last_inclusive` selects whether the namespace itself is also
+/// checked: pass true when checking CreateNamespace (the leaf would
+/// land where the table currently lives); pass false when checking the
+/// PARENT namespace of a new table (the table's own dir is checked
+/// separately by IsHadoopTableDir at the caller).
+ICEBERG_HADOOP_EXPORT Status RejectAncestorIsTable(FileIO& file_io,
+                                                   std::string_view warehouse,
+                                                   const Namespace& ns,
+                                                   bool last_inclusive);
+
 /// \brief True iff `dir_location` exists as a directory and contains a child
 /// entry whose leaf name is not in `{"metadata", "data"}`.
 ///

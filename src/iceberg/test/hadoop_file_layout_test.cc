@@ -70,6 +70,31 @@ TEST(HadoopFileLayoutTest, IdentifierAllowsUtf8) {
   EXPECT_TRUE(ValidateTableIdentifier(utf8).has_value());
 }
 
+TEST(HadoopFileLayoutTest, IsPathInsideNormalizedDecodesParent) {
+  // The PARENT dir may legitimately contain percent encoding (e.g. a
+  // warehouse with a space in its name). When the candidate path is
+  // already in decoded form, comparing it raw against the encoded
+  // parent would falsely report "outside" -- the previous round
+  // decoded only the candidate. Both sides must be decoded.
+  EXPECT_TRUE(IsPathInsideNormalized("file:///tmp/my wh/db/t/metadata/v1.metadata.json",
+                                     "file:///tmp/my%20wh/db/t"));
+  EXPECT_TRUE(IsPathInsideNormalized("file:///tmp/my%20wh/db/t/metadata/v1.metadata.json",
+                                     "file:///tmp/my%20wh/db/t"));
+}
+
+TEST(HadoopFileLayoutTest, IsPathInsideNormalizedRejectsBackslash) {
+  // Backslash is a directory separator on Windows. `\\..\\` (or
+  // %5c..%5c) between `<table>` and the rest of the path would resolve
+  // to `<table>/../...` at IO time and escape, but a `/`-only segment
+  // scan would miss it. Treat `\\` as a separator too.
+  EXPECT_FALSE(IsPathInsideNormalized("file:///wh/db/t\\..\\outside\\x.puffin",
+                                      "file:///wh/db/t"));
+  EXPECT_FALSE(IsPathInsideNormalized("file:///wh/db/t%5c..%5coutside%5cx.puffin",
+                                      "file:///wh/db/t"));
+  EXPECT_FALSE(IsPathInsideNormalized("file:///wh/db/t%5C..%5Coutside%5Cx.puffin",
+                                      "file:///wh/db/t"));
+}
+
 TEST(HadoopFileLayoutTest, IsPathInsideNormalizedRejectsTraversal) {
   // Raw `..` and percent-encoded `%2e%2e` segments must both fall out
   // of the descendant check, even when the literal string prefix looks

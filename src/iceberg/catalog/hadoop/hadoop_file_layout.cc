@@ -323,11 +323,16 @@ bool PercentDecode(std::string_view s, std::string& out) {
 
 // True if any slash-separated segment of `path` equals "." or "..". The
 // path is scanned in its already-decoded form; callers run PercentDecode
-// first if they want to catch encoded traversal aliases.
+// first if they want to catch encoded traversal aliases. Both `/` and
+// `\\` are treated as separators -- the latter would otherwise let a
+// decoded `\..\` slip through on Windows (where backslash IS a
+// directory separator) even though our POSIX-shaped layout never emits
+// it. `\\..\\` between segments is also caught because we split on
+// either separator.
 bool ContainsTraversalSegment(std::string_view path) {
   size_t i = 0;
   while (i < path.size()) {
-    const size_t next = path.find('/', i);
+    const size_t next = path.find_first_of("/\\", i);
     const std::string_view seg =
         next == std::string_view::npos ? path.substr(i) : path.substr(i, next - i);
     if (seg == "." || seg == "..") {
@@ -344,14 +349,47 @@ bool ContainsTraversalSegment(std::string_view path) {
 }  // namespace
 
 bool IsPathInsideNormalized(std::string_view path, std::string_view parent_dir) {
-  std::string decoded;
-  if (!PercentDecode(path, decoded)) {
+  std::string decoded_path;
+  if (!PercentDecode(path, decoded_path)) {
     return false;  // malformed percent encoding -- refuse
   }
-  if (ContainsTraversalSegment(decoded)) {
-    return false;  // contains `.` or `..` segment after decoding
+  if (ContainsTraversalSegment(decoded_path)) {
+    return false;  // `.` or `..` segment (after `/` or `\` split) post-decode
   }
-  return IsPathInside(decoded, parent_dir);
+  // parent_dir may itself contain legitimate percent encoding -- e.g. a
+  // warehouse like `file:///tmp/my%20wh` would otherwise be compared
+  // raw against the metadata's already-decoded paths and incorrectly
+  // judged "outside". Decode both sides so the comparison is on
+  // canonical form. Parent is built internally from a validated
+  // identifier and the warehouse, so it carries no traversal segments
+  // and we don't need to re-check them.
+  std::string decoded_parent;
+  if (!PercentDecode(parent_dir, decoded_parent)) {
+    return false;
+  }
+  return IsPathInside(decoded_path, decoded_parent);
+}
+
+Status RejectAncestorIsTable(FileIO& file_io, std::string_view warehouse,
+                             const Namespace& ns, bool last_inclusive) {
+  const size_t stop = last_inclusive ? ns.levels.size() : ns.levels.size() - 1;
+  if (ns.levels.empty()) {
+    return {};
+  }
+  Namespace prefix;
+  for (size_t i = 0; i < stop; ++i) {
+    prefix.levels.push_back(ns.levels[i]);
+    ICEBERG_ASSIGN_OR_RAISE(auto dir, NamespaceDir(warehouse, prefix));
+    ICEBERG_ASSIGN_OR_RAISE(auto is_table, IsHadoopTableDir(file_io, dir));
+    if (is_table) {
+      return InvalidArgument(
+          "Refusing operation under '{}': an ancestor at '{}' is already a "
+          "Hadoop table; creating a namespace or table beneath it would be "
+          "wiped by a subsequent DropTable(purge=true) of that ancestor.",
+          ns.ToString(), dir);
+    }
+  }
+  return {};
 }
 
 Result<bool> HasNonTableInternalChildren(FileIO& file_io, std::string_view dir_location) {
