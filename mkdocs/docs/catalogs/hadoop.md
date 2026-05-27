@@ -115,6 +115,8 @@ auto table = catalog->CreateTable(
 
 ```
 <warehouse>/
+  _iceberg_catalog_locks/          # lock-impl=file lock files (reserved name)
+    <fnv1a-hex-of-canonical-table-path>.lock
   <ns_level_1>/.../<ns_level_n>/
     <table>/
       metadata/
@@ -122,9 +124,21 @@ auto table = catalog->CreateTable(
         v2.metadata.json[.gz|.zstd]
         ...
         version-hint.text          # plain integer pointing at the current version
-        _lock                      # optional, written by FileLockManager
       data/                        # writer-managed
 ```
+
+`lock-impl=file` lock files live in a dedicated warehouse-level
+directory `_iceberg_catalog_locks/`, **outside** any table's own
+directory tree. This is deliberate: it lets `DropTable` recursively
+delete the entire table directory while still holding the lock (the lock
+file is a sibling, never a child of what's being deleted), closing the
+rmdir-after-release race a previous in-table-dir layout suffered. The
+lock filename is the FNV-1a-64 hex digest of the table's *canonical*
+identity (percent-decoded, `.`/`..`-collapsed, `file://` scheme
+stripped), so alias warehouse spellings of the same physical directory
+share one lock. `_iceberg_catalog_locks` is a reserved top-level name --
+no table or namespace may take it and it is filtered from
+`ListNamespaces`.
 
 `version-hint.text` is updated by writing a UUID-suffixed temp file
 (`version-hint.text.tmp.<uuid>`) and then issuing an atomic
@@ -224,8 +238,8 @@ only helps within a single `LockManager` instance; the default
 To stay safe across iceberg-cpp instances, choose ONE of:
 
 - Use `lock-impl=file` so all writers (on `file://`) serialise on the
-  same `<table>/metadata/_lock` file. The lock-time scan then catches
-  the duplicate-version case.
+  same `<warehouse>/_iceberg_catalog_locks/<hash>.lock` file. The
+  lock-time scan then catches the duplicate-version case.
 - Pin `write.metadata.compression-codec` to a single value at table
   creation time and never change it across writers.
 - Layer an external coordinator (the same DynamoDB/REST/Nessie option

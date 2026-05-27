@@ -400,6 +400,19 @@ Result<std::shared_ptr<Table>> HadoopTables::RegisterTable(
   if (already_table) {
     return AlreadyExists("Table already exists at '{}'.", path);
   }
+  // Same occupied-path guard as Create: refuse to register a table at a
+  // path that already holds non-table-internal children (i.e. a populated
+  // namespace). Otherwise the path becomes a table, its existing
+  // descendants become unenumerable, and a later purge could recursively
+  // delete them.
+  ICEBERG_ASSIGN_OR_RAISE(auto occupied, hadoop::HasNonTableInternalChildren(*io, path));
+  if (occupied) {
+    return InvalidArgument(
+        "HadoopTables::RegisterTable: path '{}' is occupied (contains "
+        "non-table-internal children); refusing to bury a namespace or "
+        "unrelated data under a table.",
+        path);
+  }
 
   // Match HadoopCatalog::RegisterTable: accept both gzip suffix shapes
   // (core canonical `.gz.metadata.json` AND legacy `.metadata.json.gz`).

@@ -177,6 +177,28 @@ TEST_F(HadoopTablesTest, CreateRejectsPopulatedPath) {
   EXPECT_EQ(ErrorKind::kInvalidArgument, res.error().kind);
 }
 
+TEST_F(HadoopTablesTest, RegisterRejectsPopulatedPath) {
+  // RegisterTable must run the same occupied-path guard as Create:
+  // registering a table at a path that already holds a populated
+  // namespace would bury the descendants and make them purgeable.
+  const std::string source_path = root_ + "/src";
+  auto schema = std::make_shared<Schema>(
+      std::vector<SchemaField>{SchemaField::MakeRequired(1, "id", int64())});
+  ICEBERG_UNWRAP_OR_FAIL(
+      auto source,
+      tables_->Create(schema, PartitionSpec::Unpartitioned(), SortOrder::Unsorted(),
+                      source_path, /*properties=*/{}));
+
+  // Build an occupied target: a directory with a non-table child.
+  const std::string target = root_ + "/occupied_reg";
+  ASSERT_TRUE(file_io_->CreateDir(target + "/child_ns").has_value());
+
+  auto res =
+      tables_->RegisterTable(target, std::string(source->metadata_file_location()));
+  ASSERT_FALSE(res.has_value());
+  EXPECT_EQ(ErrorKind::kInvalidArgument, res.error().kind);
+}
+
 TEST_F(HadoopTablesTest, AutoDetectRejectsMixedSchemes) {
   // The auto-detect overload caches the first scheme it sees. A subsequent
   // call against a different scheme should be rejected up front rather than

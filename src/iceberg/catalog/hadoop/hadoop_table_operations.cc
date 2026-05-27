@@ -351,6 +351,23 @@ Status HadoopTableOperations::Commit(const TableMetadata& base,
         "HadoopTableOperations::Commit: stale base. current version {} != cached {}.",
         current.version, current_version_);
   }
+  // (4b) ABA guard. The version number alone does NOT identify a table
+  // instance: a concurrent DropTable + CreateTable at the same path
+  // produces a fresh table whose current version is ALSO v1 but with a
+  // different table UUID. The update's requirements (including AssertUUID)
+  // were validated against the OLD metadata BEFORE we took the lock, so
+  // without this check we would publish v2 derived from the old
+  // generation onto the new table, silently clobbering it. Re-read the
+  // full current metadata under the lock and require its UUID to still
+  // match the base we built from.
+  ICEBERG_ASSIGN_OR_RAISE(auto current_metadata,
+                          TableMetadataUtil::Read(*file_io_, current.location));
+  if (current_metadata->table_uuid != base.table_uuid) {
+    return CommitFailed(
+        "HadoopTableOperations::Commit: table at '{}' was replaced (uuid '{}' != "
+        "base uuid '{}'); a concurrent drop+recreate happened. Refresh and retry.",
+        table_dir_, current_metadata->table_uuid, base.table_uuid);
+  }
 
   // (5) Pick the codec from the updated metadata's table properties. The
   // filename suffix follows the codec so a `.gz` file decodes correctly on

@@ -140,6 +140,24 @@ Status RejectExternalDataPathProperty(
   return {};
 }
 
+// The lock-impl=file root `<warehouse>/_iceberg_catalog_locks/` only
+// collides with a TOP-LEVEL table or namespace of that name -- nested
+// `db._iceberg_catalog_locks` is harmless. Reject when the FIRST path
+// component (the first namespace level, or the table name for a
+// top-level table) equals the reserved lock-root name.
+Status RejectTopLevelLockRoot(const Namespace& ns, std::string_view table_name,
+                              std::string_view source) {
+  const std::string_view first =
+      ns.levels.empty() ? table_name : std::string_view(ns.levels.front());
+  if (first == hadoop::kLockRootDirName) {
+    return InvalidArgument(
+        "{}: '{}' is reserved as the warehouse-level lock-impl=file root "
+        "directory; a top-level table or namespace cannot use that name.",
+        source, hadoop::kLockRootDirName);
+  }
+  return {};
+}
+
 }  // namespace
 
 HadoopCatalog::~HadoopCatalog() = default;
@@ -272,6 +290,8 @@ Status HadoopCatalog::CreateNamespace(
   }
   ICEBERG_ASSIGN_OR_RAISE(auto ns_dir, hadoop::NamespaceDir(warehouse_, ns));
 
+  ICEBERG_RETURN_UNEXPECTED(
+      RejectTopLevelLockRoot(ns, /*table_name=*/{}, "HadoopCatalog::CreateNamespace"));
   // Reject if any proper ancestor of `ns` is already a Hadoop table.
   // Creating a namespace inside an existing table would let a later
   // DropTable(purge=true) of that table wipe the namespace and any
@@ -777,6 +797,8 @@ Result<std::shared_ptr<Table>> HadoopCatalog::CreateTable(
         "HadoopCatalog::CreateTable requires non-null schema, spec, and order.");
   }
   ICEBERG_ASSIGN_OR_RAISE(auto table_dir, hadoop::TableDir(warehouse_, identifier));
+  ICEBERG_RETURN_UNEXPECTED(RejectTopLevelLockRoot(identifier.ns, identifier.name,
+                                                   "HadoopCatalog::CreateTable"));
   ICEBERG_RETURN_UNEXPECTED(
       RejectCustomLocation(table_dir, location, "HadoopCatalog::CreateTable"));
   ICEBERG_RETURN_UNEXPECTED(
@@ -846,6 +868,8 @@ Result<std::shared_ptr<Table>> HadoopCatalog::UpdateTable(
       return AlreadyExists("Table '{}' already exists at {}.", identifier.ToString(),
                            table_dir);
     }
+    ICEBERG_RETURN_UNEXPECTED(RejectTopLevelLockRoot(identifier.ns, identifier.name,
+                                                     "HadoopCatalog::UpdateTable"));
     // Reject nesting inside an existing table.
     ICEBERG_RETURN_UNEXPECTED(hadoop::RejectAncestorIsTable(
         *file_io_, warehouse_, identifier.ns, /*last_inclusive=*/true));
@@ -867,6 +891,10 @@ Result<std::shared_ptr<Table>> HadoopCatalog::UpdateTable(
       }
     }
     builder = TableMetadataBuilder::BuildFromEmpty(format_version);
+    // Assign a fresh table UUID so the create-via-Transaction path is
+    // consistent with CreateTable and the commit-time ABA recheck can
+    // distinguish a drop+recreate generation by UUID.
+    builder->AssignUUID();
   } else {
     std::string owner_id = name_ + ":" + identifier.ToString();
     ops.emplace(file_io_, table_dir, lock_manager_, std::move(owner_id));
@@ -1074,6 +1102,8 @@ Result<std::shared_ptr<Table>> HadoopCatalog::RegisterTable(
     return AlreadyExists("Table '{}' already exists at {}.", identifier.ToString(),
                          table_dir);
   }
+  ICEBERG_RETURN_UNEXPECTED(RejectTopLevelLockRoot(identifier.ns, identifier.name,
+                                                   "HadoopCatalog::RegisterTable"));
   // Refuse to register a table inside an existing table -- a later
   // DropTable(purge=true) on the outer table would wipe the inner one.
   ICEBERG_RETURN_UNEXPECTED(hadoop::RejectAncestorIsTable(

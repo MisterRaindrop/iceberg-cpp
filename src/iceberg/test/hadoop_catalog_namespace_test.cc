@@ -307,6 +307,66 @@ TEST_F(HadoopCatalogNamespaceTest, DropTablePurgeTrueRefusesSnapshottedTable) {
   EXPECT_TRUE(*still_table);
 }
 
+TEST_F(HadoopCatalogNamespaceTest, UpdateTableRejectsDropRecreateABA) {
+  // ABA: an update built from the OLD table generation must not commit
+  // onto a NEW table that replaced it (same path, same version number,
+  // different UUID). The commit-time UUID recheck catches it.
+  ASSERT_TRUE(catalog_->CreateNamespace(Namespace{.levels = {"db"}}, {}).has_value());
+  TableIdentifier id{.ns = Namespace{.levels = {"db"}}, .name = "t"};
+  auto schema = std::make_shared<Schema>(
+      std::vector<SchemaField>{SchemaField::MakeRequired(1, "id", int64())});
+  ICEBERG_UNWRAP_OR_FAIL(auto created,
+                         catalog_->CreateTable(id, schema, PartitionSpec::Unpartitioned(),
+                                               SortOrder::Unsorted(), "", {}));
+  const std::string old_uuid = created->metadata()->table_uuid;
+
+  std::vector<std::unique_ptr<TableRequirement>> reqs;
+  reqs.push_back(std::make_unique<table::AssertUUID>(old_uuid));
+  std::vector<std::unique_ptr<TableUpdate>> updates;
+  updates.push_back(std::make_unique<table::SetProperties>(
+      std::unordered_map<std::string, std::string>{{"k", "v"}}));
+
+  // Concurrent drop + recreate (new UUID, version back to v1) BEFORE the
+  // update commits.
+  ASSERT_TRUE(catalog_->DropTable(id, /*purge=*/true).has_value());
+  ICEBERG_UNWRAP_OR_FAIL(auto recreated,
+                         catalog_->CreateTable(id, schema, PartitionSpec::Unpartitioned(),
+                                               SortOrder::Unsorted(), "", {}));
+  ASSERT_NE(recreated->metadata()->table_uuid, old_uuid);
+
+  auto res = catalog_->UpdateTable(id, reqs, updates);
+  ASSERT_FALSE(res.has_value());
+  EXPECT_TRUE(res.error().kind == ErrorKind::kCommitFailed ||
+              res.error().kind == ErrorKind::kInvalidArgument ||
+              res.error().kind == ErrorKind::kCommitStateUnknown)
+      << "got kind " << static_cast<int>(res.error().kind);
+
+  // The recreated table is intact.
+  ICEBERG_UNWRAP_OR_FAIL(auto loaded, catalog_->LoadTable(id));
+  EXPECT_EQ(loaded->metadata()->table_uuid, recreated->metadata()->table_uuid);
+}
+
+TEST_F(HadoopCatalogNamespaceTest, NestedLockRootNameAllowed) {
+  // `_iceberg_catalog_locks` is reserved only at the TOP level (the
+  // warehouse-wide lock root). A NESTED namespace/table of that name
+  // collides with nothing and must be allowed.
+  ASSERT_TRUE(catalog_->CreateNamespace(Namespace{.levels = {"db"}}, {}).has_value());
+  EXPECT_TRUE(
+      catalog_
+          ->CreateNamespace(
+              Namespace{.levels = {"db", std::string(hadoop::kLockRootDirName)}}, {})
+          .has_value());
+  TableIdentifier nested{
+      .ns = Namespace{.levels = {"db", std::string(hadoop::kLockRootDirName)}},
+      .name = "t"};
+  auto schema = std::make_shared<Schema>(
+      std::vector<SchemaField>{SchemaField::MakeRequired(1, "id", int64())});
+  EXPECT_TRUE(catalog_
+                  ->CreateTable(nested, schema, PartitionSpec::Unpartitioned(),
+                                SortOrder::Unsorted(), "", {})
+                  .has_value());
+}
+
 TEST_F(HadoopCatalogNamespaceTest, WarehouseWithReservedCharRoundTrips) {
   // A warehouse whose URI path contains a percent-escaped reserved char
   // (`%23` = `#`) must keep resolving to the SAME physical directory

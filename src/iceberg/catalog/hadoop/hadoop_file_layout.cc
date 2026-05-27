@@ -88,6 +88,17 @@ std::string CanonicalLockKey(std::string_view entity_id) {
     if (!PercentDecode(entity_id, decoded)) {
       decoded.assign(entity_id);  // malformed -- fall back to raw bytes
     }
+    // Unify the `file://` URI form with the bare local path form: a
+    // catalog configured with `file:///tmp/wh` and one configured with
+    // `/tmp/wh` resolve to the same physical directory, so their lock
+    // keys must match. Strip the (always-empty-authority) `file://`
+    // prefix, leaving the absolute path. Other schemes (hdfs://, s3://)
+    // keep their scheme+authority -- those ARE part of the physical
+    // identity.
+    constexpr std::string_view kFilePrefix = "file://";
+    if (std::string_view(decoded).starts_with(kFilePrefix)) {
+      decoded.erase(0, kFilePrefix.size());
+    }
   } else {
     decoded.assign(entity_id);
   }
@@ -178,8 +189,14 @@ namespace {
 // nested under it makes the catalog point at the wrong directory the moment
 // someone calls CreateTable(db.team) (whose `metadata/` subdir would happen
 // to be the existing namespace).
-constexpr std::array<std::string_view, 3> kReservedComponentNames = {"metadata", "data",
-                                                                     kLockRootDirName};
+// `metadata` and `data` are reserved at EVERY level (they are
+// table-internal subdir names present under every table dir). The
+// lock-root name `_iceberg_catalog_locks` is NOT in this set: it only
+// collides at the warehouse root, so it is rejected/filtered by a
+// position-aware check at the catalog layer rather than blanket-reserved
+// at all nesting depths (which would wrongly forbid e.g.
+// `db._iceberg_catalog_locks`).
+constexpr std::array<std::string_view, 2> kReservedComponentNames = {"metadata", "data"};
 
 bool IsReservedComponent(std::string_view component) {
   for (const auto& reserved : kReservedComponentNames) {
