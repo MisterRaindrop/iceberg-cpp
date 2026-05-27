@@ -42,6 +42,13 @@
 
 namespace iceberg::hadoop {
 
+/// \brief Name of the warehouse-level directory where `lock-impl=file`
+/// stores its lock files (`<warehouse>/_iceberg_catalog_locks/`). It is
+/// a RESERVED component name -- ValidateNamespaceLevel /
+/// ValidateTableIdentifier reject it so no user table or namespace can
+/// collide with the lock root, and ListNamespaces filters it out.
+inline constexpr std::string_view kLockRootDirName = "_iceberg_catalog_locks";
+
 /// \brief Metadata file compression codec recognised by HadoopCatalog.
 ///
 /// `kNone` writes `v{N}.metadata.json`; `kGzip` writes the core-canonical
@@ -77,10 +84,22 @@ ICEBERG_HADOOP_EXPORT std::string_view MetadataCompressionCodecName(
 ///   2. Trailing `/` is stripped so `file:///wh` and `file:///wh/`
 ///      collapse together.
 ///
-/// Returns `kInvalidArgument` when the URI form contains malformed
-/// percent encoding (a lone `%` or non-hex pair).
+/// The result is SAFE to re-use as an IO URI prefix: only a trailing
+/// slash is removed (percent-decoding / dot-segment collapsing is NOT
+/// performed, since the decoded form would be re-parsed and mis-resolve
+/// reserved characters like `#`). Alias collapsing for lock identity is
+/// `CanonicalLockKey`'s job.
 ICEBERG_HADOOP_EXPORT Result<std::string> CanonicalizeWarehouse(
     std::string_view warehouse);
+
+/// \brief Produce a stable physical-identity string for `entity_id`,
+/// used ONLY as a lock map key / file-lock hash input (never as an IO
+/// URI). Percent-decodes the URI form, collapses `.`/`..` segments, and
+/// strips a trailing slash, so that surface aliases of the same physical
+/// directory -- `file:///tmp/wh`, `file:///tmp/./wh`,
+/// `file:///tmp/my%20wh` vs `file:///tmp/my wh` -- map to a single lock
+/// key. Literal (non-URI) paths are not percent-decoded.
+ICEBERG_HADOOP_EXPORT std::string CanonicalLockKey(std::string_view entity_id);
 
 /// \brief True if `location` uses one of the S3-family schemes
 /// (`s3://`, `s3a://`, `s3n://`). NOTE: arrow-fs-s3 only accepts the

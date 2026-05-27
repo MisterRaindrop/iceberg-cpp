@@ -377,6 +377,14 @@ Result<std::vector<Namespace>> HadoopCatalog::ListNamespaces(const Namespace& ns
     if (leaf.empty()) {
       continue;
     }
+    // Hide the catalog's own lock-root directory
+    // (`<warehouse>/_iceberg_catalog_locks/`, used by lock-impl=file).
+    // It is reserved (the validator rejects it as an identifier), so it
+    // can never be a real namespace -- filtering it keeps it out of
+    // listings even when a previous file-lock run created it.
+    if (leaf == hadoop::kLockRootDirName) {
+      continue;
+    }
     // Skip directories that look like tables. The strict check (metadata/
     // exists AND contains at least one v{N}.metadata.json) is required for
     // correctness -- a "fast" Exists(metadata/) probe would false-positive

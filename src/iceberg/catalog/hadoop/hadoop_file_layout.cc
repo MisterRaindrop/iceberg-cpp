@@ -23,6 +23,7 @@
 #include <format>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "iceberg/util/location_util.h"
 #include "iceberg/util/macros.h"
@@ -51,22 +52,84 @@ bool LooksLikeUri(std::string_view path);
 }  // namespace
 
 Result<std::string> CanonicalizeWarehouse(std::string_view warehouse) {
-  std::string canonical;
-  if (LooksLikeUri(warehouse)) {
-    if (!PercentDecode(warehouse, canonical)) {
-      return InvalidArgument(
-          "Warehouse '{}' has malformed percent encoding (lone '%' or non-hex "
-          "pair); supply a canonical URI.",
-          warehouse);
-    }
-  } else {
-    canonical.assign(warehouse);
-  }
-  // Strip a trailing '/' so `file:///wh` and `file:///wh/` collapse.
+  // IMPORTANT: do NOT percent-decode here. The result is stored as the
+  // warehouse prefix and re-joined into table / namespace URIs that the
+  // FileIO layer re-parses via arrow's PathFromUri. Decoding a URI and
+  // feeding the decoded string back as a URI is lossy and dangerous:
+  //   - `file:///tmp/a%23b` (dir `/tmp/a#b`) would decode to
+  //     `file:///tmp/a#b`; appending `/db` then makes `#b/db` a URI
+  //     fragment and the IO target collapses to `/tmp/a`.
+  //   - `%252F` would decode to `%2F` and then to `/` on the second
+  //     parse, escaping into a path separator.
+  // So the only safe normalisation for the IO-facing warehouse string is
+  // to strip a trailing slash (which never changes the resolved path).
+  // Alias collapsing for LOCK identity is handled separately by
+  // CanonicalLockKey, which produces a key that is never used for IO.
+  std::string canonical(warehouse);
   while (canonical.size() > 1 && canonical.back() == '/') {
     canonical.pop_back();
   }
   return canonical;
+}
+
+std::string CanonicalLockKey(std::string_view entity_id) {
+  // Produce a STABLE physical-identity string for use ONLY as a lock map
+  // key / file-lock hash input. Unlike the warehouse prefix, this is
+  // never re-parsed as an IO URI, so we are free to fully normalise it:
+  //   1. percent-decode the URI form (so `%20` and a literal space, or
+  //      `%2F` and `/`, map to one key);
+  //   2. collapse `.` and `..` path segments (so `file:///tmp/wh` and
+  //      `file:///tmp/./wh` share a key);
+  //   3. strip a trailing slash.
+  // Literal local paths are not percent-decoded (a `%` there is a real
+  // filename byte) but their `.`/`..` segments are still collapsed.
+  std::string decoded;
+  if (LooksLikeUri(entity_id)) {
+    if (!PercentDecode(entity_id, decoded)) {
+      decoded.assign(entity_id);  // malformed -- fall back to raw bytes
+    }
+  } else {
+    decoded.assign(entity_id);
+  }
+  // Collapse `.` / `..` segments. We treat both `/` and the run of
+  // leading separators (`scheme://`) conservatively: empty segments are
+  // preserved so `file://` authority structure is not mangled; only
+  // explicit `.` and `..` non-empty segments are folded.
+  std::vector<std::string_view> out;
+  size_t i = 0;
+  const std::string_view view = decoded;
+  while (i <= view.size()) {
+    size_t next = view.find('/', i);
+    const std::string_view seg =
+        next == std::string_view::npos ? view.substr(i) : view.substr(i, next - i);
+    if (seg == ".") {
+      // drop
+    } else if (seg == "..") {
+      // Pop the previous non-empty, non-"" segment if there is one.
+      if (!out.empty() && !out.back().empty() && out.back() != "..") {
+        out.pop_back();
+      } else {
+        out.push_back(seg);
+      }
+    } else {
+      out.push_back(seg);
+    }
+    if (next == std::string_view::npos) {
+      break;
+    }
+    i = next + 1;
+  }
+  std::string joined;
+  for (size_t k = 0; k < out.size(); ++k) {
+    if (k > 0) {
+      joined.push_back('/');
+    }
+    joined.append(out[k]);
+  }
+  while (joined.size() > 1 && joined.back() == '/') {
+    joined.pop_back();
+  }
+  return joined;
 }
 
 bool IsS3Scheme(std::string_view location) {
@@ -115,7 +178,8 @@ namespace {
 // nested under it makes the catalog point at the wrong directory the moment
 // someone calls CreateTable(db.team) (whose `metadata/` subdir would happen
 // to be the existing namespace).
-constexpr std::array<std::string_view, 2> kReservedComponentNames = {"metadata", "data"};
+constexpr std::array<std::string_view, 3> kReservedComponentNames = {"metadata", "data",
+                                                                     kLockRootDirName};
 
 bool IsReservedComponent(std::string_view component) {
   for (const auto& reserved : kReservedComponentNames) {

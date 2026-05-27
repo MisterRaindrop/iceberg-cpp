@@ -82,11 +82,16 @@ InMemoryLockManager::~InMemoryLockManager() = default;
 
 Result<bool> InMemoryLockManager::Acquire(const std::string& entity_id,
                                           const std::string& owner_id) {
+  // Canonicalise the key so two catalog instances configured with alias
+  // warehouse strings (`file:///tmp/wh` vs `file:///tmp/./wh` vs
+  // `file:///tmp/my%20wh`) that resolve to the same physical directory
+  // share one lock entry. The original entity_id is never used for IO.
+  const std::string key = CanonicalLockKey(entity_id);
   std::unique_lock lock(Impl::shared_mutex());
   const auto deadline = std::chrono::steady_clock::now() + acquire_timeout_;
 
   auto try_take = [&]() -> bool {
-    auto& entry = Impl::shared_entries()[entity_id];
+    auto& entry = Impl::shared_entries()[key];
     if (!entry.held) {
       entry.held = true;
       entry.owner = owner_id;
@@ -114,9 +119,10 @@ Result<bool> InMemoryLockManager::Acquire(const std::string& entity_id,
 
 Status InMemoryLockManager::Release(const std::string& entity_id,
                                     const std::string& owner_id) {
+  const std::string key = CanonicalLockKey(entity_id);
   std::lock_guard lock(Impl::shared_mutex());
   auto& entries = Impl::shared_entries();
-  auto it = entries.find(entity_id);
+  auto it = entries.find(key);
   if (it == entries.end() || !it->second.held) {
     return NotAllowed("InMemoryLockManager: '{}' is not held; cannot release.",
                       entity_id);
@@ -227,7 +233,10 @@ std::string FileLockManager::LockFilePathFor(std::string_view entity_id) const {
   if (!p.empty() && p.back() != '/') {
     p.push_back('/');
   }
-  p.append(EncodeEntityIdAsFilename(entity_id));
+  // Hash the CANONICAL identity, not the raw entity_id, so alias
+  // warehouse representations of the same physical table map to one
+  // lock file (matching InMemoryLockManager's keying).
+  p.append(EncodeEntityIdAsFilename(CanonicalLockKey(entity_id)));
   p.append(".lock");
   return p;
 }
@@ -578,7 +587,8 @@ Result<std::unique_ptr<LockManager>> MakeLockManagerWithIO(
     while (!lock_root.empty() && lock_root.back() == '/') {
       lock_root.pop_back();
     }
-    lock_root.append("/_iceberg_catalog_locks");
+    lock_root.push_back('/');
+    lock_root.append(kLockRootDirName);
     return std::make_unique<FileLockManager>(std::move(file_io), config,
                                              std::move(lock_root));
   }

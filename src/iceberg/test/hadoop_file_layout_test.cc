@@ -73,33 +73,38 @@ TEST(HadoopFileLayoutTest, IdentifierRejectsUriSeparators) {
   EXPECT_FALSE(ValidateTableIdentifier(hash).has_value());
 }
 
-TEST(HadoopFileLayoutTest, CanonicalizeWarehouseCollapsesUriAliases) {
-  // Percent-encoded URI form decodes to the canonical version; literal
-  // POSIX paths are preserved (their `%` bytes are literal filename
-  // bytes). Trailing slashes are stripped so `file:///wh` and
-  // `file:///wh/` collapse together.
-  auto encoded = CanonicalizeWarehouse("file:///tmp/my%20wh");
-  auto decoded = CanonicalizeWarehouse("file:///tmp/my wh");
-  ASSERT_TRUE(encoded.has_value());
-  ASSERT_TRUE(decoded.has_value());
-  EXPECT_EQ(*encoded, *decoded);
-  EXPECT_EQ(*encoded, "file:///tmp/my wh");
+TEST(HadoopFileLayoutTest, CanonicalizeWarehouseKeepsReparseableUri) {
+  // CanonicalizeWarehouse must NOT percent-decode -- the result is
+  // re-used as an IO URI prefix and decoding would corrupt reserved
+  // characters. It only strips a trailing slash.
+  auto kept = CanonicalizeWarehouse("file:///tmp/a%23b");
+  ASSERT_TRUE(kept.has_value());
+  EXPECT_EQ(*kept, "file:///tmp/a%23b")
+      << "warehouse must stay re-parseable; %23 (#) must not be decoded";
 
   auto with_slash = CanonicalizeWarehouse("file:///wh/");
   auto without_slash = CanonicalizeWarehouse("file:///wh");
   ASSERT_TRUE(with_slash.has_value());
   ASSERT_TRUE(without_slash.has_value());
   EXPECT_EQ(*with_slash, *without_slash);
+}
 
-  // Literal local paths are NOT decoded; `%20` is a literal filename byte.
-  auto literal = CanonicalizeWarehouse("/tmp/my%20wh");
-  ASSERT_TRUE(literal.has_value());
-  EXPECT_EQ(*literal, "/tmp/my%20wh");
-
-  // Malformed percent encoding in a URI surfaces as InvalidArgument.
-  auto bad = CanonicalizeWarehouse("file:///tmp/wh%2");
-  ASSERT_FALSE(bad.has_value());
-  EXPECT_EQ(ErrorKind::kInvalidArgument, bad.error().kind);
+TEST(HadoopFileLayoutTest, CanonicalLockKeyCollapsesAliases) {
+  // CanonicalLockKey IS the alias-collapsing function (used only for
+  // lock identity, never IO). `%20` vs space, `.`/`..` segments, and
+  // trailing slashes all fold to one key.
+  EXPECT_EQ(CanonicalLockKey("file:///tmp/my%20wh"),
+            CanonicalLockKey("file:///tmp/my wh"));
+  EXPECT_EQ(CanonicalLockKey("file:///tmp/wh"), CanonicalLockKey("file:///tmp/./wh"));
+  EXPECT_EQ(CanonicalLockKey("file:///tmp/a/b/../wh"),
+            CanonicalLockKey("file:///tmp/a/wh"));
+  EXPECT_EQ(CanonicalLockKey("file:///wh/"), CanonicalLockKey("file:///wh"));
+  // %2F decodes to '/', which then collapses identically to a literal
+  // slash in the key.
+  EXPECT_EQ(CanonicalLockKey("file:///tmp/wh%2Fdb"),
+            CanonicalLockKey("file:///tmp/wh/db"));
+  // Distinct physical locations stay distinct.
+  EXPECT_NE(CanonicalLockKey("file:///tmp/wh/a"), CanonicalLockKey("file:///tmp/wh/b"));
 }
 
 TEST(HadoopFileLayoutTest, IdentifierAllowsUtf8) {

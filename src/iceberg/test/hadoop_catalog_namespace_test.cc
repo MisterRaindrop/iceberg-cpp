@@ -307,6 +307,72 @@ TEST_F(HadoopCatalogNamespaceTest, DropTablePurgeTrueRefusesSnapshottedTable) {
   EXPECT_TRUE(*still_table);
 }
 
+TEST_F(HadoopCatalogNamespaceTest, WarehouseWithReservedCharRoundTrips) {
+  // A warehouse whose URI path contains a percent-escaped reserved char
+  // (`%23` = `#`) must keep resolving to the SAME physical directory
+  // through create + load. Regression for the broken decode-then-reuse
+  // canonicalisation that turned `file:///.../a%23b` into
+  // `file:///.../a#b` and made `#b/...` a URI fragment.
+  const std::string base = CreateTempDirectory();
+  // Physical directory literally named `a#b`.
+  const std::string phys = base + "/a#b";
+  ASSERT_TRUE(file_io_->CreateDir("file://" + phys).has_value());
+  const std::string warehouse = "file://" + base + "/a%23b";  // %23 == '#'
+
+  auto props = HadoopCatalogProperties::FromMap({
+      {"warehouse", warehouse},
+      {"name", "pct"},
+  });
+  ICEBERG_UNWRAP_OR_FAIL(auto cat,
+                         HadoopCatalog::Make("pct", file_io_, std::move(props)));
+  ASSERT_TRUE(cat->CreateNamespace(Namespace{.levels = {"db"}}, {}).has_value());
+  TableIdentifier id{.ns = Namespace{.levels = {"db"}}, .name = "t"};
+  auto schema = std::make_shared<Schema>(
+      std::vector<SchemaField>{SchemaField::MakeRequired(1, "id", int64())});
+  ASSERT_TRUE(cat->CreateTable(id, schema, PartitionSpec::Unpartitioned(),
+                               SortOrder::Unsorted(), "", {})
+                  .has_value());
+  // The metadata must physically land under `<base>/a#b/db/t/metadata/`.
+  ICEBERG_UNWRAP_OR_FAIL(
+      auto exists,
+      file_io_->Exists("file://" + phys + "/db/t/metadata/v1.metadata.json"));
+  EXPECT_TRUE(exists) << "table metadata must resolve under the literal a#b dir";
+  // And load works.
+  ICEBERG_UNWRAP_OR_FAIL(auto loaded, cat->LoadTable(id));
+  EXPECT_EQ(loaded->name(), id);
+}
+
+TEST_F(HadoopCatalogNamespaceTest, LockRootNameReservedAndFiltered) {
+  // `_iceberg_catalog_locks` is the lock-impl=file root directory. It is
+  // reserved (no user table/namespace may take that name) and filtered
+  // from ListNamespaces even when a prior file-lock run created it.
+  auto reserved_ns = catalog_->CreateNamespace(
+      Namespace{.levels = {std::string(hadoop::kLockRootDirName)}}, {});
+  ASSERT_FALSE(reserved_ns.has_value());
+  EXPECT_EQ(ErrorKind::kInvalidArgument, reserved_ns.error().kind);
+
+  auto schema = std::make_shared<Schema>(
+      std::vector<SchemaField>{SchemaField::MakeRequired(1, "id", int64())});
+  auto reserved_tbl = catalog_->CreateTable(
+      TableIdentifier{.ns = Namespace{}, .name = std::string(hadoop::kLockRootDirName)},
+      schema, PartitionSpec::Unpartitioned(), SortOrder::Unsorted(), "", {});
+  ASSERT_FALSE(reserved_tbl.has_value());
+  EXPECT_EQ(ErrorKind::kInvalidArgument, reserved_tbl.error().kind);
+
+  // Simulate a prior lock-impl=file run having created the lock root,
+  // then confirm ListNamespaces({}) does not surface it.
+  ICEBERG_UNWRAP_OR_FAIL(auto warehouse, catalog_->config().Warehouse());
+  ASSERT_TRUE(file_io_
+                  ->CreateDir(std::string(warehouse) + "/" +
+                              std::string(hadoop::kLockRootDirName))
+                  .has_value());
+  ICEBERG_UNWRAP_OR_FAIL(auto roots, catalog_->ListNamespaces(Namespace{}));
+  for (const auto& n : roots) {
+    EXPECT_NE(n.levels.back(), hadoop::kLockRootDirName)
+        << "lock root must not appear as a namespace";
+  }
+}
+
 TEST_F(HadoopCatalogNamespaceTest, ListNamespacesRefusesTablePath) {
   // ListNamespaces / ListTables on a path that is itself a Hadoop table
   // used to enumerate its `metadata/` / `data/` subdirs as if they were
