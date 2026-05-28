@@ -81,6 +81,26 @@ Result<std::string> CanonicalizeWarehouse(std::string_view warehouse) {
         "warehouse. Remove it, or percent-encode (%3F / %23) a literal byte.",
         warehouse);
   }
+  // Refuse a filesystem-root warehouse. The trailing-slash strip below would
+  // corrupt URI roots (`file:///` -> `file:`, `s3://` -> `s3:`), turning the
+  // stored prefix into a non-URI string that the FileIO layer then treats as
+  // a bare relative path. A bare `/` warehouse "succeeds" but
+  // StripTrailingSlash collapses it to "", so child IO lands at the
+  // filesystem root with no namespace prefix. Either way, the catalog points
+  // at the wrong place; refuse it and require an actual sub-directory.
+  {
+    std::string_view tail = warehouse;
+    if (LooksLikeUri(tail)) {
+      tail.remove_prefix(tail.find(':') + 3);  // skip `scheme://`
+    }
+    if (tail.find_first_not_of('/') == std::string_view::npos) {
+      return InvalidArgument(
+          "warehouse '{}' is a filesystem/URI root; configure a real "
+          "sub-directory (the trailing-slash normalisation would otherwise "
+          "corrupt URI roots or collapse a bare '/' to an empty prefix).",
+          warehouse);
+    }
+  }
   std::string canonical(warehouse);
   while (canonical.size() > 1 && canonical.back() == '/') {
     canonical.pop_back();
@@ -576,16 +596,32 @@ Status RejectUnsafeTablePath(std::string_view path, std::string_view source) {
         "resolved path. Remove it, or percent-encode (%3F / %23) a literal byte.",
         source, path);
   }
-  // (2) The reserved lock-root leaf, after stripping trailing slashes so a
-  // `.../_iceberg_catalog_locks/` form (whose bare Basename is empty) is
-  // still caught -- the layout strips the trailing slash before joining, so
-  // both forms resolve to the same physical lock root.
-  if (Basename(LocationUtil::StripTrailingSlash(path)) == kLockRootDirName) {
+  // (2) Strip trailing slashes once, then run the lock-root and root-only
+  // checks against the canonical leaf. The layout joiner also strips
+  // trailing slashes, so a `.../_iceberg_catalog_locks/` form would resolve
+  // to the same physical lock root as the unsuffixed form, and a
+  // `file:///` / `/` form would resolve to an empty leaf -- both must be
+  // refused at the API boundary so PathToIdentifier never builds a
+  // TableIdentifier with an empty name.
+  const std::string_view stripped = LocationUtil::StripTrailingSlash(path);
+  const std::string_view leaf = Basename(stripped);
+  if (leaf == kLockRootDirName) {
     return InvalidArgument(
         "{}: path '{}' resolves to the reserved lock-root directory name '{}'; a "
         "lock-impl=file catalog stores its lock files there, so it cannot be a "
         "table.",
         source, path, kLockRootDirName);
+  }
+  if (leaf.empty()) {
+    // After trailing-slash stripping, the path has no leaf component: it is
+    // either a bare filesystem root (`/`) or a scheme-only URI root
+    // (`file:///`, `s3://`). Operating on the filesystem root is never what
+    // the caller meant, so refuse rather than produce a Table with an empty
+    // name or an IO target that points at the warehouse root.
+    return InvalidArgument(
+        "{}: path '{}' has no leaf component (resolves to a filesystem root); a "
+        "table location must include the table directory name.",
+        source, path);
   }
   return {};
 }

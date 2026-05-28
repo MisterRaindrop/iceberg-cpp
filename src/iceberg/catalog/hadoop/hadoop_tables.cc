@@ -51,7 +51,13 @@ namespace {
 // reuse Table::Make (which keys tables by identifier). The leaf of the path
 // becomes the table name; the empty namespace signals "no catalog".
 TableIdentifier PathToIdentifier(std::string_view path) {
-  return TableIdentifier{.ns = Namespace{}, .name = std::string(Basename(path))};
+  // The layout joiner strips trailing slashes (LocationUtil::StripTrailingSlash),
+  // so `file:///wh/events` and `file:///wh/events/` refer to the same table.
+  // Without normalising here, the second form's Basename would be the empty
+  // string, leaving Table::name().name empty even though IO succeeds.
+  return TableIdentifier{
+      .ns = Namespace{},
+      .name = std::string(Basename(LocationUtil::StripTrailingSlash(path)))};
 }
 
 // Publish a v1.metadata.json[.codec] + version-hint.text under `path` via
@@ -220,6 +226,7 @@ Result<std::shared_ptr<Table>> HadoopTables::Load(const std::string& path) {
   if (path.empty()) {
     return InvalidArgument("HadoopTables::Load requires a non-empty path.");
   }
+  ICEBERG_RETURN_UNEXPECTED(hadoop::RejectUnsafeTablePath(path, "HadoopTables::Load"));
   ICEBERG_ASSIGN_OR_RAISE(auto io, ResolveFileIO(path));
 
   // Java's HadoopTables.load returns kNoSuchTable when the path is not a
@@ -247,6 +254,7 @@ Result<bool> HadoopTables::Exists(const std::string& path) {
   if (path.empty()) {
     return InvalidArgument("HadoopTables::Exists requires a non-empty path.");
   }
+  ICEBERG_RETURN_UNEXPECTED(hadoop::RejectUnsafeTablePath(path, "HadoopTables::Exists"));
   ICEBERG_ASSIGN_OR_RAISE(auto io, ResolveFileIO(path));
   return hadoop::IsHadoopTableDir(*io, path);
 }

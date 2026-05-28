@@ -682,15 +682,33 @@ Status ArrowFileSystemFileIO::DeleteDir(const std::string& dir_location, bool re
     return {};
   }
   // Non-recursive: the FileIO contract requires rmdir semantics -- fail if
-  // the directory is non-empty. On LocalFileSystem we route directly to
-  // std::filesystem::remove (which is POSIX rmdir(2)) so the empty-check
-  // and the delete are a single atomic syscall. A "list, then recursive
-  // delete" emulation here would be TOCTOU-racy: a concurrent CreateTable
-  // can populate the directory after the empty check passes but before the
-  // recursive delete runs, and the second writer's data would be silently
-  // wiped. THIS IS THE ONLY BACKEND WHERE DeleteDir(recursive=false) HAS
-  // TRUE rmdir SEMANTICS.
+  // the directory is non-empty AND fail if the target is not a directory at
+  // all. std::filesystem::remove would silently unlink a regular file (it
+  // is `std::remove`-style, dispatching to unlink/rmdir by inode type), so
+  // we probe the kind explicitly first and only then call remove. The
+  // TOCTOU window between probe and remove is narrow: if a concurrent
+  // writer replaces the inode in between, the subsequent remove either
+  // succeeds against a new (still-empty) directory or surfaces a faithful
+  // error. We never silently unlink a regular file. The empty-check then
+  // remove(2) on a directory is still a single std::filesystem call, so the
+  // empty-vs-delete race the previous comment described stays closed.
   if (dynamic_cast<::arrow::fs::LocalFileSystem*>(arrow_fs_.get()) != nullptr) {
+    std::error_code st_ec;
+    const auto st = std::filesystem::symlink_status(path, st_ec);
+    if (st_ec == std::errc::no_such_file_or_directory ||
+        st.type() == std::filesystem::file_type::not_found) {
+      return IOError("DeleteDir(non-recursive): '{}' does not exist.", dir_location);
+    }
+    if (st_ec) {
+      return IOError("DeleteDir(non-recursive, stat '{}') failed: {}", dir_location,
+                     st_ec.message());
+    }
+    if (st.type() != std::filesystem::file_type::directory) {
+      return InvalidArgument(
+          "DeleteDir(non-recursive): '{}' is not a directory; refusing to "
+          "delete to avoid silently unlinking a regular file.",
+          dir_location);
+    }
     std::error_code ec;
     const bool removed = std::filesystem::remove(path, ec);
     if (ec == std::errc::directory_not_empty) {

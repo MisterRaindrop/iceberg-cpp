@@ -115,6 +115,33 @@ TEST(HadoopFileLayoutTest, CanonicalLockKeyCollapsesAliases) {
             CanonicalLockKey("file:///tmp/wh"));
 }
 
+TEST(HadoopFileLayoutTest, CanonicalizeWarehouseRejectsRoot) {
+  // A root warehouse (`file:///`, `s3://`, `/`) cannot be safely stored:
+  // the trailing-slash strip would corrupt URI roots to bare schemes, and a
+  // bare `/` would later collapse to "" in NamespaceDir, so every child
+  // table would resolve to the filesystem root. Refuse it up front.
+  EXPECT_FALSE(CanonicalizeWarehouse("file:///").has_value());
+  EXPECT_FALSE(CanonicalizeWarehouse("file:///////").has_value());
+  EXPECT_FALSE(CanonicalizeWarehouse("s3://").has_value());
+  EXPECT_FALSE(CanonicalizeWarehouse("/").has_value());
+  EXPECT_FALSE(CanonicalizeWarehouse("///").has_value());
+  // A real sub-directory still works (no change in behaviour).
+  EXPECT_TRUE(CanonicalizeWarehouse("file:///tmp/wh").has_value());
+  EXPECT_TRUE(CanonicalizeWarehouse("/tmp/wh").has_value());
+}
+
+TEST(HadoopFileLayoutTest, RejectUnsafeTablePathRefusesRootOnly) {
+  // A path that strips to no leaf (the filesystem root) must be refused:
+  // PathToIdentifier would otherwise produce a Table with an empty name,
+  // and operating on the filesystem root is never what the caller meant.
+  EXPECT_FALSE(RejectUnsafeTablePath("file:///", "test").has_value());
+  EXPECT_FALSE(RejectUnsafeTablePath("file:////", "test").has_value());
+  EXPECT_FALSE(RejectUnsafeTablePath("/", "test").has_value());
+  EXPECT_FALSE(RejectUnsafeTablePath("//", "test").has_value());
+  // A real leaf is accepted.
+  EXPECT_TRUE(RejectUnsafeTablePath("file:///tmp/t", "test").has_value());
+}
+
 TEST(HadoopFileLayoutTest, RejectUnsafeTablePathGuardsLockRootAndUriMarkers) {
   // Lock-root leaf is rejected, with or without a trailing slash (the
   // layout strips it before joining, so both forms hit the same physical

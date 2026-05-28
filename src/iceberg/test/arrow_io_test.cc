@@ -461,6 +461,22 @@ TEST_F(LocalFileIOTest, DeleteDirNonRecursiveIsAtomicEmptyCheck) {
       << "DeleteDir(non-recursive) must NOT touch the directory contents on refusal";
 }
 
+TEST_F(LocalFileIOTest, DeleteDirNonRecursiveRefusesNonDirectory) {
+  // DeleteDir's contract is "delete a directory" -- a regular file is not
+  // a directory and must be refused. The previous implementation called
+  // std::filesystem::remove directly, which is `std::remove`-style and
+  // silently unlinks files. That broke the FileIO contract and let a
+  // mis-typed path quietly delete data.
+  const std::string root = CreateTempDirectory();
+  const std::string file_path = root + "/regular.txt";
+  EXPECT_THAT(file_io_->WriteFile(file_path, "stay"), IsOk());
+
+  EXPECT_THAT(file_io_->DeleteDir(file_path, /*recursive=*/false),
+              IsError(ErrorKind::kInvalidArgument));
+  ICEBERG_UNWRAP_OR_FAIL(auto still_there, file_io_->Exists(file_path));
+  EXPECT_TRUE(still_there) << "DeleteDir(non-recursive) on a file must not unlink it";
+}
+
 TEST_F(LocalFileIOTest, RenameHonoursOverwriteFlag) {
   const std::string root = CreateTempDirectory();
   const std::string src = root + "/src.txt";

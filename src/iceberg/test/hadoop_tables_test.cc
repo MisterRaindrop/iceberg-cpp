@@ -250,6 +250,54 @@ TEST_F(HadoopTablesTest, MutatingApisRejectLockRootPath) {
   EXPECT_EQ(ErrorKind::kInvalidArgument, created_slash.error().kind);
 }
 
+TEST_F(HadoopTablesTest, TrailingSlashKeepsLeafTableName) {
+  // The layout joiner strips trailing slashes, so `.../events/` and
+  // `.../events` refer to the same physical table. PathToIdentifier must
+  // mirror that normalisation -- without it, Table::name().name comes back
+  // empty for the trailing-slash form even though Load/Create/Register
+  // succeeded against the right directory.
+  const std::string path = root_ + "/events/";
+  auto schema = std::make_shared<Schema>(
+      std::vector<SchemaField>{SchemaField::MakeRequired(1, "id", int64())});
+
+  ICEBERG_UNWRAP_OR_FAIL(auto created,
+                         tables_->Create(schema, PartitionSpec::Unpartitioned(),
+                                         SortOrder::Unsorted(), path, /*properties=*/{}));
+  EXPECT_EQ(created->name().name, "events")
+      << "trailing-slash path must still yield the leaf as the table name";
+
+  ICEBERG_UNWRAP_OR_FAIL(auto loaded, tables_->Load(path));
+  EXPECT_EQ(loaded->name().name, "events");
+}
+
+TEST_F(HadoopTablesTest, RootOnlyPathRejectedByAllMutatingAndReadApis) {
+  // After trailing-slash stripping, a `file:///` / `/` path has no leaf
+  // component. Refuse it across the whole API surface: producing a Table
+  // with an empty name is nonsense, and operating on the filesystem root is
+  // never what the caller meant.
+  auto schema = std::make_shared<Schema>(
+      std::vector<SchemaField>{SchemaField::MakeRequired(1, "id", int64())});
+  for (const std::string& bad : {std::string("file:///"), std::string("file:////"),
+                                 std::string("file:///") /* keep */}) {
+    auto created = tables_->Create(schema, PartitionSpec::Unpartitioned(),
+                                   SortOrder::Unsorted(), bad, /*properties=*/{});
+    ASSERT_FALSE(created.has_value()) << bad;
+    EXPECT_EQ(ErrorKind::kInvalidArgument, created.error().kind);
+    auto load = tables_->Load(bad);
+    ASSERT_FALSE(load.has_value()) << bad;
+    EXPECT_EQ(ErrorKind::kInvalidArgument, load.error().kind);
+    auto exists = tables_->Exists(bad);
+    ASSERT_FALSE(exists.has_value()) << bad;
+    EXPECT_EQ(ErrorKind::kInvalidArgument, exists.error().kind);
+    auto drop = tables_->DropTable(bad, /*purge=*/true);
+    ASSERT_FALSE(drop.has_value()) << bad;
+    EXPECT_EQ(ErrorKind::kInvalidArgument, drop.error().kind);
+    auto reg = tables_->RegisterTable(bad, root_ + "/whatever.metadata.json");
+    ASSERT_FALSE(reg.has_value()) << bad;
+    EXPECT_EQ(ErrorKind::kInvalidArgument, reg.error().kind);
+  }
+}
+
 TEST_F(HadoopTablesTest, MutatingApisRejectRawUriQueryOrFragment) {
   // The bare-path API receives the location directly; a URI path with a raw
   // `?`/`#` would be truncated at the marker by arrow's URI parser, so the
