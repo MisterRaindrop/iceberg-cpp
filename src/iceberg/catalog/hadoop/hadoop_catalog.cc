@@ -21,8 +21,10 @@
 
 #include <format>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
@@ -763,6 +765,38 @@ Result<std::string> HadoopCatalog::WriteInitialBytesLocked(
   const std::string metadata_dir = hadoop::MetadataDir(table_dir);
   ICEBERG_ASSIGN_OR_RAISE(auto metadata_dir_existed, file_io_->Exists(metadata_dir));
   ICEBERG_ASSIGN_OR_RAISE(auto table_dir_existed, file_io_->Exists(table_dir));
+  // FileIO::CreateDir is mkdir-p (recursive=true), so creating
+  // `<warehouse>/db/a/b/table/metadata` also creates `db`, `db/a`, `db/a/b`
+  // when they're missing. On failure we must clean those up too -- without
+  // it, a failed CreateTable / RegisterTable into a fresh nested namespace
+  // chain leaves a tree of empty directories behind that ListNamespaces
+  // then surfaces as real namespaces. Walk every prefix between
+  // `warehouse_` and `table_dir` (exclusive on both ends), check Exists
+  // for each, and remember the prefixes we will create. Cleanup happens
+  // deepest-first under rmdir semantics so any sibling table inside
+  // these dirs survives intact.
+  std::vector<std::string> ancestor_dirs_created;
+  {
+    const std::string_view warehouse_view = LocationUtil::StripTrailingSlash(warehouse_);
+    const std::string_view table_view = LocationUtil::StripTrailingSlash(table_dir);
+    if (table_view.starts_with(warehouse_view) &&
+        table_view.size() > warehouse_view.size() + 1) {
+      const std::string_view rel = table_view.substr(warehouse_view.size() + 1);
+      size_t cursor = rel.find('/');
+      while (cursor != std::string_view::npos) {
+        std::string ancestor =
+            std::string(warehouse_view) + "/" + std::string(rel.substr(0, cursor));
+        auto exists = file_io_->Exists(ancestor);
+        // Only mark ancestors we observed as missing right now. An
+        // Exists error means we cannot tell; be conservative and don't
+        // claim ownership.
+        if (exists.has_value() && !*exists) {
+          ancestor_dirs_created.push_back(std::move(ancestor));
+        }
+        cursor = rel.find('/', cursor + 1);
+      }
+    }
+  }
   // Idempotent under file-lock (Acquire already created the dir);
   // required under in-memory-lock where Acquire has no on-disk side
   // effects.
@@ -771,14 +805,21 @@ Result<std::string> HadoopCatalog::WriteInitialBytesLocked(
   // Best-effort cleanup of directories WE created. DeleteDir is the
   // rmdir(2) path: it refuses non-empty directories, so any committed
   // content (a v1 from a concurrent writer that landed during our
-  // window, or our own partial publish that wasn't fully rolled back)
-  // survives untouched.
+  // window, our own partial publish that wasn't fully rolled back, or a
+  // sibling table that another writer created inside one of our newly-
+  // -minted ancestors) survives untouched. Ancestors are cleaned
+  // deepest-first; the shallowest only goes away when every nested
+  // level below it was also empty (i.e. truly our orphan).
   auto cleanup_orphan_dirs = [&]() {
     if (!metadata_dir_existed) {
       std::ignore = file_io_->DeleteDir(metadata_dir, /*recursive=*/false);
     }
     if (!table_dir_existed) {
       std::ignore = file_io_->DeleteDir(table_dir, /*recursive=*/false);
+    }
+    for (auto it = ancestor_dirs_created.rbegin(); it != ancestor_dirs_created.rend();
+         ++it) {
+      std::ignore = file_io_->DeleteDir(*it, /*recursive=*/false);
     }
   };
 

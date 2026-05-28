@@ -165,11 +165,42 @@ Result<ResolvedMetadataPointer> ResolveCurrentMetadata(FileIO& file_io,
     pointer.from_listdir_fallback = true;
   }
 
-  for (auto& entry : versioned) {
-    if (entry.version == pointer.version) {
-      pointer.location = std::move(entry.location);
-      return pointer;
+  // Resolve the on-disk file matching `pointer.version`. The commit path
+  // refuses to publish a second v{N} via the codec-independent CAS, but
+  // metadata directories can ALSO be populated by external writers
+  // (foreign-tool imports, RegisterTable from a separate process, a
+  // crashed mid-codec-migration run, etc.). If two different codec files
+  // exist for the same version, silently picking whichever the listing
+  // surfaces first would mask a real ambiguity -- and the next Refresh
+  // could pick a different one if the listing order changes. Detect it
+  // here and surface a kDataInvalid so the operator can repair the dir.
+  auto find_unique = [&](const std::vector<VersionedEntry>& entries,
+                         std::string* out_location) -> Status {
+    const VersionedEntry* match = nullptr;
+    for (const auto& entry : entries) {
+      if (entry.version != pointer.version) {
+        continue;
+      }
+      if (match != nullptr) {
+        return InvalidArgument(
+            "Metadata directory '{}' has multiple files at version {}: '{}' and "
+            "'{}'. Refusing to pick one silently; remove the unintended file.",
+            MetadataDir(table_dir), pointer.version, match->location, entry.location);
+      }
+      match = &entry;
     }
+    if (match == nullptr) {
+      return {};  // Not found yet -- caller may retry.
+    }
+    *out_location = match->location;
+    return {};
+  };
+
+  std::string resolved_location;
+  ICEBERG_RETURN_UNEXPECTED(find_unique(versioned, &resolved_location));
+  if (!resolved_location.empty()) {
+    pointer.location = std::move(resolved_location);
+    return pointer;
   }
 
   // Hint pointed at a version not present in our listing (this branch is
@@ -180,11 +211,10 @@ Result<ResolvedMetadataPointer> ResolveCurrentMetadata(FileIO& file_io,
   // rename has been visible by now if the hint update was.
   ICEBERG_ASSIGN_OR_RAISE(auto retry_versioned,
                           ListVersionedMetadata(file_io, table_dir));
-  for (auto& entry : retry_versioned) {
-    if (entry.version == pointer.version) {
-      pointer.location = std::move(entry.location);
-      return pointer;
-    }
+  ICEBERG_RETURN_UNEXPECTED(find_unique(retry_versioned, &resolved_location));
+  if (!resolved_location.empty()) {
+    pointer.location = std::move(resolved_location);
+    return pointer;
   }
   return NoSuchTable("Metadata file v{}.metadata.json[.gz|.zstd] not found under '{}'.",
                      pointer.version, MetadataDir(table_dir));

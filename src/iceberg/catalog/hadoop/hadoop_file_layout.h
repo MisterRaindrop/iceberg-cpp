@@ -34,8 +34,13 @@
 /// HadoopCatalog stores metadata directly on the filesystem in a fixed shape:
 /// <warehouse>/<ns_level_1>/.../<ns_level_n>/<table>/metadata/v{N}.metadata.json
 ///                                                /metadata/version-hint.text
-///                                                /metadata/_lock (optional)
 ///                                                /data/...
+///
+/// With `lock-impl=file`, the file-based LockManager keeps its lock files
+/// in a warehouse-shared directory rather than under each table:
+/// <warehouse>/_iceberg_catalog_locks/<FNV1a64-hex>.lock
+/// The lock root name is position-aware reserved (see `kLockRootDirName`),
+/// so no user table or namespace can collide with it at the warehouse root.
 ///
 /// Filenames mirror Apache Iceberg's Java HadoopTableOperations exactly so
 /// readers and writers across JVM/Python/C++ remain interoperable.

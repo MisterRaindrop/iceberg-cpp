@@ -97,14 +97,18 @@ class ICEBERG_HADOOP_EXPORT InMemoryLockManager : public LockManager {
 
 /// \brief Filesystem-backed lock manager.
 ///
-/// `FileLockManager` writes a `_lock` file under
-/// `<entity_id>/metadata/_lock` using fail-if-exists semantics (via a
-/// UUID-named temp + `Rename(overwrite=false)`). The file contents are
-/// `<owner_id>|<acquire_ts_ms>`; the recorded timestamp lets a separate
-/// reaper / operator decide when the lock is no longer live. A background
-/// heartbeat thread refreshes the timestamp every
-/// `lock.heartbeat-interval-ms` so a legitimately slow commit is not
-/// mis-classified as a dead holder.
+/// `FileLockManager` writes one lock file per entity under a single
+/// warehouse-shared directory:
+/// `<warehouse>/_iceberg_catalog_locks/<FNV1a64-hex(canonical(entity_id))>.lock`.
+/// Files are created via UUID-named temp + `Rename(overwrite=false)` so
+/// the rename CAS is fail-if-exists. Storing locks OUTSIDE each table's
+/// own `metadata/` directory means `DropTable(purge=true)` (which
+/// recursively deletes the table tree) cannot destroy an in-flight
+/// lock file. The file contents are `<owner_id>|<acquire_ts_ms>`; the
+/// recorded timestamp lets a separate reaper / operator decide when the
+/// lock is no longer live. A background heartbeat thread refreshes the
+/// timestamp every `lock.heartbeat-interval-ms` so a legitimately slow
+/// commit is not mis-classified as a dead holder.
 ///
 /// **Stale-lock reclamation is NOT performed inline by `Acquire`.** A
 /// `read body -> rename source aside` snatch is fundamentally unsafe

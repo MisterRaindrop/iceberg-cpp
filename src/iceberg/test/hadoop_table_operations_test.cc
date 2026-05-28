@@ -134,6 +134,27 @@ TEST_F(HadoopTableOperationsTest, ResolveUsesVersionHintWhenPresent) {
   EXPECT_TRUE(pointer.location.ends_with("v5.metadata.json"));
 }
 
+TEST_F(HadoopTableOperationsTest, ResolveRejectsDuplicateVersionAcrossCodecs) {
+  // The commit path's codec-independent CAS prevents iceberg-cpp from
+  // ever publishing two files at the same version. But an external
+  // writer (foreign tool, mid-codec-migration crash, manual RegisterTable
+  // from a parallel process) can plant both `vN.metadata.json` and
+  // `vN.gz.metadata.json` in the same metadata/ dir. Silently picking
+  // whichever the listing surfaces first would mask a real ambiguity and
+  // could even flip the chosen file across Refresh calls if directory
+  // ordering changes. Surface kInvalidArgument so the operator can
+  // repair the dir.
+  const std::string body = SlurpResource("TableMetadataV1Valid.json");
+  SeedMetadataFile(3, MetadataCompressionCodec::kNone, body);
+  SeedMetadataFile(3, MetadataCompressionCodec::kGzip, body);
+  SeedVersionHint("3\n");
+
+  auto resolved = ResolveCurrentMetadata(*file_io_, table_dir_);
+  ASSERT_FALSE(resolved.has_value());
+  EXPECT_EQ(ErrorKind::kInvalidArgument, resolved.error().kind);
+  EXPECT_NE(resolved.error().message.find("version 3"), std::string::npos);
+}
+
 TEST_F(HadoopTableOperationsTest, ResolveFallsBackToListdirWhenHintMissing) {
   const std::string body = SlurpResource("TableMetadataV1Valid.json");
   SeedMetadataFile(2, MetadataCompressionCodec::kNone, body);
