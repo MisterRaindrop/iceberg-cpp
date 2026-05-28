@@ -24,6 +24,7 @@
 
 #include <arrow/filesystem/localfs.h>
 #include <gtest/gtest.h>
+#include <nlohmann/json.hpp>
 
 #include "iceberg/arrow/arrow_io_internal.h"
 #include "iceberg/arrow/arrow_io_register.h"
@@ -215,6 +216,57 @@ TEST_F(HadoopTablesTest, AutoDetectRejectsMixedSchemes) {
   auto mixed = auto_tables.Exists("hdfs://example/path");
   ASSERT_FALSE(mixed.has_value());
   EXPECT_EQ(ErrorKind::kInvalidArgument, mixed.error().kind);
+}
+
+TEST_F(HadoopTablesTest, MutatingApisRejectLockRootPath) {
+  // The bare-path API cannot know a path IS some warehouse's lock root, but
+  // any path whose leaf is the reserved lock-root name could be one: a
+  // lock-impl=file catalog stores its lock files there. Creating a table
+  // over it, or purging it, would corrupt active file locks. Create /
+  // RegisterTable / DropTable must all refuse the reserved leaf name.
+  const std::string lock_path = root_ + "/" + std::string(hadoop::kLockRootDirName);
+  auto schema = std::make_shared<Schema>(
+      std::vector<SchemaField>{SchemaField::MakeRequired(1, "id", int64())});
+
+  auto created = tables_->Create(schema, PartitionSpec::Unpartitioned(),
+                                 SortOrder::Unsorted(), lock_path, /*properties=*/{});
+  ASSERT_FALSE(created.has_value());
+  EXPECT_EQ(ErrorKind::kInvalidArgument, created.error().kind);
+
+  auto dropped = tables_->DropTable(lock_path, /*purge=*/true);
+  ASSERT_FALSE(dropped.has_value());
+  EXPECT_EQ(ErrorKind::kInvalidArgument, dropped.error().kind);
+
+  auto registered = tables_->RegisterTable(lock_path, root_ + "/whatever.metadata.json");
+  ASSERT_FALSE(registered.has_value());
+  EXPECT_EQ(ErrorKind::kInvalidArgument, registered.error().kind);
+}
+
+TEST_F(HadoopTablesTest, RegisterRejectsUuidlessMetadata) {
+  // Mirror HadoopCatalog::RegisterTable: refuse importing metadata with no
+  // table-uuid, which would defeat the commit-time ABA guard. `location` is
+  // set to the target so the uuid check (which runs first) is what trips.
+  const std::string src_path = root_ + "/src";
+  auto schema = std::make_shared<Schema>(
+      std::vector<SchemaField>{SchemaField::MakeRequired(1, "id", int64())});
+  ICEBERG_UNWRAP_OR_FAIL(
+      auto src, tables_->Create(schema, PartitionSpec::Unpartitioned(),
+                                SortOrder::Unsorted(), src_path, /*properties=*/{}));
+
+  const std::string tgt_path = root_ + "/imported";
+  ICEBERG_UNWRAP_OR_FAIL(
+      auto raw,
+      file_io_->ReadFile(std::string(src->metadata_file_location()), std::nullopt));
+  auto json = nlohmann::json::parse(raw);
+  json["location"] = tgt_path;
+  json.erase("table-uuid");
+  const std::string ext_path = root_ + "/external_v1.metadata.json";
+  ASSERT_TRUE(file_io_->WriteFile(ext_path, json.dump()).has_value());
+
+  auto registered = tables_->RegisterTable(tgt_path, ext_path);
+  ASSERT_FALSE(registered.has_value());
+  EXPECT_EQ(ErrorKind::kInvalidArgument, registered.error().kind);
+  EXPECT_NE(registered.error().message.find("table-uuid"), std::string::npos);
 }
 
 }  // namespace iceberg::hadoop

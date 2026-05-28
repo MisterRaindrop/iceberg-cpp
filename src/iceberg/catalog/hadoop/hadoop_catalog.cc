@@ -158,6 +158,16 @@ Status RejectTopLevelLockRoot(const Namespace& ns, std::string_view table_name,
   return {};
 }
 
+// True iff `ns` denotes the warehouse-level reserved lock-root namespace:
+// a single top-level level equal to the lock-root name. A NESTED
+// `db._iceberg_catalog_locks` is a legitimate namespace (the reserved-name
+// rule is position-aware, see RejectTopLevelLockRoot), so it returns false.
+// The namespace read APIs use this to consistently report the reserved
+// top-level lock root as "not a namespace".
+bool IsTopLevelLockRoot(const Namespace& ns) {
+  return ns.levels.size() == 1 && ns.levels.front() == hadoop::kLockRootDirName;
+}
+
 }  // namespace
 
 HadoopCatalog::~HadoopCatalog() = default;
@@ -398,11 +408,13 @@ Result<std::vector<Namespace>> HadoopCatalog::ListNamespaces(const Namespace& ns
       continue;
     }
     // Hide the catalog's own lock-root directory
-    // (`<warehouse>/_iceberg_catalog_locks/`, used by lock-impl=file).
-    // It is reserved (the validator rejects it as an identifier), so it
-    // can never be a real namespace -- filtering it keeps it out of
-    // listings even when a previous file-lock run created it.
-    if (leaf == hadoop::kLockRootDirName) {
+    // (`<warehouse>/_iceberg_catalog_locks/`, used by lock-impl=file), but
+    // ONLY at the warehouse root. The reserved-name rule is position-aware
+    // (see RejectTopLevelLockRoot): a NESTED `db._iceberg_catalog_locks` is
+    // a legitimate, creatable namespace, so it must remain listable here.
+    // Filtering it unconditionally would make the directory un-listable
+    // even though CreateNamespace allowed it.
+    if (ns.levels.empty() && leaf == hadoop::kLockRootDirName) {
       continue;
     }
     // Skip directories that look like tables. The strict check (metadata/
@@ -433,6 +445,15 @@ Result<std::vector<Namespace>> HadoopCatalog::ListNamespaces(const Namespace& ns
 
 Result<std::unordered_map<std::string, std::string>>
 HadoopCatalog::GetNamespaceProperties(const Namespace& ns) const {
+  // The top-level lock-root directory is reserved file-lock storage, not a
+  // namespace. A file-lock run may have created it on disk, but it must
+  // never surface as a namespace -- symmetric with ListNamespaces filtering
+  // it out and CreateNamespace rejecting it.
+  if (IsTopLevelLockRoot(ns)) {
+    return NoSuchNamespace(
+        "Namespace '{}' does not exist (reserved lock-impl=file root directory).",
+        ns.ToString());
+  }
   ICEBERG_ASSIGN_OR_RAISE(auto ns_dir, hadoop::NamespaceDir(warehouse_, ns));
   auto exists_result = file_io_->Exists(ns_dir);
   if (!exists_result.has_value()) {
@@ -463,6 +484,14 @@ Status HadoopCatalog::DropNamespace(const Namespace& ns) {
     return InvalidArgument(
         "HadoopCatalog::DropNamespace requires a non-empty namespace.");
   }
+  // The reserved top-level lock root is not a namespace, so DropNamespace
+  // must not delete it (which would destroy active file locks). Report it
+  // as non-existent, symmetric with NamespaceExists/GetNamespaceProperties.
+  if (IsTopLevelLockRoot(ns)) {
+    return NoSuchNamespace(
+        "Namespace '{}' does not exist (reserved lock-impl=file root directory).",
+        ns.ToString());
+  }
   ICEBERG_ASSIGN_OR_RAISE(auto ns_dir, hadoop::NamespaceDir(warehouse_, ns));
   ICEBERG_ASSIGN_OR_RAISE(auto exists, file_io_->Exists(ns_dir));
   if (!exists) {
@@ -487,6 +516,11 @@ Status HadoopCatalog::DropNamespace(const Namespace& ns) {
 }
 
 Result<bool> HadoopCatalog::NamespaceExists(const Namespace& ns) const {
+  // The reserved top-level lock root is never a namespace, even if a
+  // file-lock run created the directory on disk.
+  if (IsTopLevelLockRoot(ns)) {
+    return false;
+  }
   ICEBERG_ASSIGN_OR_RAISE(auto ns_dir, hadoop::NamespaceDir(warehouse_, ns));
   auto exists_result = file_io_->Exists(ns_dir);
   if (!exists_result.has_value()) {
@@ -1139,6 +1173,18 @@ Result<std::shared_ptr<Table>> HadoopCatalog::RegisterTable(
   }
   ICEBERG_ASSIGN_OR_RAISE(auto json, FromJsonString(body));
   ICEBERG_ASSIGN_OR_RAISE(auto metadata, TableMetadataFromJson(json));
+
+  // The metadata MUST carry a table-uuid. An empty uuid would defeat the
+  // commit-time ABA guard (HadoopTableOperations::Commit step 4b): two
+  // uuid-less generations at the same version compare equal, so a stale
+  // update could clobber a concurrently recreated table. Refuse to import
+  // uuid-less metadata up front.
+  if (metadata->table_uuid.empty()) {
+    return InvalidArgument(
+        "HadoopCatalog::RegisterTable: source metadata at '{}' has no table-uuid; "
+        "uuid-less tables cannot be guarded against concurrent drop+recreate.",
+        metadata_file_location);
+  }
 
   // Same Java parity rule HadoopCatalog::Commit / CreateTable enforce:
   // path-based tables cannot redirect their metadata directory via

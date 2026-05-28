@@ -65,6 +65,22 @@ Result<std::string> CanonicalizeWarehouse(std::string_view warehouse) {
   // to strip a trailing slash (which never changes the resolved path).
   // Alias collapsing for LOCK identity is handled separately by
   // CanonicalLockKey, which produces a key that is never used for IO.
+  //
+  // A URI warehouse carrying a `?` (query) or `#` (fragment) is rejected:
+  // arrow's PathFromUri splits the path at the first such marker, so
+  // `file:///tmp/wh?x=1` resolves to `/tmp/wh` and appending `/db/t` then
+  // produces `file:///tmp/wh/db/t?x=1` -- the query bleeds to the end and
+  // the physical target is NOT `/tmp/wh/db/t`. A literal `?`/`#` in a
+  // directory name must be percent-encoded (`%3F` / `%23`) by the caller.
+  if (LooksLikeUri(warehouse) &&
+      warehouse.find_first_of("?#") != std::string_view::npos) {
+    return InvalidArgument(
+        "warehouse URI '{}' contains a query ('?') or fragment ('#') marker; "
+        "arrow's URI parser would strip everything from that marker out of the "
+        "resolved path, so child table/namespace URIs would not map under the "
+        "warehouse. Remove it, or percent-encode (%3F / %23) a literal byte.",
+        warehouse);
+  }
   std::string canonical(warehouse);
   while (canonical.size() > 1 && canonical.back() == '/') {
     canonical.pop_back();

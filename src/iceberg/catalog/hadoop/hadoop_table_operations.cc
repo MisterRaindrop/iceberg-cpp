@@ -360,6 +360,19 @@ Status HadoopTableOperations::Commit(const TableMetadata& base,
   // generation onto the new table, silently clobbering it. Re-read the
   // full current metadata under the lock and require its UUID to still
   // match the base we built from.
+  //
+  // A base with an EMPTY uuid would defeat the guard: a drop+recreate of
+  // another uuid-less generation also lands at the same version with an
+  // empty uuid, so `"" == ""` would wrongly pass. TableMetadata::Make
+  // assigns a uuid and RegisterTable rejects uuid-less metadata, so this
+  // only fires for externally crafted state -- refuse it rather than
+  // commit blind.
+  if (base.table_uuid.empty()) {
+    return CommitFailed(
+        "HadoopTableOperations::Commit: base metadata for '{}' has no table-uuid; "
+        "the drop+recreate ABA guard cannot operate without one. Refresh and retry.",
+        table_dir_);
+  }
   ICEBERG_ASSIGN_OR_RAISE(auto current_metadata,
                           TableMetadataUtil::Read(*file_io_, current.location));
   if (current_metadata->table_uuid != base.table_uuid) {

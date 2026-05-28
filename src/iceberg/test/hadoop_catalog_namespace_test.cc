@@ -26,6 +26,7 @@
 
 #include <arrow/filesystem/localfs.h>
 #include <gtest/gtest.h>
+#include <nlohmann/json.hpp>
 
 #include "iceberg/arrow/arrow_io_internal.h"
 #include "iceberg/arrow/arrow_io_register.h"
@@ -431,6 +432,90 @@ TEST_F(HadoopCatalogNamespaceTest, LockRootNameReservedAndFiltered) {
     EXPECT_NE(n.levels.back(), hadoop::kLockRootDirName)
         << "lock root must not appear as a namespace";
   }
+}
+
+TEST_F(HadoopCatalogNamespaceTest, NestedLockRootListableAndTopLevelReadConsistent) {
+  // The reserved-name rule is position-aware. A NESTED
+  // `db._iceberg_catalog_locks` is a real namespace: creatable AND listable
+  // under ListNamespaces(db). The TOP-LEVEL lock root is reserved: even if
+  // a file-lock run created the directory on disk, NamespaceExists /
+  // GetNamespaceProperties / DropNamespace must all treat it as absent.
+  const std::string lock_name(hadoop::kLockRootDirName);
+  ASSERT_TRUE(catalog_->CreateNamespace(Namespace{.levels = {"db"}}, {}).has_value());
+  ASSERT_TRUE(
+      catalog_->CreateNamespace(Namespace{.levels = {"db", lock_name}}, {}).has_value());
+
+  ICEBERG_UNWRAP_OR_FAIL(auto children,
+                         catalog_->ListNamespaces(Namespace{.levels = {"db"}}));
+  bool found = false;
+  for (const auto& c : children) {
+    if (c.levels.back() == lock_name) {
+      found = true;
+    }
+  }
+  EXPECT_TRUE(found) << "nested lock-root namespace must remain listable";
+
+  // Simulate a lock-impl=file run creating the warehouse-level lock root.
+  ICEBERG_UNWRAP_OR_FAIL(auto warehouse, catalog_->config().Warehouse());
+  ASSERT_TRUE(file_io_->CreateDir(std::string(warehouse) + "/" + lock_name).has_value());
+
+  const Namespace top{.levels = {lock_name}};
+  ICEBERG_UNWRAP_OR_FAIL(auto exists, catalog_->NamespaceExists(top));
+  EXPECT_FALSE(exists) << "top-level lock root is not a namespace";
+  auto props = catalog_->GetNamespaceProperties(top);
+  ASSERT_FALSE(props.has_value());
+  EXPECT_EQ(ErrorKind::kNoSuchNamespace, props.error().kind);
+  auto drop = catalog_->DropNamespace(top);
+  ASSERT_FALSE(drop.has_value());
+  EXPECT_EQ(ErrorKind::kNoSuchNamespace, drop.error().kind);
+}
+
+TEST_F(HadoopCatalogNamespaceTest, WarehouseUriWithQueryOrFragmentRejected) {
+  // A URI warehouse carrying a `?` (query) or `#` (fragment) marker has its
+  // path truncated at the marker by arrow's URI parser, so child
+  // table/namespace URIs would not map under the intended directory. Make()
+  // must reject it instead of silently mis-resolving every path.
+  for (const std::string_view bad : {"file:///tmp/wh?x=1", "file:///tmp/wh#frag"}) {
+    auto props = HadoopCatalogProperties::FromMap({
+        {"warehouse", std::string(bad)},
+        {"name", "bad"},
+    });
+    auto cat = HadoopCatalog::Make("bad", file_io_, std::move(props));
+    ASSERT_FALSE(cat.has_value()) << "expected rejection for '" << bad << "'";
+    EXPECT_EQ(ErrorKind::kInvalidArgument, cat.error().kind);
+  }
+}
+
+TEST_F(HadoopCatalogNamespaceTest, RegisterRejectsUuidlessMetadata) {
+  // Importing metadata with no table-uuid would defeat the commit-time ABA
+  // guard: two uuid-less generations at the same version compare equal, so
+  // a stale update could clobber a concurrently recreated table.
+  // RegisterTable must refuse uuid-less metadata up front. The crafted
+  // metadata's `location` is set to the target dir so the uuid check (which
+  // runs first) is what trips, not the location-mismatch check.
+  ASSERT_TRUE(catalog_->CreateNamespace(Namespace{.levels = {"db"}}, {}).has_value());
+  auto schema = std::make_shared<Schema>(
+      std::vector<SchemaField>{SchemaField::MakeRequired(1, "id", int64())});
+  TableIdentifier src_id{.ns = Namespace{.levels = {"db"}}, .name = "src"};
+  ICEBERG_UNWRAP_OR_FAIL(
+      auto src, catalog_->CreateTable(src_id, schema, PartitionSpec::Unpartitioned(),
+                                      SortOrder::Unsorted(), "", {}));
+
+  TableIdentifier tgt_id{.ns = Namespace{.levels = {"db"}}, .name = "imported"};
+  ICEBERG_UNWRAP_OR_FAIL(auto tgt_dir, hadoop::TableDir(warehouse_, tgt_id));
+  ICEBERG_UNWRAP_OR_FAIL(
+      auto raw,
+      file_io_->ReadFile(std::string(src->metadata_file_location()), std::nullopt));
+  auto json = nlohmann::json::parse(raw);
+  json["location"] = tgt_dir;
+  json.erase("table-uuid");
+  const std::string ext_path = std::string(warehouse_) + "/external_v1.metadata.json";
+  ASSERT_TRUE(file_io_->WriteFile(ext_path, json.dump()).has_value());
+
+  auto registered = catalog_->RegisterTable(tgt_id, ext_path);
+  ASSERT_FALSE(registered.has_value());
+  EXPECT_EQ(ErrorKind::kInvalidArgument, registered.error().kind);
+  EXPECT_NE(registered.error().message.find("table-uuid"), std::string::npos);
 }
 
 TEST_F(HadoopCatalogNamespaceTest, ListNamespacesRefusesTablePath) {
