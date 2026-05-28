@@ -132,9 +132,16 @@ std::string CanonicalLockKey(std::string_view entity_id) {
     if (seg == ".") {
       // drop
     } else if (seg == "..") {
-      // Pop the previous non-empty, non-"" segment if there is one.
+      // Pop the previous non-empty, non-".." segment if there is one.
       if (!out.empty() && !out.back().empty() && out.back() != "..") {
         out.pop_back();
+      } else if (out.size() == 1 && out.front().empty()) {
+        // Absolute-path root: a leading empty segment means the string
+        // started with `/` (e.g. `file:///../../tmp/wh` -> `/../../tmp/wh`).
+        // POSIX clamps `/..` to `/`, and arrow/the OS resolve the path that
+        // way at IO time, so two surface forms that differ only by leading
+        // `..` must collapse to one lock key. Drop the `..` rather than
+        // preserving a `/../` prefix the filesystem would never honour.
       } else {
         out.push_back(seg);
       }
@@ -555,6 +562,32 @@ bool IsPathInsideNormalized(std::string_view path, std::string_view parent_dir) 
     return false;
   }
   return IsPathInside(decoded_path, decoded_parent);
+}
+
+Status RejectUnsafeTablePath(std::string_view path, std::string_view source) {
+  // (1) A URI path with a raw `?`/`#` is truncated at the marker by arrow's
+  // URI parser, so the metadata/data would land somewhere other than the
+  // literal path string. Only URIs are affected -- a bare POSIX path treats
+  // `?`/`#` as ordinary filename bytes.
+  if (LooksLikeUri(path) && path.find_first_of("?#") != std::string_view::npos) {
+    return InvalidArgument(
+        "{}: path '{}' is a URI containing a query ('?') or fragment ('#') marker; "
+        "arrow's URI parser would strip everything from that marker out of the "
+        "resolved path. Remove it, or percent-encode (%3F / %23) a literal byte.",
+        source, path);
+  }
+  // (2) The reserved lock-root leaf, after stripping trailing slashes so a
+  // `.../_iceberg_catalog_locks/` form (whose bare Basename is empty) is
+  // still caught -- the layout strips the trailing slash before joining, so
+  // both forms resolve to the same physical lock root.
+  if (Basename(LocationUtil::StripTrailingSlash(path)) == kLockRootDirName) {
+    return InvalidArgument(
+        "{}: path '{}' resolves to the reserved lock-root directory name '{}'; a "
+        "lock-impl=file catalog stores its lock files there, so it cannot be a "
+        "table.",
+        source, path, kLockRootDirName);
+  }
+  return {};
 }
 
 Status RejectAncestorIsTable(FileIO& file_io, std::string_view warehouse,

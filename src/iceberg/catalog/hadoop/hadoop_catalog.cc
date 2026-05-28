@@ -355,6 +355,14 @@ Status HadoopCatalog::CreateNamespace(
 }
 
 Result<std::vector<Namespace>> HadoopCatalog::ListNamespaces(const Namespace& ns) const {
+  // The reserved top-level lock root is never a namespace, so listing
+  // "under" it must fail like any non-existent namespace -- symmetric with
+  // NamespaceExists/GetNamespaceProperties/DropNamespace and ListTables.
+  if (IsTopLevelLockRoot(ns)) {
+    return NoSuchNamespace(
+        "Namespace '{}' does not exist (reserved lock-impl=file root directory).",
+        ns.ToString());
+  }
   ICEBERG_ASSIGN_OR_RAISE(auto parent_dir, hadoop::NamespaceDir(warehouse_, ns));
 
   // Listing the warehouse root when ns is empty is allowed; otherwise the
@@ -555,6 +563,13 @@ Status HadoopCatalog::UpdateNamespaceProperties(
 
 Result<std::vector<TableIdentifier>> HadoopCatalog::ListTables(
     const Namespace& ns) const {
+  // The reserved top-level lock root is not a namespace; refuse to
+  // enumerate tables under it rather than returning an empty list.
+  if (IsTopLevelLockRoot(ns)) {
+    return NoSuchNamespace(
+        "Namespace '{}' does not exist (reserved lock-impl=file root directory).",
+        ns.ToString());
+  }
   ICEBERG_ASSIGN_OR_RAISE(auto ns_dir, hadoop::NamespaceDir(warehouse_, ns));
   auto ns_exists_result = file_io_->Exists(ns_dir);
   if (!ns_exists_result.has_value()) {

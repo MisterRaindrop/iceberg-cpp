@@ -468,6 +468,14 @@ TEST_F(HadoopCatalogNamespaceTest, NestedLockRootListableAndTopLevelReadConsiste
   auto drop = catalog_->DropNamespace(top);
   ASSERT_FALSE(drop.has_value());
   EXPECT_EQ(ErrorKind::kNoSuchNamespace, drop.error().kind);
+  // The list APIs must be consistent too: neither may treat the top-level
+  // lock root as an existing (empty) namespace.
+  auto ls_ns = catalog_->ListNamespaces(top);
+  ASSERT_FALSE(ls_ns.has_value());
+  EXPECT_EQ(ErrorKind::kNoSuchNamespace, ls_ns.error().kind);
+  auto ls_tbl = catalog_->ListTables(top);
+  ASSERT_FALSE(ls_tbl.has_value());
+  EXPECT_EQ(ErrorKind::kNoSuchNamespace, ls_tbl.error().kind);
 }
 
 TEST_F(HadoopCatalogNamespaceTest, WarehouseUriWithQueryOrFragmentRejected) {

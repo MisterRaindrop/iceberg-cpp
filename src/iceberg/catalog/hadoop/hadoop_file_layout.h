@@ -115,6 +115,21 @@ ICEBERG_HADOOP_EXPORT bool IsS3Scheme(std::string_view location);
 /// the filesystem.
 ICEBERG_HADOOP_EXPORT std::string_view Basename(std::string_view path);
 
+/// \brief Reject a HadoopTables bare-path table location that the layout
+/// cannot safely handle. The bare-path API has no warehouse/identifier
+/// validation, so this guards its boundary against two hazards:
+///   1. a URI carrying a raw `?` (query) or `#` (fragment) marker --
+///      arrow's URI parser truncates the path there, so the resolved
+///      directory would not match the literal string (see
+///      `CanonicalizeWarehouse` for the same rule on warehouses);
+///   2. a path whose leaf component is the reserved lock-root directory
+///      name `_iceberg_catalog_locks` -- a `lock-impl=file` catalog stores
+///      its lock files there, so creating/purging a table over it would
+///      corrupt active file locks. Trailing slashes are stripped before
+///      the leaf comparison so `.../_iceberg_catalog_locks/` is caught.
+ICEBERG_HADOOP_EXPORT Status RejectUnsafeTablePath(std::string_view path,
+                                                   std::string_view source);
+
 /// \brief Validate a single namespace level: must be non-empty and contain
 /// no '/' characters. Java rejects `/` in namespace levels because of the
 /// filesystem mapping; cpp follows suit.

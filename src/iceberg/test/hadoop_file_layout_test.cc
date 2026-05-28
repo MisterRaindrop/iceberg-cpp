@@ -105,6 +105,33 @@ TEST(HadoopFileLayoutTest, CanonicalLockKeyCollapsesAliases) {
             CanonicalLockKey("file:///tmp/wh/db"));
   // Distinct physical locations stay distinct.
   EXPECT_NE(CanonicalLockKey("file:///tmp/wh/a"), CanonicalLockKey("file:///tmp/wh/b"));
+  // `..` at the absolute-path root is clamped (POSIX `/..` == `/`), matching
+  // how arrow/the OS resolve the path at IO time. Without the clamp,
+  // `file:///../../tmp/wh` would keep a `/../../` prefix and produce a
+  // different lock key than `file:///tmp/wh`, letting two catalogs touch the
+  // same table under different locks.
+  EXPECT_EQ(CanonicalLockKey("file:///../../tmp/wh"), CanonicalLockKey("file:///tmp/wh"));
+  EXPECT_EQ(CanonicalLockKey("file:///tmp/a/../../tmp/wh"),
+            CanonicalLockKey("file:///tmp/wh"));
+}
+
+TEST(HadoopFileLayoutTest, RejectUnsafeTablePathGuardsLockRootAndUriMarkers) {
+  // Lock-root leaf is rejected, with or without a trailing slash (the
+  // layout strips it before joining, so both forms hit the same physical
+  // lock root).
+  EXPECT_FALSE(
+      RejectUnsafeTablePath("file:///wh/_iceberg_catalog_locks", "test").has_value());
+  EXPECT_FALSE(
+      RejectUnsafeTablePath("file:///wh/_iceberg_catalog_locks/", "test").has_value());
+  EXPECT_FALSE(
+      RejectUnsafeTablePath("file:///wh/_iceberg_catalog_locks//", "test").has_value());
+  // Raw `?`/`#` in a URI path are rejected (arrow truncates the path there).
+  EXPECT_FALSE(RejectUnsafeTablePath("file:///wh/t?x=1", "test").has_value());
+  EXPECT_FALSE(RejectUnsafeTablePath("file:///wh/t#frag", "test").has_value());
+  // A normal table path is accepted; a bare (non-URI) path with `?`/`#`
+  // treats them as literal filename bytes and is allowed.
+  EXPECT_TRUE(RejectUnsafeTablePath("file:///wh/db/events", "test").has_value());
+  EXPECT_TRUE(RejectUnsafeTablePath("/wh/db/weird?name", "test").has_value());
 }
 
 TEST(HadoopFileLayoutTest, IdentifierAllowsUtf8) {

@@ -240,6 +240,28 @@ TEST_F(HadoopTablesTest, MutatingApisRejectLockRootPath) {
   auto registered = tables_->RegisterTable(lock_path, root_ + "/whatever.metadata.json");
   ASSERT_FALSE(registered.has_value());
   EXPECT_EQ(ErrorKind::kInvalidArgument, registered.error().kind);
+
+  // A trailing slash must not bypass the guard: the layout strips it before
+  // joining, so `.../_iceberg_catalog_locks/` hits the same physical root.
+  auto created_slash =
+      tables_->Create(schema, PartitionSpec::Unpartitioned(), SortOrder::Unsorted(),
+                      lock_path + "/", /*properties=*/{});
+  ASSERT_FALSE(created_slash.has_value());
+  EXPECT_EQ(ErrorKind::kInvalidArgument, created_slash.error().kind);
+}
+
+TEST_F(HadoopTablesTest, MutatingApisRejectRawUriQueryOrFragment) {
+  // The bare-path API receives the location directly; a URI path with a raw
+  // `?`/`#` would be truncated at the marker by arrow's URI parser, so the
+  // metadata/data would not land at the literal path. Refuse it.
+  auto schema = std::make_shared<Schema>(
+      std::vector<SchemaField>{SchemaField::MakeRequired(1, "id", int64())});
+  for (const std::string& bad : {root_ + "/t?x=1", root_ + "/t#frag"}) {
+    auto created = tables_->Create(schema, PartitionSpec::Unpartitioned(),
+                                   SortOrder::Unsorted(), bad, /*properties=*/{});
+    ASSERT_FALSE(created.has_value()) << "expected rejection for " << bad;
+    EXPECT_EQ(ErrorKind::kInvalidArgument, created.error().kind);
+  }
 }
 
 TEST_F(HadoopTablesTest, RegisterRejectsUuidlessMetadata) {

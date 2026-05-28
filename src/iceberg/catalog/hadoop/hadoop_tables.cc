@@ -54,24 +54,6 @@ TableIdentifier PathToIdentifier(std::string_view path) {
   return TableIdentifier{.ns = Namespace{}, .name = std::string(Basename(path))};
 }
 
-// The bare-path API has no warehouse concept, so it cannot tell whether a
-// path IS some warehouse's lock root. But any directory whose leaf is the
-// reserved lock-root name could be one: a `lock-impl=file` HadoopCatalog
-// sharing the warehouse stores its lock files under
-// `<warehouse>/_iceberg_catalog_locks/`. Creating a table over it, or
-// purging it, would corrupt active file locks. Refuse the reserved leaf
-// name outright in the mutating path APIs.
-Status RejectLockRootPath(std::string_view path, std::string_view source) {
-  if (Basename(path) == kLockRootDirName) {
-    return InvalidArgument(
-        "{}: path '{}' uses the reserved lock-root directory name '{}'; a "
-        "lock-impl=file catalog stores its lock files there, so it cannot be a "
-        "table.",
-        source, path, kLockRootDirName);
-  }
-  return {};
-}
-
 // Publish a v1.metadata.json[.codec] + version-hint.text under `path` via
 // UUID-named temp files + atomic rename. HadoopTables has no LockManager, so
 // the rename(overwrite=false) is the only cross-writer guard -- on backends
@@ -280,7 +262,7 @@ Result<std::shared_ptr<Table>> HadoopTables::Create(
   if (path.empty()) {
     return InvalidArgument("HadoopTables::Create requires a non-empty path.");
   }
-  ICEBERG_RETURN_UNEXPECTED(RejectLockRootPath(path, "HadoopTables::Create"));
+  ICEBERG_RETURN_UNEXPECTED(hadoop::RejectUnsafeTablePath(path, "HadoopTables::Create"));
   ICEBERG_ASSIGN_OR_RAISE(auto io, ResolveFileIO(path));
 
   ICEBERG_ASSIGN_OR_RAISE(auto already_table, hadoop::IsHadoopTableDir(*io, path));
@@ -340,7 +322,8 @@ Status HadoopTables::DropTable(const std::string& path, bool purge) {
   if (path.empty()) {
     return InvalidArgument("HadoopTables::DropTable requires a non-empty path.");
   }
-  ICEBERG_RETURN_UNEXPECTED(RejectLockRootPath(path, "HadoopTables::DropTable"));
+  ICEBERG_RETURN_UNEXPECTED(
+      hadoop::RejectUnsafeTablePath(path, "HadoopTables::DropTable"));
   ICEBERG_ASSIGN_OR_RAISE(auto io, ResolveFileIO(path));
   ICEBERG_ASSIGN_OR_RAISE(auto is_table, hadoop::IsHadoopTableDir(*io, path));
   if (!is_table) {
@@ -414,7 +397,8 @@ Result<std::shared_ptr<Table>> HadoopTables::RegisterTable(
     return InvalidArgument(
         "HadoopTables::RegisterTable requires a non-empty metadata_file_location.");
   }
-  ICEBERG_RETURN_UNEXPECTED(RejectLockRootPath(path, "HadoopTables::RegisterTable"));
+  ICEBERG_RETURN_UNEXPECTED(
+      hadoop::RejectUnsafeTablePath(path, "HadoopTables::RegisterTable"));
   ICEBERG_ASSIGN_OR_RAISE(auto io, ResolveFileIO(path));
 
   ICEBERG_ASSIGN_OR_RAISE(auto already_table, hadoop::IsHadoopTableDir(*io, path));
