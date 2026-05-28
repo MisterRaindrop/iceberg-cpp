@@ -461,6 +461,28 @@ TEST_F(LocalFileIOTest, DeleteDirNonRecursiveIsAtomicEmptyCheck) {
       << "DeleteDir(non-recursive) must NOT touch the directory contents on refusal";
 }
 
+TEST_F(LocalFileIOTest, RenameOverwriteFalseRefusesDirectorySource) {
+  // The FileIO::Rename contract narrows overwrite=false to a file-only
+  // create-if-absent primitive: there is no portable atomic directory
+  // create-if-absent. The Local impl uses create_hard_link (POSIX link(2))
+  // which is file-only; rather than letting that surface as a less-specific
+  // error or silently fall through, the impl returns kNotSupported up front
+  // so callers can layer their own coordination when they need atomic
+  // directory CAS.
+  const std::string root = CreateTempDirectory();
+  const std::string src_dir = root + "/src_dir";
+  const std::string dst_dir = root + "/dst_dir";
+  EXPECT_THAT(file_io_->CreateDir(src_dir), IsOk());
+
+  EXPECT_THAT(file_io_->Rename(src_dir, dst_dir, /*overwrite=*/false),
+              IsError(ErrorKind::kNotSupported));
+  // Source must be left intact when the rename is refused.
+  ICEBERG_UNWRAP_OR_FAIL(auto src_still_there, file_io_->Exists(src_dir));
+  EXPECT_TRUE(src_still_there);
+  ICEBERG_UNWRAP_OR_FAIL(auto dst_absent, file_io_->Exists(dst_dir));
+  EXPECT_FALSE(dst_absent);
+}
+
 TEST_F(LocalFileIOTest, DeleteDirNonRecursiveRefusesNonDirectory) {
   // DeleteDir's contract is "delete a directory" -- a regular file is not
   // a directory and must be refused. The previous implementation called

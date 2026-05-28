@@ -18,12 +18,20 @@
  */
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <limits>
 #include <mutex>
 #include <optional>
 #include <system_error>
+
+#ifdef _WIN32
+#  include <direct.h>  // _rmdir
+#else
+#  include <unistd.h>  // rmdir(2)
+#endif
 
 #include <arrow/buffer.h>
 #include <arrow/filesystem/filesystem.h>
@@ -683,52 +691,44 @@ Status ArrowFileSystemFileIO::DeleteDir(const std::string& dir_location, bool re
   }
   // Non-recursive: the FileIO contract requires rmdir semantics -- fail if
   // the directory is non-empty AND fail if the target is not a directory at
-  // all. std::filesystem::remove would silently unlink a regular file (it
-  // is `std::remove`-style, dispatching to unlink/rmdir by inode type), so
-  // we probe the kind explicitly first and only then call remove. The
-  // TOCTOU window between probe and remove is narrow: if a concurrent
-  // writer replaces the inode in between, the subsequent remove either
-  // succeeds against a new (still-empty) directory or surfaces a faithful
-  // error. We never silently unlink a regular file. The empty-check then
-  // remove(2) on a directory is still a single std::filesystem call, so the
-  // empty-vs-delete race the previous comment described stays closed.
+  // all. Route directly to POSIX rmdir(2) (Windows _rmdir): it is a single
+  // syscall that refuses non-directories with ENOTDIR and refuses non-empty
+  // directories with ENOTEMPTY/EEXIST, all atomically. std::filesystem::
+  // remove is std::remove-style (dispatches by inode type) and would
+  // silently unlink a regular file, so a stat+remove dance still has a
+  // TOCTOU window where a directory replaced by a file between stat and
+  // remove gets unlinked. rmdir(2) closes that window: a non-directory at
+  // the moment of the syscall is rejected by the kernel.
   if (dynamic_cast<::arrow::fs::LocalFileSystem*>(arrow_fs_.get()) != nullptr) {
-    std::error_code st_ec;
-    const auto st = std::filesystem::symlink_status(path, st_ec);
-    if (st_ec == std::errc::no_such_file_or_directory ||
-        st.type() == std::filesystem::file_type::not_found) {
-      return IOError("DeleteDir(non-recursive): '{}' does not exist.", dir_location);
+#ifdef _WIN32
+    const int rc = ::_rmdir(path.c_str());
+#else
+    const int rc = ::rmdir(path.c_str());
+#endif
+    if (rc == 0) {
+      return {};
     }
-    if (st_ec) {
-      return IOError("DeleteDir(non-recursive, stat '{}') failed: {}", dir_location,
-                     st_ec.message());
+    const int err = errno;
+    switch (err) {
+      case ENOENT:
+        return IOError("DeleteDir(non-recursive): '{}' does not exist.", dir_location);
+      case ENOTDIR:
+        return InvalidArgument(
+            "DeleteDir(non-recursive): '{}' is not a directory; refusing to "
+            "delete to avoid silently unlinking a regular file.",
+            dir_location);
+      case ENOTEMPTY:
+      // Some platforms (notably older BSDs / certain libcs) report
+      // non-empty directories as EEXIST instead of ENOTEMPTY; treat both
+      // as the same logical "directory not empty" condition so the
+      // contract is portable.
+      case EEXIST:
+        return NotAllowed("DeleteDir(non-recursive) refused: '{}' is not empty.",
+                          dir_location);
+      default:
+        return IOError("DeleteDir(non-recursive, rmdir '{}') failed: {}", dir_location,
+                       std::strerror(err));
     }
-    if (st.type() != std::filesystem::file_type::directory) {
-      return InvalidArgument(
-          "DeleteDir(non-recursive): '{}' is not a directory; refusing to "
-          "delete to avoid silently unlinking a regular file.",
-          dir_location);
-    }
-    std::error_code ec;
-    const bool removed = std::filesystem::remove(path, ec);
-    if (ec == std::errc::directory_not_empty) {
-      return NotAllowed("DeleteDir(non-recursive) refused: '{}' is not empty.",
-                        dir_location);
-    }
-    if (ec == std::errc::no_such_file_or_directory) {
-      // arrow's DeleteDir on a missing path returns an error; mirror that.
-      return IOError("DeleteDir(non-recursive): '{}' does not exist.", dir_location);
-    }
-    if (ec) {
-      return IOError("DeleteDir(non-recursive, remove '{}') failed: {}", dir_location,
-                     ec.message());
-    }
-    if (!removed) {
-      // remove returned false without an error -- treat as "path did not
-      // exist" for consistency with the LocalFileSystem branch above.
-      return IOError("DeleteDir(non-recursive): '{}' does not exist.", dir_location);
-    }
-    return {};
   }
   // Non-local backends: arrow has no rmdir-like primitive that rejects
   // non-empty dirs, so we fall back to a list + DeleteDir(recursive=true)
@@ -777,6 +777,24 @@ Status ArrowFileSystemFileIO::Rename(const std::string& from, const std::string&
     // their own coordination (DynamoDB lock, conditional PUT, etc.); the
     // HadoopCatalog header documents this caveat explicitly.
     if (dynamic_cast<::arrow::fs::LocalFileSystem*>(arrow_fs_.get()) != nullptr) {
+      // create_hard_link (POSIX link(2)) is file-only: directories cannot be
+      // hard-linked on any mainstream filesystem, so an overwrite=false
+      // rename of a directory has no atomic CAS primitive available here.
+      // Reject it explicitly (rather than letting the link call fail with a
+      // less-specific error) so callers get a clear NotSupported and can
+      // layer their own coordination if they need atomic directory CAS.
+      // HadoopCatalog's Commit only renames the v{N}.metadata.json file, so
+      // this restriction does not affect catalog operations.
+      std::error_code src_ec;
+      const auto src_st = std::filesystem::symlink_status(from_path, src_ec);
+      if (!src_ec && src_st.type() == std::filesystem::file_type::directory) {
+        return NotSupported(
+            "Rename(overwrite=false) on LocalFileSystem is file-only: source '{}' "
+            "is a directory and there is no atomic create-if-absent primitive for "
+            "directory rename. Use overwrite=true (atomic-replace) or coordinate "
+            "externally.",
+            from);
+      }
       std::error_code ec;
       std::filesystem::create_hard_link(from_path, to_path, ec);
       if (ec == std::errc::file_exists) {

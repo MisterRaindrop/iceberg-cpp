@@ -204,16 +204,23 @@ class ICEBERG_EXPORT FileIO {
     return NotImplemented("DeleteDir not implemented");
   }
 
-  /// \brief Atomically rename a file or directory.
+  /// \brief Atomically rename a path.
   ///
-  /// `overwrite=false` should fail if the destination already exists; this
-  /// is the primitive HadoopCatalog uses as its commit-time CAS on
-  /// `v{N+1}.metadata.json` and as the conditional create primitive for
-  /// `FileLockManager`. `overwrite=true` is an atomic-replace and is used
-  /// by HadoopCatalog to publish the updated `version-hint.text`.
-  /// Implementations should document which backends provide truly atomic
-  /// create-if-absent semantics; on those that don't, callers must layer
-  /// their own coordination.
+  /// `overwrite=true` is an atomic-replace and may be applied to either a
+  /// file or a directory (subject to backend limitations on directory
+  /// rename — see the implementation's documentation). HadoopCatalog uses
+  /// this form to publish the updated `version-hint.text`.
+  ///
+  /// `overwrite=false` is a conditional create-if-absent primitive. It is
+  /// FILE-ONLY in the iceberg-cpp built-in backends: there is no portable
+  /// directory primitive that is both atomic and "fail-if-exists", and
+  /// every catalog use case (commit-time CAS on `v{N+1}.metadata.json`,
+  /// `FileLockManager` lock file creation) operates on regular files. An
+  /// implementation that receives a directory source with `overwrite=false`
+  /// must return `kNotSupported` rather than fall back to a non-atomic
+  /// emulation. Implementations should also document which backends
+  /// provide a truly atomic file-level create-if-absent guarantee; on
+  /// those that don't, callers must layer their own coordination.
   virtual Status Rename(const std::string& from, const std::string& to, bool overwrite) {
     return NotImplemented("Rename not implemented");
   }

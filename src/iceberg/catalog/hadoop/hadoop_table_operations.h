@@ -108,29 +108,44 @@ class ICEBERG_HADOOP_EXPORT HadoopTableOperations {
   /// \brief Commit `updated` if and only if `base`'s metadata pointer is
   /// still the current one.
   ///
-  /// Implements the 10-step Java HadoopTableOperations protocol:
+  /// Mirrors Java HadoopTableOperations with iceberg-cpp's additional ABA
+  /// guard. Numbered to match the in-file step comments:
   ///   1. Reject any change to `metadata.location` (Java requires
   ///      filesystem tables to stay at their original path).
-  ///   2. Reject metadata that overrides `write.metadata.path`.
+  ///   2. Reject metadata that overrides `write.metadata.path` or
+  ///      `write.data.path` -- both would orphan data on
+  ///      `DropTable(purge=true)`.
   ///   3. Acquire the LockManager. Acquire timeout -> kCommitFailed.
   ///   4. Re-resolve the current pointer; if it has drifted from `base`,
   ///      return kCommitFailed so `iceberg::Transaction` can retry.
+  ///   4b. ABA guard: re-read the FULL current metadata under the lock
+  ///       and require its `table_uuid` to match `base.table_uuid` (a
+  ///       concurrent drop+recreate would land the same version with a
+  ///       different uuid). Uuid-less bases are refused outright.
   ///   5. Pick a target filename based on the table's
   ///      `write.metadata.compression-codec` property.
-  ///   6. Refuse to overwrite an existing v{N}.metadata.json[.codec]
-  ///      (kCommitFailed) -- belt-and-braces alongside the rename CAS.
-  ///   7. Write the new metadata.
-  ///   8. Update `version-hint.text` via write-tmp + atomic
-  ///      rename(overwrite=true). The lock serialises writers so a single
-  ///      atomic replace is enough; this keeps the protocol crash-safe
-  ///      without exposing a no-hint window.
-  ///   9. On rename failure, re-read the hint. If it already points at
-  ///      our new version (e.g. a transient post-success error on
-  ///      HDFS/S3) treat the commit as landed. Otherwise clean up the
-  ///      v{N+1} file + tmp hint and propagate the ORIGINAL rename
-  ///      error -- the metadata rename already committed, so wrapping
-  ///      the error as kCommitFailed would make Transaction retry
-  ///      forever against a permanent infrastructure failure.
+  ///   5b. Codec-independent CAS scan: refuse if ANY v{next_version}.*
+  ///       file already exists (defense against two writers picking
+  ///       different codecs and both succeeding on rename).
+  ///   6/7. Write to a UUID-named temp file, then atomically
+  ///        `Rename(overwrite=false)` to the canonical
+  ///        `v{N}.metadata.json[.codec]`. Rename failure with
+  ///        kAlreadyExists -> kCommitFailed; any other backend error is
+  ///        surfaced as-is so Transaction does not retry forever against
+  ///        an infrastructure failure.
+  ///   8. THE METADATA RENAME IS THE COMMIT POINT. From here on,
+  ///      `ResolveCurrentMetadata` will discover the new version via the
+  ///      `max(hint, listdir-max)` fallback even without a hint update.
+  ///      Update `version-hint.text` via write-tmp + atomic
+  ///      `Rename(overwrite=true)`. A hint write/rename failure is
+  ///      logged as a WARNING only -- the commit has already landed and
+  ///      rolling it back would break readers that have observed the
+  ///      new metadata file.
+  ///   9. Honour `write.metadata.delete-after-commit.enabled` (default
+  ///      false) by pruning v{N - previous-versions-max} and older
+  ///      metadata files. Runs UNDER the commit lock so a concurrent
+  ///      drop+recreate at this path cannot land new files before GC
+  ///      finishes scanning the directory.
   ///   10. Release the lock in a `finally`-like cleanup.
   Status Commit(const TableMetadata& base, const TableMetadata& updated);
 

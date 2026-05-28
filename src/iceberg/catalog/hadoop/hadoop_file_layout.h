@@ -43,10 +43,22 @@
 namespace iceberg::hadoop {
 
 /// \brief Name of the warehouse-level directory where `lock-impl=file`
-/// stores its lock files (`<warehouse>/_iceberg_catalog_locks/`). It is
-/// a RESERVED component name -- ValidateNamespaceLevel /
-/// ValidateTableIdentifier reject it so no user table or namespace can
-/// collide with the lock root, and ListNamespaces filters it out.
+/// stores its lock files (`<warehouse>/_iceberg_catalog_locks/`).
+///
+/// The name is reserved POSITION-AWARE: only the FIRST namespace level (or
+/// a top-level table name) may not equal this value, because that is the
+/// only depth where it would collide with the on-disk lock root. Nested
+/// uses like `db._iceberg_catalog_locks` are legitimate namespaces and are
+/// not rejected. The position-aware guard lives in the catalog layer
+/// (HadoopCatalog::CreateNamespace / CreateTable / UpdateTable /
+/// RegisterTable) and at the HadoopTables bare-path API boundary via
+/// `RejectUnsafeTablePath`. The namespace read APIs (`NamespaceExists`,
+/// `GetNamespaceProperties`, `ListNamespaces`, `ListTables`,
+/// `DropNamespace`) treat the top-level lock root as not-a-namespace, and
+/// `ListNamespaces({})` filters it out of warehouse-root listings.
+/// `ValidateNamespaceLevel`/`ValidateTableIdentifier` do NOT carry the
+/// reserved-name check, because they are level-agnostic and would
+/// incorrectly forbid nested uses.
 inline constexpr std::string_view kLockRootDirName = "_iceberg_catalog_locks";
 
 /// \brief Metadata file compression codec recognised by HadoopCatalog.
