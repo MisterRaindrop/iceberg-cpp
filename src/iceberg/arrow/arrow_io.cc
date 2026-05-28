@@ -776,25 +776,27 @@ Status ArrowFileSystemFileIO::Rename(const std::string& from, const std::string&
     // Callers that need cross-process correctness on HDFS/S3 must layer
     // their own coordination (DynamoDB lock, conditional PUT, etc.); the
     // HadoopCatalog header documents this caveat explicitly.
+    // Rename(overwrite=false) is the file-only create-if-absent primitive
+    // (see FileIO::Rename docstring). No iceberg-cpp built-in backend
+    // exposes a portable atomic directory CAS, so refuse directory sources
+    // up front on every backend -- not just LocalFileSystem -- before any
+    // backend-specific rename attempt. Without this, MockFileSystem /
+    // libhdfs / S3 paths would either silently attempt a directory move
+    // or surface a less-specific backend error, violating the contract
+    // documented in file_io.h.
+    auto src_info = arrow_fs_->GetFileInfo(from_path);
+    if (!src_info.ok()) {
+      return IOError("Rename pre-check (source) failed for '{}': {}", from,
+                     src_info.status().ToString());
+    }
+    if (src_info->type() == ::arrow::fs::FileType::Directory) {
+      return NotSupported(
+          "Rename(overwrite=false) is file-only: source '{}' is a directory and "
+          "there is no portable atomic create-if-absent primitive for directory "
+          "rename. Use overwrite=true (atomic-replace) or coordinate externally.",
+          from);
+    }
     if (dynamic_cast<::arrow::fs::LocalFileSystem*>(arrow_fs_.get()) != nullptr) {
-      // create_hard_link (POSIX link(2)) is file-only: directories cannot be
-      // hard-linked on any mainstream filesystem, so an overwrite=false
-      // rename of a directory has no atomic CAS primitive available here.
-      // Reject it explicitly (rather than letting the link call fail with a
-      // less-specific error) so callers get a clear NotSupported and can
-      // layer their own coordination if they need atomic directory CAS.
-      // HadoopCatalog's Commit only renames the v{N}.metadata.json file, so
-      // this restriction does not affect catalog operations.
-      std::error_code src_ec;
-      const auto src_st = std::filesystem::symlink_status(from_path, src_ec);
-      if (!src_ec && src_st.type() == std::filesystem::file_type::directory) {
-        return NotSupported(
-            "Rename(overwrite=false) on LocalFileSystem is file-only: source '{}' "
-            "is a directory and there is no atomic create-if-absent primitive for "
-            "directory rename. Use overwrite=true (atomic-replace) or coordinate "
-            "externally.",
-            from);
-      }
       std::error_code ec;
       std::filesystem::create_hard_link(from_path, to_path, ec);
       if (ec == std::errc::file_exists) {

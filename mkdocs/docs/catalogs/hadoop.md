@@ -188,19 +188,25 @@ implementation:
 7. Atomically rename the temp file to `v{N+1}.metadata.json[.codec]` with
    `overwrite=false`. This is the CAS primitive: if another writer beat
    us to `v{N+1}`, the rename fails and we surface `kCommitFailed`.
-8. Update `version-hint.text` via write-tmp + `Rename(overwrite=true)`.
+8. **THE METADATA RENAME IS THE COMMIT POINT.** From here on
+   `ResolveCurrentMetadata` will discover the new version via its
+   `max(hint, listdir-max)` fallback even without a hint update.
+   Update `version-hint.text` via write-tmp + `Rename(overwrite=true)`.
    The lock already serialises writers, so the atomic replace is enough;
-   no delete-then-rename window where the hint is absent.
-9. If the hint rename fails, re-read the metadata directory. If the hint
-   has somehow already advanced to our version (e.g. a transient
-   network error after a successful rename on HDFS/S3), treat as
-   success. Otherwise clean up the v{N+1} file + tmp hint and return
-   the original rename error -- permission / NotSupported / permanent
-   IO failures must NOT be wrapped as `kCommitFailed`, because the
-   metadata rename already committed and `Transaction::Commit` would
-   otherwise retry forever against an error that will not resolve.
-10. Release the lock before any commit-time GC (`PruneOldMetadataFiles`)
-    so long delete loops on deep history do not stall other writers.
+   no delete-then-rename window where the hint is absent. A hint write
+   or rename failure is logged as a WARNING and the commit returns
+   success — rolling back the v{N+1} metadata to "match" a failed hint
+   would break readers that have already observed the new file via
+   listdir fallback.
+9. Honour `write.metadata.delete-after-commit.enabled` (default `false`)
+   by pruning v{N − previous-versions-max} and older metadata files.
+   **GC runs UNDER THE COMMIT LOCK**, before the lock is released, so a
+   concurrent `DropTable` + `CreateTable` on the same path cannot land
+   the new generation's v1 before our scan finishes — the position-aware
+   ABA guard already refuses such a stale commit, and keeping GC under
+   the lock means it can never delete files belonging to a different
+   table generation.
+10. Release the lock in a `finally`-like cleanup.
 
 ## Cross-process safety envelope
 

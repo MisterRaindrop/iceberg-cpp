@@ -461,6 +461,22 @@ TEST_F(LocalFileIOTest, DeleteDirNonRecursiveIsAtomicEmptyCheck) {
       << "DeleteDir(non-recursive) must NOT touch the directory contents on refusal";
 }
 
+TEST(MockFileIOTest, RenameOverwriteFalseRefusesDirectorySourceOnAllBackends) {
+  // The FileIO::Rename(overwrite=false) contract is FILE-ONLY across all
+  // built-in backends, not just LocalFileSystem. Previously the directory
+  // refusal lived inside the LocalFileSystem branch, so non-Local backends
+  // (Mock / HDFS / S3) silently fell through to `GetFileInfo + Move` --
+  // which would either attempt a directory move or surface a less-specific
+  // backend error, both violating the documented kNotSupported contract.
+  // Regression for that gap, exercised on MockFileSystem.
+  auto file_io = ::iceberg::arrow::ArrowFileSystemFileIO::MakeMockFileIO();
+  const std::string src_dir = "/wh/src_dir";
+  EXPECT_THAT(file_io->CreateDir(src_dir), IsOk());
+
+  EXPECT_THAT(file_io->Rename(src_dir, "/wh/dst_dir", /*overwrite=*/false),
+              IsError(ErrorKind::kNotSupported));
+}
+
 TEST_F(LocalFileIOTest, RenameOverwriteFalseRefusesDirectorySource) {
   // The FileIO::Rename contract narrows overwrite=false to a file-only
   // create-if-absent primitive: there is no portable atomic directory

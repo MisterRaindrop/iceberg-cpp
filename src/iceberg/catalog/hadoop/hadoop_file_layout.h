@@ -82,25 +82,27 @@ ICEBERG_HADOOP_EXPORT Result<MetadataCompressionCodec> ParseMetadataCompressionC
 ICEBERG_HADOOP_EXPORT std::string_view MetadataCompressionCodecName(
     MetadataCompressionCodec codec);
 
-/// \brief Reduce a warehouse string to a canonical form so different
-/// surface representations of the same physical location share lock
-/// keys and table-dir comparisons.
+/// \brief Reduce a warehouse string to a canonical form suitable for
+/// re-use as the IO URI prefix.
 ///
-/// The transformation is:
-///   1. If the input is a URI (`scheme://...`), percent-decode it.
-///      arrow's URI parser would decode the path at IO time, so
-///      `file:///tmp/my%20wh` and `file:///tmp/my wh` refer to the
-///      same directory; we want both to map to the SAME lock key.
-///      Literal local paths (no `scheme://`) are NOT decoded -- a
-///      literal `%XX` in a POSIX path means a `%XX` filename byte.
-///   2. Trailing `/` is stripped so `file:///wh` and `file:///wh/`
+/// The result is SAFE to re-parse as a URI: percent-decoding and
+/// dot-segment collapsing are deliberately NOT performed here (decoding
+/// then re-parsing would mis-resolve reserved characters like `#` /
+/// `%2F`, and round-tripping `%252F` would collapse it to a path
+/// separator). The function only:
+///   1. Rejects URI warehouses carrying a raw `?` or `#` (arrow's URI
+///      parser would truncate the path at the marker).
+///   2. Rejects filesystem-root warehouses (`file:///`, `s3://`, `/`,
+///      `///`): the trailing-slash strip below would corrupt URI roots
+///      to bare schemes, and a bare `/` would collapse to an empty
+///      prefix in `NamespaceDir`.
+///   3. Strips trailing slashes so `file:///wh` and `file:///wh/`
 ///      collapse together.
 ///
-/// The result is SAFE to re-use as an IO URI prefix: only a trailing
-/// slash is removed (percent-decoding / dot-segment collapsing is NOT
-/// performed, since the decoded form would be re-parsed and mis-resolve
-/// reserved characters like `#`). Alias collapsing for lock identity is
-/// `CanonicalLockKey`'s job.
+/// Alias collapsing for lock identity (`%20` vs space, `.`/`..` segment
+/// folding, `file://` vs literal path) is intentionally separate and
+/// lives in `CanonicalLockKey`, whose output is used only for lock
+/// identity and never for IO.
 ICEBERG_HADOOP_EXPORT Result<std::string> CanonicalizeWarehouse(
     std::string_view warehouse);
 

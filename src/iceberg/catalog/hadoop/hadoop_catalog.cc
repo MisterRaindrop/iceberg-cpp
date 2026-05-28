@@ -748,13 +748,49 @@ Result<std::string> HadoopCatalog::WriteInitialBytesLocked(
         table_dir);
   }
   LockReleaseGuard guard(lock_manager_.get(), table_dir, owner);
+  // Track which directories we (might) create in this call so failed
+  // publishes / rollbacks can leave the warehouse in the state we found
+  // it. Without this, a failed CreateTable or RegisterTable would leave
+  // behind an empty `<table>/metadata/` -- which is not a Hadoop table
+  // (no v{N}.metadata.json) but IS a non-empty directory, so
+  // DropNamespace then refuses to delete the parent namespace as
+  // "not empty". Capture pre-existence BEFORE the CreateDir below; the
+  // pre-check is racy against a concurrent publish, but our own lock
+  // already serialises us against drop+recreate on the same path, and
+  // the rollback uses rmdir-semantics (DeleteDir(recursive=false)) so
+  // any directory that picked up real content while we were running
+  // survives untouched.
+  const std::string metadata_dir = hadoop::MetadataDir(table_dir);
+  ICEBERG_ASSIGN_OR_RAISE(auto metadata_dir_existed, file_io_->Exists(metadata_dir));
+  ICEBERG_ASSIGN_OR_RAISE(auto table_dir_existed, file_io_->Exists(table_dir));
   // Idempotent under file-lock (Acquire already created the dir);
   // required under in-memory-lock where Acquire has no on-disk side
   // effects.
-  ICEBERG_RETURN_UNEXPECTED(file_io_->CreateDir(hadoop::MetadataDir(table_dir)));
+  ICEBERG_RETURN_UNEXPECTED(file_io_->CreateDir(metadata_dir));
 
-  ICEBERG_ASSIGN_OR_RAISE(auto recheck, hadoop::IsHadoopTableDir(*file_io_, table_dir));
-  if (recheck) {
+  // Best-effort cleanup of directories WE created. DeleteDir is the
+  // rmdir(2) path: it refuses non-empty directories, so any committed
+  // content (a v1 from a concurrent writer that landed during our
+  // window, or our own partial publish that wasn't fully rolled back)
+  // survives untouched.
+  auto cleanup_orphan_dirs = [&]() {
+    if (!metadata_dir_existed) {
+      std::ignore = file_io_->DeleteDir(metadata_dir, /*recursive=*/false);
+    }
+    if (!table_dir_existed) {
+      std::ignore = file_io_->DeleteDir(table_dir, /*recursive=*/false);
+    }
+  };
+
+  auto recheck = hadoop::IsHadoopTableDir(*file_io_, table_dir);
+  if (!recheck.has_value()) {
+    cleanup_orphan_dirs();
+    return std::unexpected<Error>(recheck.error());
+  }
+  if (*recheck) {
+    // A real table now lives here -- either it pre-existed, or a
+    // concurrent writer published between our pre-check and Acquire.
+    // Either way the directory is owned by that table; do NOT cleanup.
     return AlreadyExists("Table already exists at {}.", table_dir);
   }
   // Also re-check the namespace-occupation invariant under the lock: a
@@ -762,17 +798,25 @@ Result<std::string> HadoopCatalog::WriteInitialBytesLocked(
   // pre-check and Acquire. Without this guard a CreateTable would either
   // bury the namespace's children under a new metadata/ or fight a parallel
   // create at a different leaf inside the namespace.
-  ICEBERG_ASSIGN_OR_RAISE(auto occupied,
-                          hadoop::HasNonTableInternalChildren(*file_io_, table_dir));
-  if (occupied) {
+  auto occupied = hadoop::HasNonTableInternalChildren(*file_io_, table_dir);
+  if (!occupied.has_value()) {
+    cleanup_orphan_dirs();
+    return std::unexpected<Error>(occupied.error());
+  }
+  if (*occupied) {
+    cleanup_orphan_dirs();
     return InvalidArgument(
         "Cannot create table at {}: path is occupied by a namespace (it already "
         "contains child entries other than metadata/ and data/).",
         table_dir);
   }
 
-  ICEBERG_ASSIGN_OR_RAISE(auto published,
-                          PublishV1AfterLock(*file_io_, table_dir, codec, raw_bytes));
+  auto published_result = PublishV1AfterLock(*file_io_, table_dir, codec, raw_bytes);
+  if (!published_result.has_value()) {
+    cleanup_orphan_dirs();
+    return std::unexpected<Error>(published_result.error());
+  }
+  auto published = *published_result;
 
   // Post-publish hierarchy recheck. The per-table lock we hold only
   // serializes operations on THIS table_dir; a concurrent CreateTable
@@ -827,9 +871,12 @@ Result<std::string> HadoopCatalog::WriteInitialBytesLocked(
     // Rollback: best-effort delete of the just-published v1 and the
     // version-hint we wrote. Both writers in the race do this; the
     // caller sees CommitFailed and retries -- only one of them then
-    // re-publishes cleanly.
+    // re-publishes cleanly. After the v1/hint are gone the metadata/
+    // (and table/) directories we created become empty; cleanup_orphan_dirs
+    // removes them via rmdir semantics so the failure leaves no trace.
     std::ignore = file_io_->DeleteFile(published);
     std::ignore = file_io_->DeleteFile(hadoop::VersionHintPath(table_dir));
+    cleanup_orphan_dirs();
     return CommitFailed("{}", conflict_msg);
   }
   return published;

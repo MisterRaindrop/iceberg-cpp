@@ -1122,6 +1122,54 @@ TEST_F(HadoopCatalogNamespaceTest, CreateTableRejectsPopulatedNamespace) {
   EXPECT_TRUE(*exists);
 }
 
+TEST_F(HadoopCatalogNamespaceTest, FailedCreateTableLeavesNoOrphanMetadataDir) {
+  // A failed CreateTable used to leave `<table>/metadata/` behind: the
+  // CreateDir(metadata) ran BEFORE the occupied-recheck, and the failure
+  // path returned without removing it. That orphan then made the path
+  // look "non-empty" to ListDir, so DropNamespace on the parent refused
+  // to delete the namespace as not-empty -- a soft DoS on namespace
+  // management caused by a single failed Create.
+  //
+  // Populate `db.victim` as a namespace, attempt to create a table at the
+  // same path, observe the failure, then assert that the parent namespace
+  // is still drop-able (i.e. its only child is `victim/`, and `victim/`
+  // contains only the pre-existing `child/` -- no `metadata/` orphan).
+  ASSERT_TRUE(catalog_->CreateNamespace(Namespace{.levels = {"db"}}, {}).has_value());
+  ASSERT_TRUE(
+      catalog_->CreateNamespace(Namespace{.levels = {"db", "victim"}}, {}).has_value());
+  ASSERT_TRUE(
+      catalog_->CreateNamespace(Namespace{.levels = {"db", "victim", "child"}}, {})
+          .has_value());
+
+  TableIdentifier conflict{.ns = Namespace{.levels = {"db"}}, .name = "victim"};
+  auto schema = std::make_shared<Schema>(
+      std::vector<SchemaField>{SchemaField::MakeRequired(1, "id", int64())});
+  auto res = catalog_->CreateTable(conflict, schema, PartitionSpec::Unpartitioned(),
+                                   SortOrder::Unsorted(), "", {});
+  ASSERT_FALSE(res.has_value());
+  EXPECT_EQ(ErrorKind::kInvalidArgument, res.error().kind);
+
+  // The orphan probe: a `metadata/` directory under db/victim is the
+  // failure mode this test guards against.
+  ICEBERG_UNWRAP_OR_FAIL(
+      auto table_dir,
+      hadoop::TableDir(warehouse_, TableIdentifier{.ns = Namespace{.levels = {"db"}},
+                                                   .name = "victim"}));
+  ICEBERG_UNWRAP_OR_FAIL(auto orphan_exists,
+                         file_io_->Exists(hadoop::MetadataDir(table_dir)));
+  EXPECT_FALSE(orphan_exists)
+      << "failed CreateTable must not leave an orphan metadata/ behind";
+
+  // And the downstream effect: dropping the descendant + the victim
+  // namespace must succeed; without the cleanup, the second drop would
+  // fail with kNamespaceNotEmpty because the orphan `metadata/` would
+  // count as a child.
+  ASSERT_TRUE(catalog_->DropNamespace(Namespace{.levels = {"db", "victim", "child"}})
+                  .has_value());
+  auto drop_victim = catalog_->DropNamespace(Namespace{.levels = {"db", "victim"}});
+  ASSERT_TRUE(drop_victim.has_value()) << drop_victim.error().message;
+}
+
 TEST_F(HadoopCatalogNamespaceTest, RegisterRejectsMismatchedLocation) {
   // RegisterTable that imports metadata from another table's path would
   // leave the new table's recorded `location` pointing at the OTHER
