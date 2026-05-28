@@ -1,0 +1,5 @@
+# Vendored upstream Apache Hive Thrift IDL is included verbatim from
+# https://github.com/apache/hive — do not edit. Skip git's whitespace
+# checks (`git diff --check`, `git apply --whitespace=warn`, etc.) so
+# upstream defects don't surface as warnings on our changes.
+third_party/** -whitespace linguist-vendored
