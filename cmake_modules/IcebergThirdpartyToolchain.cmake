@@ -66,6 +66,11 @@ else()
   )
 endif()
 
+# Apache Thrift (the C++ runtime that iceberg_hive's generated bindings link
+# against) is provided by Apache Arrow's bundled build — Arrow already builds
+# Thrift for Parquet. We expose it as a global `thrift::thrift` alias at the
+# end of this file. No separate Thrift tarball or system install is needed.
+
 # ----------------------------------------------------------------------
 # FetchContent
 
@@ -627,4 +632,15 @@ endif()
 
 if(ICEBERG_BUILD_SQL_CATALOG)
   resolve_sql_catalog_dependencies()
+endif()
+
+# Arrow's bundled build creates the Thrift C++ runtime as a `thrift` target
+# scoped to its FetchContent directory, where iceberg_hive cannot see it.
+# Promote it to a global `thrift::thrift` alias so iceberg_hive can link the
+# generated Hive Metastore bindings against it.
+if(ICEBERG_BUILD_HIVE
+   AND TARGET thrift
+   AND NOT TARGET thrift::thrift)
+  add_library(thrift::thrift INTERFACE IMPORTED GLOBAL)
+  target_link_libraries(thrift::thrift INTERFACE thrift)
 endif()

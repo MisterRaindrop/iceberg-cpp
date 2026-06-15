@@ -38,6 +38,11 @@ C++ implementation of [Apache Iceberg™](https://iceberg.apache.org/).
 **Optional:**
 
 - Python 3 and [pre-commit](https://pre-commit.com/) (for linting)
+- [Apache Thrift](https://thrift.apache.org/) IDL compiler — only for maintainers
+  regenerating the checked-in Hive Metastore bindings via
+  `dev/update_hive_thrift.sh`. A normal `ICEBERG_BUILD_HIVE=ON` build does not
+  need it: the bindings are committed and the Thrift C++ runtime comes from
+  Apache Arrow's bundled build.
 
 ## Quick Start
 
